@@ -870,8 +870,8 @@ the 9 recorded-untouched lines.
     — keep with the §4.2 message retarget; its last assertion ("a bias-free
     degenerate D stays ROW") becomes: bias-free with `right_major(&[384,1])` alone
     → ROW (unchanged), bias-free with both spellings → COL (§4.2 rule).
-  * `cublaslt_contracts.rs` (device) `degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based`
-    — carry verbatim (touches no layout type).
+  * `cublaslt_contracts.rs` (device) `degenerate_extent_bias_plan_matches_decomposed_route`
+    — carry with exact semantic comparison (touches no layout type).
   If #507 merges first anyway, step S3 below additionally deletes the arm and
   the "ONE EXCEPTION" doc paragraph; the test retargets are the same.
 * Any test asserting the preference order: `cublaslt_bias_premise.rs:170-176`

@@ -352,31 +352,36 @@ impl Translator<'_> {
         // The round count is a function of the operands' dtype, taken
         // before the widening cast below (see `gcd_euclid_rounds`).
         let rounds = gcd_euclid_rounds(gcd_magnitude_bound(lhs.dtype));
-        // Match ATen's signed Euclid loop: take wrapping abs in the operand
-        // dtype, then repeatedly (a, b) = (b % a, a), returning b verbatim.
-        // abs(MIN) remains negative, so later remainders can be negative too;
-        // a final abs would incorrectly turn gcd(MIN, MAX) from -1 into 1.
-        let (mut lhs, mut rhs) = (
-            self.torch_int_abs(rhs).cast(DType::I64),
-            self.torch_int_abs(lhs).cast(DType::I64),
-        );
+        // PyTorch takes abs in the operand dtype before Euclid. That ordering
+        // is observable at MIN: same-width wrapping abs leaves MIN negative,
+        // while widening first would make (for example) I32::MIN positive.
+        let lhs = self.torch_int_abs(lhs);
+        let rhs = self.torch_int_abs(rhs);
+        let mut lhs = lhs.cast(DType::I64);
+        let mut rhs = rhs.cast(DType::I64);
         let one = self.constant_like(lhs, 1.0);
         let zero = self.constant_like(lhs, 0.0);
-        for round in 0..rounds {
+        for _ in 0..rounds {
             let finished = self.exact_is_zero(rhs);
+            // `maximum(|rhs|, 1)` gives the ordinary remainder a statically
+            // positive divisor. I64::MIN is the sole exception because its
+            // wrapping magnitude remains negative. Division by I64::MIN has
+            // a simple exact spelling over I64: `lhs % MIN` is `0` for MIN
+            // and `lhs` otherwise. Selecting that spelling preserves
+            // PyTorch's signed Euclid state without weakening the remainder
+            // proof gate or evaluating an overflowing MIN / -1 division.
             let magnitude = self.torch_int_abs(rhs);
+            let divisor_is_min = magnitude.lt(zero);
             let safe_rhs = magnitude.maximum(one);
-            let mut remainder = lhs.trunc_rem(safe_rhs);
-            // Only the initial divisor can be I64::MIN: every remainder
-            // thereafter is strictly smaller in magnitude. Division by MIN
-            // yields the dividend unchanged, except MIN % MIN == 0.
-            if round == 0 {
-                let by_min = lhs.eq(rhs).select(zero, lhs);
-                remainder = magnitude.lt(zero).select(by_min, remainder);
-            }
+            let ordinary_remainder = lhs.trunc_rem(safe_rhs);
+            let min_remainder = lhs.eq(rhs).select(zero, lhs);
+            let remainder = divisor_is_min.select(min_remainder, ordinary_remainder);
             lhs = finished.select(lhs, rhs);
             rhs = finished.select(zero, remainder);
         }
+        // Do not take another abs here. A wrapped MIN operand can make the
+        // final signed remainder negative (for example gcd(MIN, 6) == -2),
+        // and that sign is part of PyTorch's authored result.
         Ok(lhs.cast(output_dtype))
     }
 

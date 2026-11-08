@@ -5,6 +5,12 @@ dependency enforces the same minimum during installation. On Linux/Windows,
 the configured CUDA wheel source is CUDA 13.0; the CUDA 12.8 index does not
 provide PyTorch 2.14 wheels.
 
+The PyTorch program, including DTensor placement and collective semantics, is
+authoritative. Region partitioning and runtime search preserve that program;
+they do not choose new dtypes, accumulator behavior, shards, placements, or
+collective order. If an exact local operation or distribution contract is not
+supported, compilation fails.
+
 ## Run a minimal SPMD example
 
 From the repository root:
@@ -104,7 +110,8 @@ short and long token sequences and dispatches at the application layer.
 ## Initial SPMD contract
 
 Use one CPU process per rank, a Gloo process group, and a CPU `DeviceMesh`.
-DTensor placements specify the sharding plan. AOTAutograd traces DTensor's
+DTensor placements specify the sharding plan and are immutable model semantics.
+AOTAutograd traces DTensor's
 local operations and creates the forward and backward programs. For example,
 with a one-dimensional mesh:
 

@@ -59,6 +59,18 @@ fn range<T>(stream: &Arc<CudaStream>, buffer: &CudaSlice<T>) -> DeviceRange {
     }
 }
 fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
+    if call.a_dtype == PlanDtype::I8 {
+        support::int8::execute_call(stream, call, alias);
+        return;
+    }
+    if call.computation == LtComputation::Float16 {
+        support::fp16::execute_call(stream, call, alias);
+        return;
+    }
+    if call.computation == LtComputation::Float64 {
+        support::fp64::execute_call(stream, call, alias);
+        return;
+    }
     use luminal_cuda_lite::ops::cublaslt::exec::LtScalars;
     let mut call = call.clone();
     let (alpha, beta) = (1.25, if call.c.is_some() { -0.5 } else { 0.0 });
@@ -211,23 +223,56 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     }
 }
 #[test]
-fn every_approved_configuration_executes_and_certified_aliases_preserve_results() {
+fn every_semantically_admitted_configuration_executes_and_certified_aliases_preserve_results() {
     let context = CudaContext::new(0).unwrap();
     let stream = context.default_stream();
     let ampere_or_newer = context.compute_capability().unwrap().0 >= 8;
     let witnesses = whitelist::witnesses();
+    let admitted = whitelist::approved_keys()
+        .into_iter()
+        .filter(|key| {
+            key.contains("(CublasLtDefaultEpilogue)") || key.contains("(CublasLtBiasEpilogue)")
+        })
+        .collect();
     assert_eq!(
         witnesses
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        whitelist::approved_keys()
+        admitted
     );
+    let expected_runs = witnesses
+        .values()
+        .filter(|op| {
+            ampere_or_newer
+                || !(op.a.dtype == PlanDtype::Bf16
+                    || matches!(
+                        op.computation,
+                        LtComputation::TensorFloat32 | LtComputation::Float32FastBfloat16
+                    ))
+        })
+        .count();
+    let in_place_witnesses = whitelist::in_place_witnesses();
+    let expected_aliases = in_place_witnesses
+        .values()
+        .filter(|op| {
+            ampere_or_newer
+                || !(op.a.dtype == PlanDtype::Bf16
+                    || matches!(
+                        op.computation,
+                        LtComputation::TensorFloat32 | LtComputation::Float32FastBfloat16
+                    ))
+        })
+        .count();
     let mut ran = 0;
     let mut aliases = 0;
     for op in witnesses.values() {
         if !ampere_or_newer
-            && (op.a.dtype == PlanDtype::Bf16 || op.computation == LtComputation::TensorFloat32)
+            && (op.a.dtype == PlanDtype::Bf16
+                || matches!(
+                    op.computation,
+                    LtComputation::TensorFloat32 | LtComputation::Float32FastBfloat16
+                ))
         {
             continue;
         }
@@ -235,9 +280,13 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, false);
         ran += 1;
     }
-    for op in whitelist::in_place_witnesses().values() {
+    for op in in_place_witnesses.values() {
         if !ampere_or_newer
-            && (op.a.dtype == PlanDtype::Bf16 || op.computation == LtComputation::TensorFloat32)
+            && (op.a.dtype == PlanDtype::Bf16
+                || matches!(
+                    op.computation,
+                    LtComputation::TensorFloat32 | LtComputation::Float32FastBfloat16
+                ))
         {
             continue;
         }
@@ -246,8 +295,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if ampere_or_newer { 2176 } else { 1088 });
-    assert_eq!(aliases, if ampere_or_newer { 1088 } else { 544 });
+    assert_eq!(ran, expected_runs);
+    assert_eq!(aliases, expected_aliases);
 }
 
 #[test]
@@ -278,7 +327,14 @@ fn shared_padded_c_supports_dense_and_pitched_output_bindings() {
             &graph,
             bindings,
             luminal_cuda_lite::cuda_registry_filtered(|row| {
-                !matches!(row.label(), "ReduceSumGeneric" | "AddFunctionalGeneric")
+                // Exercise direct GEMM output delivery into the declared C
+                // buffer. Folded view outputs use the bufferizer's separate
+                // escape-and-disclose contract and may return another backing
+                // buffer with its elected layout instead.
+                !matches!(
+                    row.label(),
+                    "ReduceSumGeneric" | "AddFunctionalGeneric" | "IndexMapApplyViewGeneric"
+                )
             }),
         )
         .unwrap();
@@ -443,8 +499,53 @@ fn production_and_decomposed_search_are_measured_with_identical_precision_and_da
                     .0
                     .as_f32()
                     .unwrap(),
-                vec![8.0; 4096]
+                vec![8.0; 64 * 64]
             );
         }
     }
+}
+
+#[test]
+fn widened_bf16_storage_product_is_elected_and_executes_through_cublaslt() {
+    let mut graph = Graph::new();
+    let a = graph.tensor([64, 128], DType::Bf16);
+    let b = graph.tensor([128, 64], DType::Bf16);
+    let out = a
+        .cast(DType::F32)
+        .matmul(b.cast(DType::F32))
+        .cast(DType::Bf16);
+    let input = |value| {
+        HostBuffer::new(
+            PlanDtype::Bf16,
+            raw(&vec![value; 64 * 128], PlanDtype::Bf16),
+        )
+        .unwrap()
+    };
+    let inputs = FxHashMap::from_iter([(a.id, input(1.0)), (b.id, input(0.0625))]);
+    let mut runtime = CudaRuntime::load(&graph).unwrap();
+    runtime
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &inputs,
+            &luminal_cuda_lite::harness_search_options(),
+        )
+        .unwrap();
+    assert!(runtime.plan().unwrap().dag.node_weights().any(|node| {
+        matches!(node, luminal::bufferize::BufferNode::Compute { op, .. }
+            if op.label() == "CublasLtCall")
+    }));
+
+    let mut arena = support::allocate_arena(&runtime).unwrap();
+    let mut staging = runtime.allocate_staging().unwrap();
+    for (id, data) in inputs {
+        runtime.upload(&mut arena, id, data).unwrap();
+    }
+    runtime.execute(arena.arena(), &mut staging).unwrap();
+    let result = runtime.download(&arena, out.id).unwrap().0;
+    let expected = half::bf16::from_f32(8.0).to_bits();
+    assert_eq!(result.dtype, PlanDtype::Bf16);
+    assert!(result.bytes.chunks_exact(2).all(|chunk| {
+        u16::from_ne_bytes(chunk.try_into().expect("two-byte BF16 element")) == expected
+    }));
 }

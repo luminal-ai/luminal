@@ -1,6 +1,7 @@
 //! Production proof, descriptor coherence, and bufferization regressions.
 use luminal::dtype::PlanDtype;
 use luminal::layout_ir::{ExtractedNode, ExtractionSite, OpMatcher};
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::egraph_serialize::EGraph;
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
     CONSTRUCTOR as IN_PLACE_CONSTRUCTOR, CublasLtAccumulateInPlace,
@@ -30,9 +31,7 @@ fn run(body: &str, checks: &str) -> EGraph {
     egraph
         .parse_and_run_program(None, &source)
         .unwrap_or_else(|error| panic!("experiment egglog: {error}"));
-    egraph
-        .serialize(luminal::prelude::egglog::SerializeConfig::default())
-        .egraph
+    egraph.serialize_compact_filtered(|_| true)
 }
 
 fn input(name: &str, rows: &str, cols: &str, strides: Option<(&str, &str)>, dtype: &str) -> String {
@@ -208,20 +207,118 @@ fn c_then_bias_is_the_only_fully_fused_addition_order() {
 }
 
 #[test]
-fn only_f32_calls_are_minted() {
-    for dtype in ["F32", "F16", "Bf16"] {
+fn direct_products_require_an_explicitly_admitted_arithmetic_dtype() {
+    use luminal_cuda_lite::ops::cublaslt::exec::LtComputation;
+    for (dtype, expected) in [
+        (
+            "F32",
+            Some((LtComputation::Float32, PlanDtype::F32, PlanDtype::F32)),
+        ),
+        (
+            "F16",
+            Some((LtComputation::Float16, PlanDtype::F16, PlanDtype::F16)),
+        ),
+        (
+            "F64",
+            Some((LtComputation::Float64, PlanDtype::F64, PlanDtype::F64)),
+        ),
+        ("Bf16", None),
+    ] {
         let body = input("a", "(IntLit 3)", "(IntLit 8)", None, dtype)
             + &input("b", "(IntLit 8)", "(IntLit 4)", None, dtype)
             + "(let p (LogicalHelperMatrixMultiply a b))\n";
         let graph = run(&body, "");
-        let count = graph
-            .nodes
-            .values()
-            .filter(|node| node.op == CONSTRUCTOR)
-            .count();
-        assert_eq!(count > 0, dtype == "F32", "dtype={dtype}, calls={count}");
-        println!("WHITELIST {dtype}: {count} calls");
+        let calls = calls(&graph);
+        assert_eq!(!calls.is_empty(), expected.is_some(), "dtype={dtype}");
+        for call in calls {
+            let (computation, storage, scale) = expected.unwrap();
+            assert_eq!(call.computation, computation);
+            assert_eq!(
+                (call.a.dtype, call.b.dtype, call.d.dtype, call.scale),
+                (storage, storage, storage, scale)
+            );
+        }
     }
+}
+
+#[test]
+fn complete_admission_consumes_only_frame_keyed_semantic_markers() {
+    let rules = luminal_cuda_lite::ops::cublaslt::approved::RULES;
+    let admission = rules
+        .split(
+            ":name \"cublaslt: approve one complete configuration with exact logical semantics\"",
+        )
+        .next()
+        .unwrap()
+        .rsplit("(rule")
+        .next()
+        .unwrap();
+    for marker in [
+        "cublaslt-matrix-product-semantics",
+        "cublaslt-call-argument-semantics",
+        "cublaslt-approved-configuration",
+    ] {
+        assert!(
+            admission.contains(marker),
+            "final admission must consume {marker}"
+        );
+    }
+    for raw_proof in [
+        "cublaslt-expression-frame",
+        "cublaslt-operand-storage-reading",
+        "cublaslt-matrix-reading",
+        "cublaslt-destination-reading",
+        "cublaslt-C-matrix-argument",
+        "cublaslt-bias-argument",
+        "cublaslt-scalar-arguments",
+        "shape-of",
+        "dtype-of",
+        "LayoutTensorLit",
+    ] {
+        assert!(
+            !admission.contains(raw_proof),
+            "final admission must not reopen raw proof table {raw_proof}"
+        );
+    }
+}
+
+#[test]
+fn many_independent_frames_saturate_through_semantic_markers() {
+    const FRAME_COUNT: usize = 64;
+    let mut body = String::new();
+    for index in 0..FRAME_COUNT {
+        body += &input(
+            &format!("a_{index}"),
+            "(IntLit 3)",
+            "(IntLit 8)",
+            None,
+            "F32",
+        );
+        body += &input(
+            &format!("b_{index}"),
+            "(IntLit 8)",
+            "(IntLit 4)",
+            None,
+            "F32",
+        );
+        body +=
+            &format!("(let product_{index} (LogicalHelperMatrixMultiply a_{index} b_{index}))\n");
+    }
+    let graph = run(
+        &body,
+        r#"
+(check (cublaslt-a-matrix-semantics ?frame ?compute ?arithmetic ?scale ?storage ?m ?k ?order ?transpose ?descriptor))
+(check (cublaslt-b-matrix-semantics ?frame ?compute ?arithmetic ?scale ?storage ?k ?n ?order ?transpose ?descriptor))
+(check (cublaslt-destination-semantics ?frame ?m ?n ?storage ?order ?descriptor ?epilogue))
+(check (cublaslt-matrix-product-semantics ?frame ?compute ?arithmetic ?scale ?A_storage ?B_storage ?D_storage ?epilogue ?A_order ?B_order ?D_order ?A_transpose ?B_transpose ?A_descriptor ?B_descriptor ?D_descriptor ?m))
+(check (cublaslt-call-argument-semantics ?frame ?D_descriptor ?m ?scale ?C_argument ?C_type ?bias_argument ?bias_type ?pointer_mode ?scalars))
+"#,
+    );
+    let roots: std::collections::BTreeSet<_> = calls(&graph)
+        .into_iter()
+        .map(|call| call.logical_root)
+        .collect();
+    assert_eq!(roots.len(), FRAME_COUNT);
 }
 
 fn calls(graph: &EGraph) -> Vec<ApprovedCublasLt> {
@@ -293,8 +390,12 @@ fn f32_fixture_configurations_have_coherent_descriptor_witnesses() {
     let graph = all_families();
     let calls = calls(&graph);
     let keys: std::collections::BTreeSet<_> = calls.iter().map(configuration_key).collect();
-    assert_eq!(keys.len(), 40);
+    assert_eq!(keys.len(), 24);
     for op in &calls {
+        assert_eq!(
+            op.activation,
+            luminal_cuda_lite::ops::cublaslt::exec::LtActivation::Identity
+        );
         assert_eq!(op.scale, PlanDtype::F32);
         assert_eq!(
             [

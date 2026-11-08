@@ -1538,6 +1538,7 @@ mod intcoordvar_probe {
 #[cfg(test)]
 mod stage4b_probes {
     use luminal::dtype::DType;
+    use luminal::prelude::CompactSnapshotExt;
     use luminal::shape::SliceRange;
 
     /// (History: this module held the Step-4b degenerate-broadcast
@@ -1645,8 +1646,7 @@ mod stage4b_probes {
             // ignition. Serialization runs only near/after ignition.
             let channel_counts =
                 |egraph: &mut luminal::prelude::egglog::EGraph| -> (usize, usize, usize) {
-                    use luminal::prelude::egglog::SerializeConfig;
-                    let serialized = egraph.serialize(SerializeConfig::default()).egraph;
+                    let serialized = egraph.serialize_compact_filtered(|_| true);
                     let mut intadd_nodes = 0usize;
                     let mut intadd_classes = std::collections::HashSet::new();
                     let mut all_classes = std::collections::HashSet::new();
@@ -1874,8 +1874,7 @@ mod stage4b_probes {
                     }
                 }
             }
-            use luminal::prelude::egglog::SerializeConfig;
-            let serialized = egraph.serialize(SerializeConfig::default()).egraph;
+            let serialized = egraph.serialize_compact_filtered(|_| true);
             let mut classes = std::collections::HashSet::new();
             let mut intadd = 0usize;
             for node in serialized.nodes.values() {

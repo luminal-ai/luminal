@@ -32,15 +32,50 @@ pub mod device {
     use super::memory::Allocation;
     use anyhow::{Context, Result, anyhow, bail};
     use luminal::bufferize::BufferNode;
+    use luminal::dtype::{DType, PlanDtype};
     use luminal::graph::Graph;
     use luminal::prelude::{FxHashMap, NodeIndex};
     use luminal_cuda_lite::CudaRuntime;
     use luminal_cuda_lite::HostBuffer;
 
+    fn bf16_weights(n: usize, seed: usize) -> Result<HostBuffer> {
+        let byte_len = n
+            .checked_mul(2)
+            .context("BF16 parameter payload byte count overflow")?;
+        const PERIOD: usize = 121;
+        const PERIODS_PER_TILE: usize = 4096;
+        let pattern = (0..PERIOD)
+            .flat_map(|i| {
+                let value = (((i * 37 + seed * 101 + 13) % PERIOD) as f32 / 100.0) - 0.6;
+                half::bf16::from_f32(value).to_bits().to_ne_bytes()
+            })
+            .collect::<Vec<_>>();
+        let mut tile = Vec::with_capacity(pattern.len() * PERIODS_PER_TILE);
+        for _ in 0..PERIODS_PER_TILE {
+            tile.extend_from_slice(&pattern);
+        }
+        let mut bytes = vec![0; byte_len];
+        for chunk in bytes.chunks_mut(tile.len()) {
+            chunk.copy_from_slice(&tile[..chunk.len()]);
+        }
+        HostBuffer::new(PlanDtype::Bf16, bytes)
+    }
+
+    pub fn bf16(values: Vec<f32>) -> Result<HostBuffer> {
+        HostBuffer::new(
+            PlanDtype::Bf16,
+            values
+                .into_iter()
+                .flat_map(|value| half::bf16::from_f32(value).to_bits().to_ne_bytes())
+                .collect(),
+        )
+    }
+
     /// Fill every logical input in a model graph. Callers provide the
     /// semantically constrained runtime inputs (token ids, cache indices,
-    /// masks, and so on); all remaining F32 inputs are model parameters and
-    /// receive deterministic synthetic values.
+    /// masks, and so on); all remaining F32 or BF16 inputs are model parameters
+    /// and receive deterministic synthetic values in their declared storage
+    /// dtype.
     pub fn seeded_graph_inputs(
         cx: &Graph,
         overrides: Vec<(NodeIndex, HostBuffer)>,
@@ -51,19 +86,19 @@ pub mod device {
             let value = if let Some(value) = overrides.remove(&spec.id) {
                 value
             } else {
-                if spec.dtype != luminal::dtype::DType::F32 {
-                    bail!(
-                        "'{}' ({:?}) needs an explicit runtime value",
-                        spec.label,
-                        spec.dtype
-                    );
-                }
                 let elements = spec
                     .dims
                     .iter()
                     .map(|dim| dim.to_usize().context("static example dimension"))
                     .product::<Result<usize>>()?;
-                super::weights(elements, seed).into()
+                match spec.dtype {
+                    DType::F32 => super::weights(elements, seed).into(),
+                    DType::Bf16 => bf16_weights(elements, seed)?,
+                    other => bail!(
+                        "'{}' ({other:?}) needs an explicit runtime value",
+                        spec.label
+                    ),
+                }
             };
             pairs.push((spec.id, value));
         }

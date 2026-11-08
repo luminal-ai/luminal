@@ -323,6 +323,30 @@ def _drop_input_guards(ep):
         ep._guards_code = []
 
 
+def _run_decompositions_without_guards(ep, decomposition_table):
+    """Run export decompositions without carrying eager-only input guards.
+
+    ``run_decompositions`` retraces the unlifted program and can populate a
+    fresh ``_guards_code`` list on the returned ExportedProgram even when the
+    input program's guards were already cleared.  A later decomposition pass
+    would then execute that generated ``_guards_fn`` while retracing.  Besides
+    the data-dependent guards described in :func:`_drop_input_guards`, PyTorch
+    can emit guard expressions that refer to generated
+    ``__meta_utils_unknown_tensor*`` globals which are not installed in the
+    unlifted module's namespace.
+
+    Luminal validates the compiled boundary itself, so those eager consumer
+    guards are neither part of the authored tensor program nor needed by the
+    backend.  Clear them on both sides of every decomposition pass.  Doing so
+    centrally also makes repeated passes obey the same invariant.
+    """
+
+    _drop_input_guards(ep)
+    decomposed = ep.run_decompositions(decomposition_table)
+    _drop_input_guards(decomposed)
+    return decomposed
+
+
 def _drop_dead_data_dependent_ops(gm):
     """Remove ``aten.item.default`` (and other data-dependent ops) with no users.
 
@@ -357,6 +381,7 @@ __all__ = [
     "_decomp_table",
     "_drop_dead_data_dependent_ops",
     "_drop_input_guards",
+    "_run_decompositions_without_guards",
     "_get_cache_dict",
     "_lower_sym_sum",
     "_register_cache_serialization",

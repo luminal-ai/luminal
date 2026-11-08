@@ -12,7 +12,7 @@
 mod all_gather;
 use all_gather::LogicalAllGather;
 
-use egraph_serialize::Node;
+use crate::snapshot::compact::Node;
 
 use crate::egglog_snippet::EgglogSnippet;
 

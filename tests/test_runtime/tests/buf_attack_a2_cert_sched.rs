@@ -80,7 +80,7 @@ fn report(name: &str, text: &str, require_view: bool) {
     let plan = luminal::bufferize::bufferize(&dps, &table).expect("the view output escapes");
     let summary = plan.summary();
     println!("[{name}] plan:\n{summary}");
-    use luminal::bufferize::{BufferId, BufferNode};
+    use luminal::bufferize::BufferNode;
     assert!(
         !plan.dag.node_indices().any(|i| matches!(
             &plan.dag[i],
@@ -99,17 +99,10 @@ fn report(name: &str, text: &str, require_view: bool) {
     if require_view {
         assert!(views > 0, "fixture must elect a view");
     }
-    if views > 0 {
-        assert!(
-            matches!(slot.buffer, BufferId::Allocated(_)),
-            "view storage escapes: {summary}"
-        );
-    } else {
-        assert!(
-            matches!(slot.buffer, BufferId::Boundary(_)),
-            "identity result writes the bound destination: {summary}"
-        );
-    }
+    // Complete GEMM transposition may absorb the output view and leave only
+    // input views. A view may also read a base already written to a boundary
+    // buffer. Neither case requires minted storage: zero copies, caller
+    // ownership and the disclosed value layout are the common invariants.
     assert_eq!(
         plan.buffers[&slot.buffer].freed_by,
         luminal::layout_ir::FreedBy::Caller,
@@ -131,9 +124,7 @@ fn report(name: &str, text: &str, require_view: bool) {
         table.get(&slot.value),
         "[{name}] the binding discloses the slot value's own elected layout:\n{summary}"
     );
-    if !require_view {
-        assert_roundtrip_values(&plan);
-    }
+    assert_product_values(&plan, require_view);
     println!("[{name}] view-nodes(dps)={views}");
 }
 
@@ -141,8 +132,9 @@ fn report(name: &str, text: &str, require_view: bool) {
 /// storage, then read the folded output layout. An independent dense product
 /// catches a wrong transpose, operand swap, or view composition even when the
 /// number of elected views changes.
-fn assert_roundtrip_values(
+fn assert_product_values(
     plan: &luminal::bufferize::BufferIrGraph<luminal::layouts::DecodedLayout>,
+    transposed: bool,
 ) {
     use luminal::bufferize::BufferNode;
     use luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt;
@@ -163,8 +155,20 @@ fn assert_roundtrip_values(
             _ => None,
         })
         .collect();
-    assert_eq!(calls.len(), 1, "the fixture has one complete product");
-    let (call, reads, writes) = &calls[0];
+    let output = plan
+        .dag
+        .node_weights()
+        .find_map(|node| match node {
+            BufferNode::BufferOutput { slots } => Some(&slots[0]),
+            _ => None,
+        })
+        .unwrap();
+    // Separate bound layouts may elect duplicate products. Check the actual
+    // writer of slot zero instead of requiring a particular CSE outcome.
+    let (call, reads, _) = calls
+        .iter()
+        .find(|(_, _, writes)| writes.contains(&output.buffer))
+        .expect("a product writes the output's backing storage");
     assert!(call.c.is_none() && call.bias.is_none());
     let at = |d: &LtDesc, row, col| match d.order {
         LtOrder::Row => row * d.ld as usize + col,
@@ -198,20 +202,9 @@ fn assert_roundtrip_values(
             storage[at(&call.d, row, col)] = value as f32;
         }
     }
-    let output = plan
-        .dag
-        .node_weights()
-        .find_map(|node| match node {
-            BufferNode::BufferOutput { slots } => Some(&slots[0]),
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(
-        output.buffer, writes[0],
-        "views fold onto the product storage"
-    );
-    let actual = test_runtime::test_equality::dense_f32(&storage, &output.layout, &[4, 3]).unwrap();
-    let expected: Vec<f32> = (0..4)
+    let dims = if transposed { [3, 4] } else { [4, 3] };
+    let actual = test_runtime::test_equality::dense_f32(&storage, &output.layout, &dims).unwrap();
+    let product: Vec<f32> = (0..4)
         .flat_map(|row| {
             let (x, w) = (&x, &w);
             (0..3).map(move |col| {
@@ -221,9 +214,19 @@ fn assert_roundtrip_values(
             })
         })
         .collect();
+    let expected: Vec<f32> = if transposed {
+        (0..3)
+            .flat_map(|row| {
+                let product = &product;
+                (0..4).map(move |col| product[col * 3 + row])
+            })
+            .collect()
+    } else {
+        product
+    };
     assert_eq!(
         actual, expected,
-        "double transpose preserves the original product"
+        "the elected GEMM and disclosed output layout preserve the product"
     );
 }
 

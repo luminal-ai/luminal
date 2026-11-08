@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -45,8 +45,7 @@ def create_app(backend: str, local_project_dir: Path):
     image = (
         modal.Image.from_registry(
             f"ghcr.io/luminal-ai/luminal-docker:{'cuda' if backend == 'cuda_lite' else 'cpu'}",
-            # Serialized class bytecode must match the launcher interpreter.
-            add_python=f"{sys.version_info.major}.{sys.version_info.minor}",
+            add_python="3.11",
         )
         .env({"CUDARC_CUDA_VERSION": CUDARC_CUDA_VERSION})
         .workdir(PROJECT_DIR)
@@ -71,7 +70,7 @@ def create_app(backend: str, local_project_dir: Path):
     )
 
     def _utc_now() -> str:
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     def _hf_token_secret() -> modal.Secret | None:
         hf_token = os.environ.get(HF_TOKEN_ENV_KEY)
@@ -90,7 +89,7 @@ def create_app(backend: str, local_project_dir: Path):
         )
 
     def _run_id() -> str:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         return f"{timestamp}-{uuid.uuid4().hex[:8]}"
 
     def _prepare_scratch_dir(scratch_dir: Path) -> None:
@@ -187,12 +186,24 @@ def create_app(backend: str, local_project_dir: Path):
             return DEFAULT_TIMEOUT
         return timeout
 
-    @app.cls(image=image, timeout=DEFAULT_TIMEOUT, serialized=True)
+    # The serialized class closes over both volume objects to commit test cache
+    # and profiling data. Register them as static class dependencies so Modal
+    # hydrates them before serializing the class definition.
+    @app.cls(
+        image=image,
+        timeout=DEFAULT_TIMEOUT,
+        serialized=True,
+        volumes={
+            HF_CACHE_PATH: HF_CACHE_VOLUME,
+            PROFILE_VOLUME_PATH: PROFILE_VOLUME,
+        },
+    )
     class TestRunner:
         @modal.method()
         def run(
             self,
             pytest_args: list[str],
+            pytest_suites: list[str] | None = None,
             pytest_addopts: str = "",
             profile_enabled: bool = False,
         ) -> dict[str, Any]:
@@ -238,27 +249,39 @@ def create_app(backend: str, local_project_dir: Path):
                     )
 
             svg_requested = profile_enabled and dot_available
-            cmd = [
-                "uv",
-                "run",
-                "--project",
-                f"{PROJECT_DIR}/{backend}",
-                "--group",
-                "dev",
-                "python",
-                "-m",
-                "pytest",
-                "-c",
-                f"{PROJECT_DIR}/{backend}/pyproject.toml",
-                *sanitized_pytest_args,
-            ]
-            exit_code = subprocess.run(
-                cmd,
-                check=False,
-                env=env,
-                cwd=str(scratch_dir) if scratch_dir is not None else PROJECT_DIR,
-            ).returncode
-            modal.Volume.from_name(HF_CACHE_VOLUME_NAME).commit()
+            exit_code = 0
+            # Pytest registers fixtures from every explicitly supplied
+            # conftest in one global plugin manager. Running backend-owned,
+            # shared-parity, and model roots together therefore lets an
+            # autouse fixture from one sibling tree change another tree's
+            # tensor device. Keep the extension build and Modal container
+            # shared, but give independently rooted suites independent pytest
+            # sessions so each sees only its own conftest hierarchy.
+            for suite in pytest_suites or [None]:
+                cmd = [
+                    "uv",
+                    "run",
+                    "--project",
+                    f"{PROJECT_DIR}/{backend}",
+                    "--group",
+                    "dev",
+                    "python",
+                    "-m",
+                    "pytest",
+                    "-c",
+                    f"{PROJECT_DIR}/{backend}/pyproject.toml",
+                ]
+                if suite is not None:
+                    cmd.append(suite)
+                cmd.extend(sanitized_pytest_args)
+                completed = subprocess.run(
+                    cmd,
+                    check=False,
+                    env=env,
+                    cwd=str(scratch_dir) if scratch_dir is not None else PROJECT_DIR,
+                )
+                exit_code = max(exit_code, completed.returncode)
+            HF_CACHE_VOLUME.commit()
             finished_at = _utc_now()
 
             if not profile_enabled:
@@ -312,7 +335,7 @@ def create_app(backend: str, local_project_dir: Path):
 
     def _parse_cli_args(
         cli_args: tuple[str, ...],
-    ) -> tuple[str, int, bool, str | None, list[str]]:
+    ) -> tuple[str, int, bool, str | None, list[str], list[str]]:
         parser = argparse.ArgumentParser(
             prog="modal run modal_pytest_runner.py",
             add_help=False,
@@ -339,14 +362,39 @@ def create_app(backend: str, local_project_dir: Path):
             "--profile-output-dir",
             help="Directory to download profiling artifacts into when profiling is enabled.",
         )
+        parser.add_argument(
+            "--pytest-suite",
+            action="append",
+            default=[],
+            help=(
+                "Run this pytest root in an isolated session. Repeat for sibling "
+                "trees with independent conftest hierarchies."
+            ),
+        )
         parsed, pytest_args = parser.parse_known_args(cli_args)
 
         if pytest_args and pytest_args[0] == "--":
             pytest_args = pytest_args[1:]
-        if not pytest_args:
-            pytest_args = [f"{backend}/tests", "utils/tests"]
+        pytest_suites = parsed.pytest_suite
+        if not pytest_suites:
+            # ``pull_request_target`` evaluates workflow YAML from the base
+            # branch.  During the transition to ``--pytest-suite``, an older
+            # workflow can therefore invoke a newer checked-out launcher with
+            # the three historical positional roots.  Recognize those roots
+            # here as suites as well so sibling conftests remain isolated even
+            # before the workflow change itself lands on the base branch.
+            legacy_suites = {
+                f"{backend}/tests",
+                "utils/tests",
+                "reference/tests/models",
+            }
+            pytest_suites = [arg for arg in pytest_args if arg in legacy_suites]
+            if pytest_suites:
+                pytest_args = [arg for arg in pytest_args if arg not in legacy_suites]
+        if not pytest_args and not pytest_suites:
+            pytest_suites = [f"{backend}/tests", "utils/tests"]
             if backend == "cuda_lite":
-                pytest_args.append("reference/tests/models")
+                pytest_suites.append("reference/tests/models")
 
         return (
             parsed.gpu,
@@ -354,27 +402,31 @@ def create_app(backend: str, local_project_dir: Path):
             parsed.profile,
             parsed.profile_output_dir,
             pytest_args,
+            pytest_suites,
         )
 
     def main(*cli_args: str):
-        gpu, timeout, cli_profile, profile_output_dir, pytest_args = _parse_cli_args(
-            cli_args
-        )
+        (
+            gpu,
+            timeout,
+            cli_profile,
+            profile_output_dir,
+            pytest_args,
+            pytest_suites,
+        ) = _parse_cli_args(cli_args)
         profile_enabled = _profiling_enabled(cli_profile, pytest_args)
         pytest_addopts = os.environ.get("PYTEST_ADDOPTS", "")
         timeout = _effective_timeout(timeout)
         runner_options = {"gpu": gpu} if gpu else {}
         hf_token_secret = _hf_token_secret()
-        runner_volumes = {HF_CACHE_PATH: HF_CACHE_VOLUME}
+
         runner_options["timeout"] = timeout
-        if profile_enabled:
-            runner_volumes[PROFILE_VOLUME_PATH] = PROFILE_VOLUME
-        runner_options["volumes"] = runner_volumes
         if hf_token_secret is not None:
             runner_options["secrets"] = [hf_token_secret]
         runner = TestRunner.with_options(**runner_options)()
         result = runner.run.remote(
             pytest_args=pytest_args,
+            pytest_suites=pytest_suites,
             pytest_addopts=pytest_addopts,
             profile_enabled=profile_enabled,
         )

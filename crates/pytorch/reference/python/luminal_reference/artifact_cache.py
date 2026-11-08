@@ -233,9 +233,12 @@ class CompiledArtifact:
             raise RuntimeError(
                 "artifact device type differs from the requested runtime"
             )
-        # Region examples are metadata-only FakeTensors, serialized by
-        # torch.export's own reducer. Keep weights-only loading and scope the
-        # allowlist to that upstream reconstruction function.
+        # Export archives containing FakeTensor example inputs use PyTorch's
+        # own reconstruction helper.  PyTorch 2.14's restricted loader does
+        # not yet allowlist that helper by default, then its fallback warning
+        # has a malformed format argument and can fail under pytest's log
+        # capture.  Trust only this precise PyTorch-owned constructor while
+        # retaining ``weights_only`` handling for every other archive object.
         from torch._export.serde.serialize import _reconstruct_fake_tensor
 
         with torch.serialization.safe_globals([_reconstruct_fake_tensor]):

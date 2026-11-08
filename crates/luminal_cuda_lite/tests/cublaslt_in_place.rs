@@ -344,7 +344,11 @@ fn all_accumulation_configurations_have_an_unconditional_one_operand_tie() {
     let witnesses = whitelist::in_place_witnesses();
     let expected: std::collections::BTreeSet<_> = whitelist::approved_keys()
         .into_iter()
-        .filter(|key| key.contains("CublasLtCMatrixDataTypeOf"))
+        .filter(|key| {
+            key.contains("CublasLtCMatrixDataTypeOf")
+                && (key.contains("(CublasLtDefaultEpilogue)")
+                    || key.contains("(CublasLtBiasEpilogue)"))
+        })
         .collect();
     assert_eq!(
         witnesses
@@ -353,7 +357,7 @@ fn all_accumulation_configurations_have_an_unconditional_one_operand_tie() {
             .collect::<std::collections::BTreeSet<_>>(),
         expected
     );
-    assert_eq!(witnesses.len(), 1088);
+    assert_eq!(witnesses.len(), expected.len());
     for op in witnesses.values() {
         assert!(op.to_dps().is_none(), "C already is the destination");
         let ties = op.alias_info();

@@ -177,9 +177,9 @@ fn int64_gcd_finishes_the_worst_case_fibonacci_pairs() {
     assert_eq!(actual, expected);
 }
 
-/// ATen takes wrapping abs before its signed Euclid loop. MIN therefore
-/// remains negative and gcd(MIN, MAX) returns -1, while gcd(MIN, 0)
-/// remains MIN. Preserve these same-width results (LUM-1134).
+/// Torch takes same-width wrapping abs before signed Euclid. Therefore MIN
+/// remains negative and can make the final remainder negative; this is not
+/// the mathematical nonnegative gcd, but it is the authored torch result.
 #[test]
 fn int64_gcd_at_the_minimum_matches_torch() {
     let (min, max) = (i64::MIN, i64::MAX);
@@ -190,6 +190,8 @@ fn int64_gcd_at_the_minimum_matches_torch() {
         ((min, 6), -2),
         ((-1, min), 1),
         ((min, -1), 1),
+        ((-7, min), -1),
+        ((min, -7), -1),
         ((0, min), min),
         ((min, 0), min),
         ((min, min), min),
@@ -217,4 +219,25 @@ fn int32_gcd_finishes_the_worst_case_fibonacci_pairs() {
     let actual = run_gcd(TorchDType::Int, &pairs, (-max, max));
     let expected = pairs.iter().map(|&(a, b)| gcd(a, b)).collect::<Vec<_>>();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn int32_gcd_at_the_minimum_matches_torch() {
+    let (min, max) = (i32::MIN as i64, i32::MAX as i64);
+    let cases = [
+        ((max, min), -1),
+        ((min, max), -1),
+        ((6, min), -2),
+        ((min, 6), -2),
+        ((-1, min), 1),
+        ((min, -1), 1),
+        ((-7, min), 1),
+        ((min, -7), 1),
+        ((0, min), min),
+        ((min, 0), min),
+        ((min, min), min),
+    ];
+    let pairs = cases.map(|(pair, _)| pair);
+    let actual = run_gcd(TorchDType::Int, &pairs, (min, max));
+    assert_eq!(actual, cases.map(|(_, expected)| expected));
 }

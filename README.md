@@ -57,6 +57,18 @@ The core of Luminal is and always will be minimal. It should be possible to unde
 
 Luminal directly integrates with PyTorch as a compiler backend. Simply do `torch.compile(model, backend=luminal_cuda)` to compile your PyTorch models. We also have an excellent tensor API in Rust.
 
+### Model semantics are immutable
+
+The PyTorch or Rust model definition is the single source of functional truth.
+Luminal preserves its operations, shapes, dtypes, casts, accumulator/output
+dtypes and explicit rounding boundaries, mutation, and sharding/collective
+semantics. Reduction order is unspecified unless the model explicitly authors
+an ordered operation, so equivalent implementations may reassociate it. Egglog can
+choose different kernels, fusions, layouts, schedules, and buffer reuse only
+when they are equivalent to that definition. The compiler does not silently
+change precision or distribution to gain speed or fit memory; an unsupported
+model is refused instead.
+
 ### RISC-style architecture
 
 Everything in Luminal boils down to 15 primitive ops:
@@ -101,7 +113,12 @@ A fully-static world would be nice, but we live in a world of nessecary dynamism
 
 **But why?**
 
-A consequence of this is that the actual computation that gets ran can be radically different than the code that was written. Since we have an entire neural network fully represented in a compute graph, Luminal has global knowledge. This means we can push most ML complexity to the compiler. For instance, devices, datatypes, and even autograd is modeled ahead of time and optimized by the compiler!
+A consequence is that the physical implementation can be radically different
+from the code that was written while the model's observable function remains
+the same. Since the entire neural network is represented in a compute graph,
+Luminal has global knowledge and can optimize kernels, fusion, layouts,
+schedules, and storage. Authored dtype, accumulation, and sharding semantics do
+not become compiler choices merely because the compiler can see them.
 
 Now we can do:
 

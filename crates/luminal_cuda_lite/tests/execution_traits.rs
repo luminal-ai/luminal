@@ -240,6 +240,7 @@ fn all_cublaslt_dps_forms_keep_the_host_interface_when_cloned() {
                 .then(|| luminal_cuda_lite::ops::cublaslt::approved::Bias {
                     tensor: "bias".into(),
                     dtype: luminal::dtype::PlanDtype::F32,
+                    batch_stride_in_elements: luminal::index_expr::IotaExpr::Lit(0),
                 });
         let dps = functional.to_dps().unwrap();
         let cloned = dps.clone_bt_box();

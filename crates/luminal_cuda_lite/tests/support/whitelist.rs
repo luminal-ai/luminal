@@ -32,7 +32,7 @@ fn resolved_key(call: &LtCall, scale: luminal::dtype::PlanDtype) -> String {
         }
     };
     format!(
-        "(CublasLtConfigurationOf ({}) ({:?}) ({:?}) ({:?}) {} ({:?}) {} ({}) ({}) ({}) ({}) ({}) ({}) ({}))",
+        "(CublasLtConfigurationOf ({}) ({:?}) ({:?}) ({:?}) {} ({:?}) {} ({}) ({}) ({}) ({}) ({}) ({}) ({}) ({}))",
         call.computation.egglog_constructor(),
         scale,
         call.a_dtype,
@@ -59,7 +59,8 @@ fn resolved_key(call: &LtCall, scale: luminal::dtype::PlanDtype) -> String {
         order(call.b.order),
         order(call.d.order),
         op(call.trans_a),
-        op(call.trans_b)
+        op(call.trans_b),
+        call.reduction_scheme_mask.egglog_constructor()
     )
 }
 pub fn approved_keys() -> std::collections::BTreeSet<String> {
@@ -87,26 +88,38 @@ pub fn approved_keys() -> std::collections::BTreeSet<String> {
 }
 fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
     let mut graphs = Vec::new();
-    for (dtype, tf32, narrow) in [
-        (DType::F32, false, false),
-        (DType::Bf16, false, false),
-        (DType::F16, false, false),
-        (DType::F32, true, false),
-        (DType::Bf16, false, true),
-        (DType::F16, false, true),
+    for (dtype, input_rounding, narrow, native_half) in [
+        (DType::F16, None, false, true),
+        (DType::I8, None, false, false),
+        (DType::F32, None, false, false),
+        (DType::F64, None, false, false),
+        (DType::Bf16, None, false, false),
+        (DType::F16, None, false, false),
+        (DType::F32, Some(DType::TF32), false, false),
+        (DType::F32, Some(DType::F16), false, false),
+        (DType::F32, Some(DType::Bf16), false, false),
+        (DType::Bf16, None, true, false),
+        (DType::F16, None, true, false),
     ] {
         for ta in [false, true] {
             for tb in [false, true] {
                 let mut model = Graph::new();
+                let compute = if native_half {
+                    DType::F16
+                } else if dtype == DType::F64 {
+                    DType::F64
+                } else {
+                    DType::F32
+                };
                 let mut a = model
                     .tensor(if ta { [8, 3] } else { [3, 8] }, dtype)
-                    .cast(DType::F32);
+                    .cast(compute);
                 let mut b = model
                     .tensor(if tb { [4, 8] } else { [8, 4] }, dtype)
-                    .cast(DType::F32);
-                if tf32 {
-                    a = a.cast(DType::TF32).cast(DType::F32);
-                    b = b.cast(DType::TF32).cast(DType::F32);
+                    .cast(compute);
+                if let Some(rounding) = input_rounding {
+                    a = a.cast(rounding).cast(compute);
+                    b = b.cast(rounding).cast(compute);
                 }
                 if ta {
                     a = a.permute(&[1, 0]);
@@ -115,11 +128,11 @@ fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
                     b = b.permute(&[1, 0]);
                 }
                 let p = a.matmul(b);
-                let addend_dtype = if narrow { dtype } else { DType::F32 };
-                let c = model.tensor([3, 4], addend_dtype).cast(DType::F32);
+                let addend_dtype = if narrow { dtype } else { compute };
+                let c = model.tensor([3, 4], addend_dtype).cast(compute);
                 let bias = model
                     .tensor([4], addend_dtype)
-                    .cast(DType::F32)
+                    .cast(compute)
                     .expand_dim(0, 3);
                 let _acc = p + c;
                 let _biased = p + bias;
@@ -214,6 +227,104 @@ pub fn tf32_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
     table_registry(TABLE.as_str())
 }
 
+/// Force TF32 input rounding while also requiring the call to consume the F32
+/// C matrix and bias. Exact frontend activations and final casts stay separate.
+pub fn tf32_c_bias_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        approved_keys()
+            .into_iter()
+            .filter(|key| {
+                key.contains("CublasLtTensorFloat32Computation")
+                    && key.contains("(CublasLtCMatrixDataTypeOf (F32))")
+                    && key.contains("(CublasLtBiasDataTypeOf (F32))")
+            })
+            .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+            .collect()
+    });
+    table_registry(TABLE.as_str())
+}
+
+pub fn int8_registry(device: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|index| {
+            approved_keys()
+                .into_iter()
+                .filter(|key| {
+                    key.contains("(I8) (I8)")
+                        && key.contains(if index == 1 {
+                            "CublasLtDeviceScalarPointerMode"
+                        } else {
+                            "CublasLtHostScalarPointerMode"
+                        })
+                })
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    table_registry(&TABLES[usize::from(device)])
+}
+
+pub fn fp16_registry(device: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|index| {
+            approved_keys()
+                .into_iter()
+                .filter(|key| {
+                    key.contains("CublasLtFloat16Computation")
+                        && key.contains(if index == 1 {
+                            "CublasLtDeviceScalarPointerMode"
+                        } else {
+                            "CublasLtHostScalarPointerMode"
+                        })
+                })
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    table_registry(&TABLES[usize::from(device)])
+}
+
+pub fn fast16_registry(bfloat: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        [
+            "CublasLtFloat32FastFloat16Computation",
+            "CublasLtFloat32FastBfloat16Computation",
+        ]
+        .map(|mode| {
+            approved_keys()
+                .into_iter()
+                .filter(|key| key.contains(mode))
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    table_registry(&TABLES[usize::from(bfloat)])
+}
+
+/// Require F32-fast input rounding while also forcing the call to consume the
+/// authored F32 C matrix and bias. Exact frontend activations remain separate
+/// because their exceptional-value semantics are not vendor epilogues.
+pub fn fast16_c_bias_registry(bfloat: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        [
+            "CublasLtFloat32FastFloat16Computation",
+            "CublasLtFloat32FastBfloat16Computation",
+        ]
+        .map(|mode| {
+            approved_keys()
+                .into_iter()
+                .filter(|key| {
+                    key.contains(mode)
+                        && key.contains("(CublasLtCMatrixDataTypeOf (F32))")
+                        && key.contains("(CublasLtBiasDataTypeOf (F32))")
+                })
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    table_registry(&TABLES[usize::from(bfloat)])
+}
+
 /// Require a complete narrow-output row; generic FP32 calls cannot hide a
 /// missing final-rounding or narrow C/bias proof in these execution tests.
 pub fn narrow_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
@@ -255,7 +366,71 @@ pub fn scalar_registry(device: bool, narrow: bool) -> Vec<luminal_cuda_lite::Reg
     table_registry(&TABLES[usize::from(device) + 2 * usize::from(narrow)])
 }
 
-fn table_registry(table: &'static str) -> Vec<luminal_cuda_lite::RegisteredOp> {
+/// Require the requested native epilogue, so generic activation kernels cannot
+/// hide missing recognition or let profiling choose a decomposed substitute.
+pub fn fp16_epilogue_registry(
+    device: bool,
+    bias: bool,
+    activation: LtActivation,
+) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    native_epilogue_registry(true, device, bias, activation)
+}
+
+pub fn fp64_epilogue_registry(
+    device: bool,
+    bias: bool,
+    activation: LtActivation,
+) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    native_epilogue_registry(false, device, bias, activation)
+}
+
+fn native_epilogue_registry(
+    half: bool,
+    device: bool,
+    bias: bool,
+    activation: LtActivation,
+) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 24]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|index| {
+            let epilogue = match ((index % 12) / 4, index & 2 != 0) {
+                (0, false) => "CublasLtDefaultEpilogue",
+                (0, true) => "CublasLtBiasEpilogue",
+                (1, false) => "CublasLtRectifiedLinearEpilogue",
+                (1, true) => "CublasLtRectifiedLinearBiasEpilogue",
+                (2, false) => "CublasLtGaussianErrorLinearEpilogue",
+                (2, true) => "CublasLtGaussianErrorLinearBiasEpilogue",
+                _ => unreachable!(),
+            };
+            approved_keys()
+                .into_iter()
+                .filter(|key| {
+                    key.contains(if index >= 12 {
+                        "(CublasLtFloat16Computation)"
+                    } else {
+                        "(CublasLtFloat64Computation)"
+                    }) && key.contains(&format!("({epilogue})"))
+                        && key.contains(if index & 1 == 1 {
+                            "CublasLtDeviceScalarPointerMode"
+                        } else {
+                            "CublasLtHostScalarPointerMode"
+                        })
+                })
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    let activation = match activation {
+        LtActivation::Identity => 0,
+        LtActivation::RectifiedLinear => 1,
+        LtActivation::GaussianErrorLinear => 2,
+    };
+    table_registry(
+        &TABLES
+            [12 * usize::from(half) + usize::from(device) + 2 * usize::from(bias) + 4 * activation],
+    )
+}
+
+pub fn table_registry(table: &'static str) -> Vec<luminal_cuda_lite::RegisteredOp> {
     use luminal::egglog_snippet::EgglogSnippet;
     use luminal::layout_ir::LayoutIrOp;
     #[derive(Debug)]

@@ -15,7 +15,7 @@
 //!
 //! Idempotent by construction: DPS forms answer `to_dps() = None`.
 
-use egraph_serialize::ClassId;
+use crate::snapshot::compact::ClassId;
 
 use crate::buffer_tensor_ir::Poison;
 use crate::layout_ir::{

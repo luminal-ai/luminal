@@ -137,5 +137,9 @@ pub(crate) fn kernel(
     _op: &dyn BufferTensorIrOp,
     ctx: &mut ReferenceKernelCtx,
 ) -> anyhow::Result<()> {
-    ctx.unary_elementwise_typed(|x| x.recip(), |x| x.recip())
+    if matches!(ctx.operands[0], crate::typed_buffer::TypedBuffer::F16(_)) {
+        ctx.unary_elementwise_f16(|x| half::f16::from_f32(x.to_f32().recip()))
+    } else {
+        ctx.unary_elementwise_typed(|x| x.recip(), |x| x.recip())
+    }
 }

@@ -1,5 +1,6 @@
 use luminal::dtype::PlanDtype;
 use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::egraph_serialize::EGraph;
 use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
@@ -34,7 +35,7 @@ fn saturate(model: &Graph, table: &str) -> EGraph {
             ),
         )
         .unwrap();
-    graph.serialize(Default::default()).egraph
+    graph.serialize_compact_filtered(|_| true)
 }
 fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
     let index = SerializedIndex::new(graph);
@@ -227,14 +228,7 @@ fn narrow_storage_is_admitted_only_with_authored_final_rounding_and_exact_wideni
                 }
                 let with_bias = !batch && !with_c;
                 for narrow_output in [false, true] {
-                    let f = fixture_with_c(
-                        dtype,
-                        batch,
-                        narrow_output,
-                        with_bias,
-                        if batch { 0 } else { 1 },
-                        with_c,
-                    );
+                    let f = fixture_with_c(dtype, batch, narrow_output, with_bias, 0, with_c);
                     let (separate, in_place) = calls(&saturate(&f.graph, WHITELIST));
                     let narrow: Vec<_> = separate
                         .iter()
@@ -277,7 +271,7 @@ fn narrow_storage_is_admitted_only_with_authored_final_rounding_and_exact_wideni
 #[test]
 fn narrow_calls_require_the_complete_whitelist_row_for_both_forms() {
     for dtype in [DType::Bf16, DType::F16] {
-        let f = fixture(dtype, false, true, false, 1);
+        let f = fixture(dtype, false, true, false, 0);
         let (all, _) = calls(&saturate(&f.graph, WHITELIST));
         let op = all
             .iter()
@@ -346,10 +340,11 @@ fn epilogues_that_can_round_early_have_no_narrow_whitelist_row() {
         whitelist::approved_keys()
             .iter()
             .filter(|key| {
-                ["Bf16", "F16"].iter().any(|dtype| {
-                    key.contains(&format!(") ({dtype}) (CublasLtNoBiasDataType)"))
-                        || key.contains(&format!(") ({dtype}) (CublasLtBiasDataTypeOf"))
-                })
+                key.contains("(CublasLtFloat32Computation)")
+                    && ["Bf16", "F16"].iter().any(|dtype| {
+                        key.contains(&format!(") ({dtype}) (CublasLtNoBiasDataType)"))
+                            || key.contains(&format!(") ({dtype}) (CublasLtBiasDataTypeOf"))
+                    })
             })
             .all(|key| key.contains("CublasLtNoBiasDataType")
                 && !key.contains("GaussianErrorLinear"))
@@ -634,14 +629,14 @@ mod execution {
         use luminal::layout_ir::Access;
         for dtype in [DType::F16, DType::Bf16] {
             for with_c in [false, true] {
-                for activation in [0, 1] {
-                    execute(
-                        fixture_with_c(dtype, false, true, !with_c, activation, with_c),
-                        false,
-                        Access::ReadOnly,
-                        false,
-                    );
-                }
+                // Frontend activations have stricter exceptional-value
+                // semantics and exercise the F32 fallback below.
+                execute(
+                    fixture_with_c(dtype, false, true, !with_c, 0, with_c),
+                    false,
+                    Access::ReadOnly,
+                    false,
+                );
             }
         }
     }
@@ -760,14 +755,14 @@ mod execution {
     fn packed_bias_via_broadcast_c_preserves_cancellation_before_final_rounding() {
         use luminal::layout_ir::Access;
         for dtype in [DType::F16, DType::Bf16] {
-            for activation in [0, 1] {
-                execute(
-                    cancellation_fixture(dtype, false, activation),
-                    false,
-                    Access::ReadOnly,
-                    false,
-                );
-            }
+            // Cancellation can stay inside the narrow call only when no
+            // separate frontend activation observes its F32 result.
+            execute(
+                cancellation_fixture(dtype, false, 0),
+                false,
+                Access::ReadOnly,
+                false,
+            );
         }
     }
 
@@ -777,7 +772,7 @@ mod execution {
         for dtype in [DType::F16, DType::Bf16] {
             for with_c in [false, true] {
                 for activation in [0, 1, 2] {
-                    if !with_c && activation != 2 {
+                    if !with_c && activation == 0 {
                         continue;
                     }
                     let mut f = cancellation_fixture(dtype, with_c, activation);

@@ -27,7 +27,7 @@ fn run() -> anyhow::Result<()> {
     const SLOTS: usize = 4;
     let dims = Gemma4Dims::gemma4_26b_a4b();
     let mut cx = Graph::new();
-    let model = Gemma4Moe::init(&mut cx, &dims);
+    let model = Gemma4Moe::init_with_dtype(&mut cx, &dims, DType::Bf16);
     let token = cx.tensor(vec![1], DType::Int);
     let q_pos = cx.tensor(vec![1], DType::Int);
     let sliding_cos = cx.tensor(vec![1, dims.sliding_head_dim], DType::F32);

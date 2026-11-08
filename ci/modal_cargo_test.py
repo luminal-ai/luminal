@@ -4,7 +4,9 @@ import subprocess
 
 import modal
 
-# The precision suites exercise BF16 and TF32 cuBLASLt modes (SM80+).
+# The cuBLASLt device suites exercise BF16-fast configurations that require
+# Ampere or newer hardware. Keep this overridable for focused probes, but run
+# the complete default board on the A100 it is validated against.
 gpu_type = os.environ.get("GPU_TYPE", "A100")
 modal_timeout = int(os.environ.get("MODAL_TIMEOUT", "7200"))
 CUDARC_CUDA_VERSION = "12080"
@@ -80,10 +82,19 @@ def run_nccl_all_gather():
     """Exercise the native collective on two ranks and two CUDA devices."""
     subprocess.run(
         [
-            "cargo", "test", "--release", "-p", "luminal_cuda_lite",
-            "--features", "device", "--test", "all_gather",
+            "cargo",
+            "test",
+            "--release",
+            "-p",
+            "luminal_cuda_lite",
+            "--features",
+            "device",
+            "--test",
+            "all_gather",
             "nccl_all_gather_replays_with_new_shapes_and_arenas",
-            "--", "--ignored", "--nocapture",
+            "--",
+            "--ignored",
+            "--nocapture",
         ],
         cwd=WORKDIR,
         check=True,

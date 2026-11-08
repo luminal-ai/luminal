@@ -4,6 +4,7 @@
 use crate::host_buffer::HostBuffer;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::bufferize::BufferIrGraph;
+use luminal::prelude::CompactSnapshotExt;
 
 use crate::search::{CompileOptions, SearchOutcome};
 use luminal::graph;
@@ -268,8 +269,8 @@ impl MetalRuntime {
             bail!("shape contracts failed:\n  - {}", doors.join("\n  - "));
         }
         self.decoders.check(&egraph)?;
-        let serialized = egraph.serialize(luminal::prelude::egglog::SerializeConfig::default());
-        Ok((serialized.egraph, program))
+        let serialized = egraph.serialize_compact_filtered(|_| true);
+        Ok((serialized, program))
     }
 
     pub fn search(

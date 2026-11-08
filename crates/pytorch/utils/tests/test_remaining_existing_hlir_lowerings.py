@@ -1305,10 +1305,12 @@ class NanMedianSlots(torch.nn.Module):
 
 
 def test_nanmedian_slot_matches_eager_on_the_backend_path(monkeypatch) -> None:
-    # Odd and even non-NaN counts, a single value, and an all-NaN row: the
-    # slot is (count - 1) // 2, or 0 with no values. The NaNs trail each row:
-    # the lowering's NaN reorder is composed in the wrong frame when a NaN
-    # precedes a value (reported separately), and this test is about the slot.
+    # Odd and even non-NaN counts, a single value, and an all-NaN row. Median
+    # indices are device-specific when the selected value is not unique, so
+    # compare values to eager and separately prove that each returned index
+    # names its returned value. The NaNs trail each row: the lowering's NaN
+    # reorder is composed in the wrong frame when a NaN precedes a value
+    # (reported separately), and this test is about the selected slot.
     nan = float("nan")
     inputs = (
         torch.tensor(
@@ -1323,7 +1325,20 @@ def test_nanmedian_slot_matches_eager_on_the_backend_path(monkeypatch) -> None:
     )
     module = NanMedianSlots()
     compiled, attempts = _backend_path(module, monkeypatch)
-    _assert_close(compiled(*inputs), module(*inputs))
+    actual, expected = compiled(*inputs), module(*inputs)
+    actual, _ = torch.utils._pytree.tree_flatten(actual)
+    expected, _ = torch.utils._pytree.tree_flatten(expected)
+    for value_slot, index_slot in ((0, 1), (2, 3)):
+        torch.testing.assert_close(
+            actual[value_slot], expected[value_slot], equal_nan=True
+        )
+        indices = actual[index_slot]
+        gathered = torch.gather(inputs[0], 1, indices.reshape(inputs[0].shape[0], 1))
+        torch.testing.assert_close(
+            gathered.reshape(actual[value_slot].shape),
+            actual[value_slot],
+            equal_nan=True,
+        )
     _assert_stage_one(attempts, "aten.nanmedian.dim")
 
 

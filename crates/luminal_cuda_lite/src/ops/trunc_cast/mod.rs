@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, cuda_type, math_function, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, math_call, unary};
 use anyhow::Result;
 
 /// `TruncCastGeneric(input) -> out` — pure dataflow form.
@@ -93,9 +93,7 @@ impl LayoutIrOp for TruncCastDps {}
 /// field of its own.
 impl KernelOp for TruncCastDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-        let to = cuda_type(ctx.dest_dtypes[0])?;
-        let function = math_function(ctx, 1, "truncf", "trunc")?;
-        unary(ctx, &format!("({to}){function}(a[i])"))
+        unary(ctx, &math_call(ctx, 1, "truncf", "trunc", &["a[i]"])?)
     }
 }
 

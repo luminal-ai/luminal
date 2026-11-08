@@ -16,6 +16,7 @@ fn call(form: CublasLtForm) -> LtCall {
     };
     LtCall {
         computation: luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float32,
+        reduction_scheme_mask: luminal_cuda_lite::ops::cublaslt::exec::LtReductionSchemeMask::All,
         form,
         m: 4,
         n: 3,
@@ -44,6 +45,7 @@ fn call(form: CublasLtForm) -> LtCall {
             .then_some(luminal_cuda_lite::ops::cublaslt::exec::LtBiasInput {
                 operand: if form.has_c() { 3 } else { 2 },
                 data_type: luminal::dtype::PlanDtype::F32,
+                batch_stride_in_elements: 0,
             }),
     }
 }
@@ -177,4 +179,34 @@ fn scalar_dtype_and_device_scalar_capacity_are_checked_before_dispatch() {
         op.validate_against(&[100, 100], 100).is_err(),
         "absent C requires beta zero"
     );
+}
+
+#[test]
+fn batched_bias_bounds_cover_the_last_vector_without_requiring_padding_after_it() {
+    for form in [CublasLtForm::Bias, CublasLtForm::AccumulateBias] {
+        for stride in [0, 4, 12] {
+            let mut call = call(form);
+            for desc in [&mut call.a, &mut call.b, &mut call.d] {
+                desc.batch_count = 3;
+                desc.batch_stride_in_elements = desc.rows * desc.cols;
+            }
+            if let Some(c) = call.c.as_mut() {
+                c.descriptor = call.d;
+            }
+            call.bias.as_mut().unwrap().batch_stride_in_elements = stride;
+            let mut sizes = vec![60, 45];
+            if form.has_c() {
+                sizes.push(36);
+            }
+            sizes.push((2 * stride + 4) as usize);
+            call.validate_against(&sizes, 36).unwrap();
+            *sizes.last_mut().unwrap() -= 1;
+            assert!(call.validate_against(&sizes, 36).is_err());
+            for bad in [-1, 2, 5, i64::MAX] {
+                call.bias.as_mut().unwrap().batch_stride_in_elements = bad;
+                *sizes.last_mut().unwrap() = usize::MAX;
+                assert!(call.validate_against(&sizes, 36).is_err(), "stride={bad}");
+            }
+        }
+    }
 }

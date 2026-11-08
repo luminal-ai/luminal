@@ -1,3 +1,17 @@
+; Arithmetic precision supplies typed identities and the scalar ABI. Storage
+; never selects it; both semantic operands must have this same arithmetic dtype.
+(relation cublaslt-arithmetic-type (Dtype LogicalTensor LogicalTensor))
+(cublaslt-arithmetic-type (F16) (LogicalCast (LogicalConstant 0.0) (F16)) (LogicalCast (LogicalConstant 1.0) (F16)))
+(cublaslt-arithmetic-type (F32) (LogicalConstant 0.0) (LogicalConstant 1.0))
+(cublaslt-arithmetic-type (F64) (LogicalConstantF64 0.0) (LogicalConstantF64 1.0))
+(relation cublaslt-scale-data-type (CublasLtComputationType Dtype Dtype))
+(cublaslt-scale-data-type (CublasLtFloat16Computation) (F16) (F16))
+(cublaslt-scale-data-type (CublasLtFloat32Computation) (F32) (F32))
+(cublaslt-scale-data-type (CublasLtTensorFloat32Computation) (F32) (F32))
+(cublaslt-scale-data-type (CublasLtFloat32FastFloat16Computation) (F32) (F32))
+(cublaslt-scale-data-type (CublasLtFloat32FastBfloat16Computation) (F32) (F32))
+(cublaslt-scale-data-type (CublasLtFloat64Computation) (F64) (F64))
+(relation cublaslt-exact-storage-reading (Dtype LogicalTensor LogicalTensor))
 ; Production proof relations. None of these helper facts is an executable call.
 (relation cublaslt-approved-configuration (CublasLtConfiguration))
 (relation cublaslt-layout-axis (LayoutTensor Shape i64 IntExpr IntExpr))
@@ -19,7 +33,7 @@
 (relation cublaslt-scalar-multiplication (LogicalTensor LogicalTensor LogicalTensor))
 (relation cublaslt-scalar-demand (LogicalTensor LogicalTensor))
 (relation cublaslt-scalar-arguments
-  (LogicalTensor LogicalTensor CublasLtScalarPointerMode CublasLtScalarArguments LayoutTensorList))
+  (LogicalTensor LogicalTensor Dtype CublasLtScalarPointerMode CublasLtScalarArguments LayoutTensorList))
 (relation cublaslt-product-with-C-matrix
   (LogicalTensor LogicalTensor LogicalTensor CublasLtLogicalCMatrix LogicalTensor LogicalTensor))
 (relation cublaslt-logical-expression
@@ -31,6 +45,28 @@
     LayoutTensorList))
 (relation cublaslt-bias-argument
   (CublasLtExpressionFrame IntExpr CublasLtBiasArgument CublasLtBiasDataType LayoutTensorList))
+; Frame-keyed semantic markers keep complete call admission out of one giant
+; conjunctive query. Each marker proves one independently meaningful boundary;
+; later rules join only these compact facts, never the underlying layout and
+; dtype tables again.
+(relation cublaslt-a-matrix-semantics
+  (CublasLtExpressionFrame CublasLtComputationType Dtype Dtype Dtype IntExpr IntExpr
+    CublasLtMatrixOrder CublasLtMatrixOperation CublasLtMatrixDescriptor))
+(relation cublaslt-b-matrix-semantics
+  (CublasLtExpressionFrame CublasLtComputationType Dtype Dtype Dtype IntExpr IntExpr
+    CublasLtMatrixOrder CublasLtMatrixOperation CublasLtMatrixDescriptor))
+(relation cublaslt-destination-semantics
+  (CublasLtExpressionFrame IntExpr IntExpr Dtype CublasLtMatrixOrder
+    CublasLtMatrixDescriptor CublasLtEpilogue))
+(relation cublaslt-matrix-product-semantics
+  (CublasLtExpressionFrame CublasLtComputationType Dtype Dtype Dtype Dtype Dtype
+    CublasLtEpilogue CublasLtMatrixOrder CublasLtMatrixOrder CublasLtMatrixOrder
+    CublasLtMatrixOperation CublasLtMatrixOperation CublasLtMatrixDescriptor
+    CublasLtMatrixDescriptor CublasLtMatrixDescriptor IntExpr))
+(relation cublaslt-call-argument-semantics
+  (CublasLtExpressionFrame CublasLtMatrixDescriptor IntExpr Dtype
+    CublasLtCMatrixArgument CublasLtCMatrixDataType CublasLtBiasArgument
+    CublasLtBiasDataType CublasLtScalarPointerMode CublasLtScalarArguments))
 ; Complete, whitelist-approved call descriptions are proof facts, not ops.
 ; Executable forms consume this same admission result without reinterpreting it.
 (relation cublaslt-approved-call
@@ -50,10 +86,11 @@
 (cublaslt-narrow-storage-data-type (Bf16))
 (cublaslt-narrow-storage-data-type (F16))
 (rule
-  ((= (dtype-of ?arithmetic_expression) (F32)))
+  ((= ?arithmetic_type (dtype-of ?arithmetic_expression))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero ?one))
   ((cublaslt-output-storage-reading ?arithmetic_expression ?arithmetic_expression))
   :ruleset backend
-  :name "cublaslt: F32 output preserves the arithmetic expression")
+  :name "cublaslt: output storage preserves its arithmetic dtype")
 (rule
   ((= ?stored_expression (LogicalCast ?arithmetic_expression ?storage_data_type))
    (cublaslt-narrow-storage-data-type ?storage_data_type)
@@ -230,26 +267,29 @@
 ; Recognize complete logical expressions; never match an existing library call.
 (rule
   ((= ?matrix_product (LogicalHelperMatrixMultiply ?A_operand ?B_operand))
-   (= (dtype-of ?A_operand) (F32))
-   (= (dtype-of ?B_operand) (F32))
-   (= (dtype-of ?matrix_product) (F32)))
+   (= ?arithmetic_type (dtype-of ?matrix_product))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero ?one)
+   (= (dtype-of ?A_operand) ?arithmetic_type)
+   (= (dtype-of ?B_operand) ?arithmetic_type))
   ((cublaslt-logical-matrix-product ?matrix_product ?A_operand ?B_operand))
   :ruleset backend
   :name "cublaslt: logical product")
 (rule
   ((cublaslt-scaled-matrix-product ?matrix_product ?A_operand ?B_operand ?alpha)
    (= ?expression (LogicalAdd ?matrix_product ?C_matrix))
-   (= (shape-of ?matrix_product) (shape-of ?C_matrix)))
+   (= (shape-of ?matrix_product) (shape-of ?C_matrix))
+   (cublaslt-arithmetic-type (dtype-of ?matrix_product) ?zero ?one))
   ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand (CublasLtCMatrixOf ?C_matrix)
-     ?alpha (LogicalConstant 1.0)))
+     ?alpha ?one))
   :ruleset backend
   :name "cublaslt: product then C in one order")
 (rule
   ((cublaslt-scaled-matrix-product ?matrix_product ?A_operand ?B_operand ?alpha)
    (= ?expression (LogicalAdd ?C_matrix ?matrix_product))
-   (= (shape-of ?matrix_product) (shape-of ?C_matrix)))
+   (= (shape-of ?matrix_product) (shape-of ?C_matrix))
+   (cublaslt-arithmetic-type (dtype-of ?matrix_product) ?zero ?one))
   ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand (CublasLtCMatrixOf ?C_matrix)
-     ?alpha (LogicalConstant 1.0)))
+     ?alpha ?one))
   :ruleset backend
   :name "cublaslt: C then product in one authored addition")
 (rule
@@ -272,14 +312,16 @@
 (rule
   ((= ?output_expression
      (LogicalSelect (LogicalLessThan ?activation_input ?zero_tensor) ?zero_tensor ?activation_input))
-   (= ?zero_tensor (LogicalIndexMapApply (LogicalConstant 0.0) ?zero_broadcast_index_map ?activation_shape))
+   (cublaslt-arithmetic-type (dtype-of ?activation_input) ?zero_literal ?one_literal)
+   (= ?zero_tensor (LogicalIndexMapApply ?zero_literal ?zero_broadcast_index_map ?activation_shape))
    (= ?zero_broadcast_index_map (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))))
    (= ?activation_shape (shape-of ?activation_input)))
   ((cublaslt-rectified-linear-activation ?output_expression ?activation_input))
   :ruleset backend
   :name "cublaslt: select ReLU")
-; The frontend's full maximum_f32 spelling, including NaN propagation.
-; Admission accepts the vendor ReLU sign-of-zero difference.
+; The frontend's full maximum_f32 spelling, including NaN propagation. This is
+; recognition only; its exceptional-value and signed-zero behavior prevents
+; promotion to the current vendor ReLU epilogue.
 (rule
   ((= ?comparison_zero
      (LogicalIndexMapApply (LogicalConstant 0.0) ?comparison_zero_broadcast_index_map
@@ -336,44 +378,59 @@
   ((cublaslt-rectified-linear-activation ?output_expression ?activation_input))
   :ruleset backend
   :name "cublaslt: frontend ReLU")
-(rule
-  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias (CublasLtDefaultEpilogue) ?alpha ?beta)
-   (cublaslt-rectified-linear-activation ?output_expression ?expression))
-  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtRectifiedLinearEpilogue) ?alpha ?beta))
-  :ruleset backend
-  :name "cublaslt: ReLU of expression without bias")
-(rule
-  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias (CublasLtBiasEpilogue) ?alpha ?beta)
-   (cublaslt-rectified-linear-activation ?output_expression ?expression))
-  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtRectifiedLinearBiasEpilogue) ?alpha ?beta))
-  :ruleset backend
-  :name "cublaslt: ReLU of biased expression")
-; GELU recognition is local to F32 matrix expressions. These facts describe
+; GELU recognition is local to typed matrix expressions. These facts describe
 ; existing frontend DAGs; they neither construct arithmetic nor union tensors.
-; Both frontend GELU approximations may use the vendor tanh approximation.
-; No cast is skipped, and every scalar is an exact F32 broadcast to this shape.
+; Scalar proofs describe the authored literal and its one explicit cast.
+; Their f64 field is the source literal, not the rounded result: F16 coefficients
+; retain that cast, while widening an F32 constant to F64 preserves its value.
+; These syntax facts never publish storage readings or fold arbitrary cast chains.
 (relation cublaslt-gaussian-error-linear-input (LogicalTensor))
 (relation cublaslt-gaussian-error-linear-activation (LogicalTensor LogicalTensor))
-(relation cublaslt-float32-scalar-broadcast (LogicalTensor f64 Shape))
+(relation cublaslt-gaussian-error-linear-sign (LogicalTensor LogicalTensor))
+(relation cublaslt-authored-scalar-broadcast (Dtype LogicalTensor f64 Shape))
+; exp() authors a full-width log2(e) constant for F64, unlike its F32 spelling.
+(relation cublaslt-elementary-exponential-scale (Dtype f64))
+(cublaslt-elementary-exponential-scale (F16) 1.4426950216293335)
+(cublaslt-elementary-exponential-scale (F32) 1.4426950216293335)
+(cublaslt-elementary-exponential-scale (F64) 1.4426950408889634)
 (rule
   ((= ?broadcast (LogicalIndexMapApply (LogicalConstant ?value)
        (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape)))
-  ((cublaslt-float32-scalar-broadcast ?broadcast ?value ?shape))
+  ((cublaslt-authored-scalar-broadcast (F32) ?broadcast ?value ?shape))
   :ruleset backend
-  :name "cublaslt: exact scalar broadcast")
+  :name "cublaslt: exact FP32 scalar broadcast")
+(rule
+  ((= ?broadcast (LogicalIndexMapApply (LogicalConstantF64 ?value)
+       (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape)))
+  ((cublaslt-authored-scalar-broadcast (F64) ?broadcast ?value ?shape))
+  :ruleset backend
+  :name "cublaslt: exact FP64 scalar broadcast")
+(rule
+  ((= ?broadcast (LogicalIndexMapApply (LogicalCast (LogicalConstant ?value) (F64))
+       (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape)))
+  ((cublaslt-authored-scalar-broadcast (F64) ?broadcast ?value ?shape))
+  :ruleset backend
+  :name "cublaslt: exact widening of an authored FP32 scalar to FP64")
+; Native half frontend arithmetic casts each F32 coefficient to F16. Match
+; that exact authored operation; do not call its unrounded source an F16 value.
+(rule
+  ((= ?broadcast (LogicalIndexMapApply (LogicalCast (LogicalConstant ?value) (F16))
+       (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape)))
+  ((cublaslt-authored-scalar-broadcast (F16) ?broadcast ?value ?shape))
+  :ruleset backend
+  :name "cublaslt: authored FP32 scalar explicitly rounded to FP16")
 ; The current frontend maximum(x, 0) keeps x when x is NaN and guards
 ; only the zero operand with isnan. Its exact ordered-comparison count is
 ; two, so that guard is false. Recognize the whole result, including this
 ; guard, so an authored final cast can round after the fused ReLU.
 (rule
   ((= ?shape (shape-of ?activation_input))
-   (= (dtype-of ?activation_input) (F32))
-   (cublaslt-float32-scalar-broadcast ?zero 0.0 ?shape)
-   (cublaslt-float32-scalar-broadcast ?one 1.0 ?shape)
-   (cublaslt-float32-scalar-broadcast ?positive_infinity inf ?shape)
-   (cublaslt-float32-scalar-broadcast ?negative_infinity -inf ?shape)
+   (= ?arithmetic_type (dtype-of ?activation_input))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero_literal ?one_literal)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?zero 0.0 ?shape)
+   (cublaslt-authored-scalar-broadcast (F32) ?one 1.0 ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?positive_infinity inf ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?negative_infinity -inf ?shape)
    (= ?ordered_count (LogicalAdd
      (LogicalCast (LogicalLessThan ?zero ?positive_infinity) (F32))
      (LogicalCast (LogicalLessThan ?negative_infinity ?zero) (F32))))
@@ -385,25 +442,27 @@
 (rule
   ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
      (CublasLtDefaultEpilogue) ?alpha ?beta)
-   (= (dtype-of ?expression) (F32)))
+   (cublaslt-arithmetic-type (dtype-of ?expression) ?zero ?one))
   ((cublaslt-gaussian-error-linear-input ?expression))
   :ruleset backend
   :name "cublaslt: examine default expression for GELU")
 (rule
   ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
      (CublasLtBiasEpilogue) ?alpha ?beta)
-   (= (dtype-of ?expression) (F32)))
+   (cublaslt-arithmetic-type (dtype-of ?expression) ?zero ?one))
   ((cublaslt-gaussian-error-linear-input ?expression))
   :ruleset backend
   :name "cublaslt: examine bias expression for GELU")
 (rule
   ((cublaslt-gaussian-error-linear-input ?activation_input)
    (= ?activation_shape (shape-of ?activation_input))
-   (cublaslt-float32-scalar-broadcast ?one 1.0 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?negative_one -1.0 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?exponential_scale 1.4426950216293335 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?tanh_scale 1.5957691669464111 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?cubic_coefficient 0.044714998453855515 ?activation_shape)
+   (= ?arithmetic_type (dtype-of ?activation_input))
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?one 1.0 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?activation_shape)
+   (cublaslt-elementary-exponential-scale ?arithmetic_type ?exponential_value)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?exponential_scale ?exponential_value ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?tanh_scale 1.5957691669464111 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?cubic_coefficient 0.044714998453855515 ?activation_shape)
    (= ?scaled_input (LogicalMul ?activation_input ?cubic_coefficient))
    (= ?quadratic_term (LogicalMul ?scaled_input ?activation_input))
    (= ?linear_term (LogicalMul ?activation_input ?tanh_scale))
@@ -418,17 +477,53 @@
   ((cublaslt-gaussian-error-linear-activation ?output_expression ?activation_input))
   :ruleset backend
   :name "cublaslt: frontend tanh GELU")
+; Match the sign's complete authored spelling. The current frontend uses
+; exact ordered selects; the older erf graph used x / (abs(x) + epsilon).
+; The legacy epsilon underflows to zero in F16, so that spelling must not
+; authorize a half GELU (it would create 0/0 at zero).
+(relation cublaslt-legacy-smoothed-sign-arithmetic (Dtype))
+(cublaslt-legacy-smoothed-sign-arithmetic (F32))
+(cublaslt-legacy-smoothed-sign-arithmetic (F64))
+(rule
+  ((= ?arithmetic_type (dtype-of ?input))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero_literal ?one_literal)
+   (= ?shape (shape-of ?input))
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?zero 0.0 ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?one 1.0 ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?shape)
+   (= ?negative (LogicalSelect (LogicalLessThan ?input ?zero) ?negative_one ?input))
+   (= ?sign (LogicalSelect (LogicalLessThan ?zero ?input) ?one ?negative)))
+  ((cublaslt-gaussian-error-linear-sign ?input ?sign))
+  :ruleset backend
+  :name "cublaslt: exact ordered-select sign in erf GELU")
+(rule
+  ((= ?arithmetic_type (dtype-of ?input))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero_literal ?one_literal)
+   (= ?shape (shape-of ?input))
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?zero 0.0 ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?shape)
+   (cublaslt-legacy-smoothed-sign-arithmetic ?arithmetic_type)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?epsilon 1.000000013351432e-10 ?shape)
+   (= ?negative (LogicalMul ?input ?negative_one))
+   (= ?absolute (LogicalSelect (LogicalLessThan ?input ?zero) ?negative ?input))
+   (= ?denominator (LogicalAdd ?absolute ?epsilon))
+   (= ?reciprocal (LogicalRecip ?denominator))
+   (= ?sign (LogicalMul ?input ?reciprocal)))
+  ((cublaslt-gaussian-error-linear-sign ?input ?sign))
+  :ruleset backend
+  :name "cublaslt: legacy smoothed sign in erf GELU")
 (rule
   ((cublaslt-gaussian-error-linear-input ?activation_input)
    (= ?activation_shape (shape-of ?activation_input))
-   (cublaslt-float32-scalar-broadcast ?one 1.0 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?negative_one -1.0 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?exponential_scale 1.4426950216293335 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?inverse_square_root_two 0.7071067690849304 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?zero 0.0 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?polynomial_scale 0.32759109139442444 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?sign_epsilon 1.000000013351432e-10 ?activation_shape)
-   (cublaslt-float32-scalar-broadcast ?half 0.5 ?activation_shape)
+   (= ?arithmetic_type (dtype-of ?activation_input))
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?one 1.0 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?activation_shape)
+   (cublaslt-elementary-exponential-scale ?arithmetic_type ?exponential_value)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?exponential_scale ?exponential_value ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?inverse_square_root_two 0.7071067690849304 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?zero 0.0 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_scale 0.32759109139442444 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?half 0.5 ?activation_shape)
    (= ?scaled_activation_input (LogicalMul ?activation_input ?inverse_square_root_two))
    (= ?negative_input_predicate (LogicalLessThan ?scaled_activation_input ?zero))
    (= ?negative_input (LogicalMul ?scaled_activation_input ?negative_one))
@@ -436,23 +531,21 @@
    (= ?scaled_absolute_input (LogicalMul ?absolute_input ?polynomial_scale))
    (= ?polynomial_denominator (LogicalAdd ?scaled_absolute_input ?one))
    (= ?polynomial_argument (LogicalRecip ?polynomial_denominator))
-   (cublaslt-float32-scalar-broadcast ?polynomial_coefficient_five 1.0614054203033447 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_five 1.0614054203033447 ?activation_shape)
    (= ?polynomial_degree_five (LogicalMul ?polynomial_argument ?polynomial_coefficient_five))
-   (cublaslt-float32-scalar-broadcast ?polynomial_coefficient_4 -1.453152060508728 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_4 -1.453152060508728 ?activation_shape)
    (= ?polynomial_sum_4 (LogicalAdd ?polynomial_degree_five ?polynomial_coefficient_4))
    (= ?polynomial_degree_4 (LogicalMul ?polynomial_sum_4 ?polynomial_argument))
-   (cublaslt-float32-scalar-broadcast ?polynomial_coefficient_3 1.421413779258728 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_3 1.421413779258728 ?activation_shape)
    (= ?polynomial_sum_3 (LogicalAdd ?polynomial_degree_4 ?polynomial_coefficient_3))
    (= ?polynomial_degree_3 (LogicalMul ?polynomial_sum_3 ?polynomial_argument))
-   (cublaslt-float32-scalar-broadcast ?polynomial_coefficient_2 -0.2844967246055603 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_2 -0.2844967246055603 ?activation_shape)
    (= ?polynomial_sum_2 (LogicalAdd ?polynomial_degree_3 ?polynomial_coefficient_2))
    (= ?polynomial_degree_2 (LogicalMul ?polynomial_sum_2 ?polynomial_argument))
-   (cublaslt-float32-scalar-broadcast ?polynomial_coefficient_1 0.2548295855522156 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_1 0.2548295855522156 ?activation_shape)
    (= ?polynomial_sum_1 (LogicalAdd ?polynomial_degree_2 ?polynomial_coefficient_1))
    (= ?polynomial_degree_1 (LogicalMul ?polynomial_sum_1 ?polynomial_argument))
-   (= ?sign_denominator (LogicalAdd ?absolute_input ?sign_epsilon))
-   (= ?sign_denominator_reciprocal (LogicalRecip ?sign_denominator))
-   (= ?input_sign (LogicalMul ?scaled_activation_input ?sign_denominator_reciprocal))
+   (cublaslt-gaussian-error-linear-sign ?scaled_activation_input ?input_sign)
    (= ?input_square (LogicalMul ?scaled_activation_input ?scaled_activation_input))
    (= ?negative_input_square (LogicalMul ?input_square ?negative_one))
    (= ?gaussian_exponential_scaled (LogicalMul ?negative_input_square ?exponential_scale))
@@ -467,22 +560,11 @@
   ((cublaslt-gaussian-error-linear-activation ?output_expression ?activation_input))
   :ruleset backend
   :name "cublaslt: frontend erf GELU")
-(rule
-  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtDefaultEpilogue) ?alpha ?beta)
-   (cublaslt-gaussian-error-linear-activation ?output_expression ?expression))
-  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtGaussianErrorLinearEpilogue) ?alpha ?beta))
-  :ruleset backend
-  :name "cublaslt: GELU of default expression")
-(rule
-  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtBiasEpilogue) ?alpha ?beta)
-   (cublaslt-gaussian-error-linear-activation ?output_expression ?expression))
-  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtGaussianErrorLinearBiasEpilogue) ?alpha ?beta))
-  :ruleset backend
-  :name "cublaslt: GELU of bias expression")
+; ReLU and GELU recognition deliberately does not promote a logical expression
+; to a vendor epilogue. cuBLASLt's ReLU exceptional-value behavior and GELU
+; approximation are not equivalent to the authored frontend expressions over
+; their complete domains. Capability rows may remain in the vendor table, but
+; no executable expression can reach them without an exact semantic proof.
 (rule
   ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix (CublasLtNoBias) ?epilogue ?alpha ?beta))
   ((cublaslt-expression-frame
@@ -565,7 +647,7 @@
          ?D_LeadingDimension (IntLit 1) (IntLit 0))))
    (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?layout))
    (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?element_data_type ?matrix_order ?D_matrix_descriptor)
-   (cublaslt-f32-storage-reading ?C_matrix ?C_storage_tensor)
+   (cublaslt-exact-storage-reading (dtype-of ?A_operand) ?C_matrix ?C_storage_tensor)
    (= (shape-of ?C_matrix) (shape-of ?C_storage_tensor))
    (= ?C_layout_tensor (LayoutTensorLit ?C_storage_tensor ?C_layout))
    (cublaslt-C-matrix-reading ?C_layout_tensor ?m ?n ?element_data_type ?matrix_order
@@ -592,47 +674,123 @@
        (CublasLtBiasOf ?bias) ?epilogue ?alpha ?beta))
    (= (shape-of ?output_expression) (ShapeLit (IntExprCons ?m (IntExprCons ?n (IntExprNil)))))
    (= (shape-of ?bias) (ShapeLit (IntExprCons ?m (IntExprNil))))
-   (cublaslt-f32-storage-reading ?bias ?bias_storage_tensor)
+   (cublaslt-exact-storage-reading (dtype-of ?A_operand) ?bias ?bias_storage_tensor)
    (= (shape-of ?bias) (shape-of ?bias_storage_tensor))
    (= ?element_data_type (dtype-of ?bias_storage_tensor))
    (= ?bias_layout_tensor
      (LayoutTensorLit ?bias_storage_tensor
        (RightMajorContiguousElementLayoutLit (shape-of ?bias_storage_tensor) (bits-of ?element_data_type)))))
-  ((cublaslt-bias-argument ?expression_frame ?m (CublasLtBiasInput ?bias_layout_tensor ?element_data_type)
+  ((cublaslt-bias-argument ?expression_frame ?m (CublasLtBiasInput ?bias_layout_tensor ?element_data_type (IntLit 0))
      (CublasLtBiasDataTypeOf ?element_data_type) (LayoutTensorCons ?bias_layout_tensor (LayoutTensorNil))))
   :ruleset backend
   :name "cublaslt: packed bias with exact row length")
-; Shared admission gate. Every API field and every precision boundary is proved here.
+; Prove each operand independently. These facts stay keyed by their owning
+; expression frame, computation contract and logical arithmetic dtype.
 (rule
   ((cublaslt-expression-frame ?expression_frame)
    (= ?expression_frame
      (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
        ?logical_C_matrix ?logical_bias ?epilogue ?alpha ?beta))
    (cublaslt-operand-storage-reading ?computation_type ?A_operand ?A_storage_tensor)
-   (cublaslt-operand-storage-reading ?computation_type ?B_operand ?B_storage_tensor)
    (= (shape-of ?A_operand) (shape-of ?A_storage_tensor))
-   (= (shape-of ?B_operand) (shape-of ?B_storage_tensor))
    (= ?A_layout_tensor (LayoutTensorLit ?A_storage_tensor ?A_operand_layout))
-   (= ?B_layout_tensor (LayoutTensorLit ?B_storage_tensor ?B_operand_layout))
-   (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?D_layout))
    (cublaslt-matrix-reading ?A_layout_tensor ?m ?k ?A_storage_data_type ?A_matrix_order
      ?A_transpose_operation ?A_matrix_descriptor)
+   (= ?arithmetic_data_type (dtype-of ?A_operand))
+   (cublaslt-scale-data-type ?computation_type ?arithmetic_data_type ?scalar_data_type))
+  ((cublaslt-a-matrix-semantics ?expression_frame ?computation_type ?arithmetic_data_type
+     ?scalar_data_type ?A_storage_data_type ?m ?k ?A_matrix_order ?A_transpose_operation
+     ?A_matrix_descriptor))
+  :ruleset backend
+  :name "cublaslt: prove A matrix semantics for one expression frame")
+
+(rule
+  ((cublaslt-expression-frame ?expression_frame)
+   (= ?expression_frame
+     (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
+       ?logical_C_matrix ?logical_bias ?epilogue ?alpha ?beta))
+   (cublaslt-operand-storage-reading ?computation_type ?B_operand ?B_storage_tensor)
+   (= (shape-of ?B_operand) (shape-of ?B_storage_tensor))
+   (= ?B_layout_tensor (LayoutTensorLit ?B_storage_tensor ?B_operand_layout))
    (cublaslt-matrix-reading ?B_layout_tensor ?k ?n ?B_storage_data_type ?B_matrix_order
      ?B_transpose_operation ?B_matrix_descriptor)
+   (= ?arithmetic_data_type (dtype-of ?B_operand))
+   (cublaslt-scale-data-type ?computation_type ?arithmetic_data_type ?scalar_data_type))
+  ((cublaslt-b-matrix-semantics ?expression_frame ?computation_type ?arithmetic_data_type
+     ?scalar_data_type ?B_storage_data_type ?k ?n ?B_matrix_order ?B_transpose_operation
+     ?B_matrix_descriptor))
+  :ruleset backend
+  :name "cublaslt: prove B matrix semantics for one expression frame")
+
+; Destination semantics are independent of A/B representation choices.
+(rule
+  ((cublaslt-expression-frame ?expression_frame)
+   (= ?expression_frame
+     (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
+       ?logical_C_matrix ?logical_bias ?epilogue ?alpha ?beta))
+   (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?D_layout))
    (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?D_storage_data_type ?D_matrix_order
      ?D_matrix_descriptor)
-   (= (dtype-of ?output_expression) ?D_storage_data_type)
-   (= (dtype-of ?A_operand) (F32))
-   (= (dtype-of ?B_operand) (F32))
+   (= (dtype-of ?output_expression) ?D_storage_data_type))
+  ((cublaslt-destination-semantics ?expression_frame ?m ?n ?D_storage_data_type
+     ?D_matrix_order ?D_matrix_descriptor ?epilogue))
+  :ruleset backend
+  :name "cublaslt: prove destination semantics for one expression frame")
+
+; This join correlates only compact per-frame markers. Matching the same
+; arithmetic dtype, computation contract, scale type and m/n/k witnesses here
+; preserves the complete logical matrix product contract.
+(rule
+  ((cublaslt-a-matrix-semantics ?expression_frame ?computation_type ?arithmetic_data_type
+     ?scalar_data_type ?A_storage_data_type ?m ?k ?A_matrix_order ?A_transpose_operation
+     ?A_matrix_descriptor)
+   (cublaslt-b-matrix-semantics ?expression_frame ?computation_type ?arithmetic_data_type
+     ?scalar_data_type ?B_storage_data_type ?k ?n ?B_matrix_order ?B_transpose_operation
+     ?B_matrix_descriptor)
+   (cublaslt-destination-semantics ?expression_frame ?m ?n ?D_storage_data_type
+     ?D_matrix_order ?D_matrix_descriptor ?epilogue))
+  ((cublaslt-matrix-product-semantics ?expression_frame ?computation_type
+     ?arithmetic_data_type ?scalar_data_type ?A_storage_data_type ?B_storage_data_type
+     ?D_storage_data_type ?epilogue ?A_matrix_order ?B_matrix_order ?D_matrix_order
+     ?A_transpose_operation ?B_transpose_operation ?A_matrix_descriptor ?B_matrix_descriptor
+     ?D_matrix_descriptor ?m))
+  :ruleset backend
+  :name "cublaslt: correlate A B and destination semantic markers")
+
+; C, bias and scalar proofs are already frame-owned. Collapse them into one
+; argument marker before consulting the capability whitelist.
+(rule
+  ((cublaslt-expression-frame ?expression_frame)
+   (= ?expression_frame
+     (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
+       ?logical_C_matrix ?logical_bias ?epilogue ?alpha ?beta))
    (cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_matrix_data_type
      ?C_input_tensors)
    (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors)
-   (cublaslt-scalar-arguments ?alpha ?beta ?scalar_pointer_mode ?scalar_arguments ?scalar_input_tensors)
-   (= ?scalar_data_type (F32))
+   (cublaslt-scalar-arguments ?alpha ?beta ?scalar_data_type ?scalar_pointer_mode
+     ?scalar_arguments ?scalar_input_tensors))
+  ((cublaslt-call-argument-semantics ?expression_frame ?D_matrix_descriptor ?m
+     ?scalar_data_type ?C_matrix_argument ?C_matrix_data_type ?bias_argument ?bias_data_type
+     ?scalar_pointer_mode ?scalar_arguments))
+  :ruleset backend
+  :name "cublaslt: correlate C bias and scalar semantic markers")
+
+; Shared admission gate. Every API field and precision boundary was proved by
+; one of the frame-keyed markers above; this final rule only checks that exact
+; semantic tuple against the vendor capability table.
+(rule
+  ((cublaslt-matrix-product-semantics ?expression_frame ?computation_type
+     ?arithmetic_data_type ?scalar_data_type ?A_storage_data_type ?B_storage_data_type
+     ?D_storage_data_type ?epilogue ?A_matrix_order ?B_matrix_order ?D_matrix_order
+     ?A_transpose_operation ?B_transpose_operation ?A_matrix_descriptor ?B_matrix_descriptor
+     ?D_matrix_descriptor ?m)
+   (cublaslt-call-argument-semantics ?expression_frame ?D_matrix_descriptor ?m
+     ?scalar_data_type ?C_matrix_argument ?C_matrix_data_type ?bias_argument ?bias_data_type
+     ?scalar_pointer_mode ?scalar_arguments)
    (= ?configuration
      (CublasLtConfigurationOf ?computation_type ?scalar_data_type ?A_storage_data_type ?B_storage_data_type
        ?C_matrix_data_type ?D_storage_data_type ?bias_data_type ?scalar_pointer_mode ?epilogue ?A_matrix_order
-       ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
+       ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation ?reduction_scheme_mask))
    (cublaslt-approved-configuration ?configuration))
   ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor ?C_matrix_argument
      ?bias_argument ?D_matrix_descriptor  ?expression_frame ?scalar_arguments))
@@ -667,6 +825,18 @@
   :ruleset backend
   :name "cublaslt: F32 computation reads exact widened storage")
 
+; Signed INT8 widens exactly to F32. This A/B-only proof does not grant
+; INT8 C/bias storage or move narrowing, scaling, or offsets across the cast.
+(rule
+  ((= ?logical_operand (LogicalCast ?storage_source (F32)))
+   (= (dtype-of ?storage_source) (I8))
+   (= (dtype-of ?logical_operand) (F32))
+   (= (shape-of ?logical_operand) (shape-of ?storage_source)))
+  ((cublaslt-operand-storage-reading (CublasLtFloat32Computation)
+     ?logical_operand ?storage_source))
+  :ruleset backend
+  :name "cublaslt: explicit signed INT8 to F32 widening reads INT8 A or B storage")
+
 ; Both operands must separately prove this same computation contract before
 ; admission. TF32 casts adopt the device's conversion behavior, including tie
 ; handling. Only this computation mode may read the pre-cast F32 storage;
@@ -680,3 +850,50 @@
      ?logical_operand ?storage_source))
   :ruleset backend
   :name "cublaslt: explicit device TF32 rounding then F32 arithmetic reads F32 storage")
+
+; F32 storage, explicit F16 rounding, exact widening, then F32 arithmetic.
+; This permission belongs only to this computation mode. Ordinary F32 calls
+; still read a materialized rounded operand; earlier casts remain in the source.
+(rule
+  ((= ?logical_operand (LogicalCast (LogicalCast ?storage_source (F16)) (F32)))
+   (= (dtype-of ?storage_source) (F32))
+   (= (dtype-of ?logical_operand) (F32))
+   (= (shape-of ?logical_operand) (shape-of ?storage_source)))
+  ((cublaslt-operand-storage-reading (CublasLtFloat32FastFloat16Computation)
+     ?logical_operand ?storage_source))
+  :ruleset backend
+  :name "cublaslt: explicit F16 rounding then F32 arithmetic reads F32 storage")
+
+; F32 storage, explicit Bf16 rounding, exact widening, then F32 arithmetic.
+; This permission belongs only to this computation mode. Ordinary F32 calls
+; still read a materialized rounded operand; earlier casts remain in the source.
+(rule
+  ((= ?logical_operand (LogicalCast (LogicalCast ?storage_source (Bf16)) (F32)))
+   (= (dtype-of ?storage_source) (F32))
+   (= (dtype-of ?logical_operand) (F32))
+   (= (shape-of ?logical_operand) (shape-of ?storage_source)))
+  ((cublaslt-operand-storage-reading (CublasLtFloat32FastBfloat16Computation)
+     ?logical_operand ?storage_source))
+  :ruleset backend
+  :name "cublaslt: explicit Bf16 rounding then F32 arithmetic reads F32 storage")
+
+; Exact F64 storage remains distinct from the FP32 and TF32 input contracts.
+(rule
+  ((cublaslt-f32-storage-reading ?logical_operand ?storage_source))
+  ((cublaslt-exact-storage-reading (F32) ?logical_operand ?storage_source))
+  :ruleset backend
+  :name "cublaslt: exact FP32 C and bias storage proof")
+(rule
+  ((= (dtype-of ?logical_operand) (F64)))
+  ((cublaslt-exact-storage-reading (F64) ?logical_operand ?logical_operand)
+   (cublaslt-operand-storage-reading (CublasLtFloat64Computation) ?logical_operand ?logical_operand))
+  :ruleset backend
+  :name "cublaslt: FP64 arithmetic reads FP64 storage")
+
+; Native FP16 arithmetic must read FP16 values, never the source of a cast.
+(rule
+  ((= (dtype-of ?operand) (F16)))
+  ((cublaslt-exact-storage-reading (F16) ?operand ?operand)
+   (cublaslt-operand-storage-reading (CublasLtFloat16Computation) ?operand ?operand))
+  :ruleset backend
+  :name "cublaslt: native FP16 arithmetic reads FP16 storage")

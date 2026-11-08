@@ -557,6 +557,28 @@ mod strided {
         assert_contains(&source, &["out[i] = (int)a[a_idx];"]);
     }
 
+    /// NVRTC compiles generated kernels without math headers, so FP8 widening
+    /// must spell infinity as a CUDA intrinsic bit pattern rather than the
+    /// unavailable `INFINITY` macro.
+    #[test]
+    fn fp8_widening_uses_headerless_infinity_literal() {
+        let op = ops::cast::CastDps;
+        let operand = slot_dt(vec![4], PlanDtype::F8E5M2);
+        let dest = slot_dt(vec![4], PlanDtype::F32);
+        let source = generate(&op, &[operand, dest.clone()], &[dest]);
+        assert_contains(
+            &source,
+            &[
+                "float infinity = __uint_as_float(0x7f800000u);",
+                "bits & 128 ? -infinity : infinity",
+            ],
+        );
+        assert!(
+            !source.contains("INFINITY"),
+            "headerless NVRTC source:\n{source}"
+        );
+    }
+
     /// OPTION B fail-closed analogues of the old `entries: None` hop
     /// refusals: a layout the lowerer cannot spell numerically bails
     /// loudly — never identity, never a guessed extent.

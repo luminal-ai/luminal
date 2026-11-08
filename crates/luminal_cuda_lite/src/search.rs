@@ -59,6 +59,12 @@ pub struct CompileOptions {
     /// materializations, and rejects candidate arenas over the limit before
     /// allocation. Final validation enforces the same per-program budget.
     pub device_budget_bytes: Option<usize>,
+    /// Maximum peak bytes occupied by program-owned intermediates, operation
+    /// workspaces, and the dynamic-parameter block. `None` derives each
+    /// candidate's default from the usable device arena minus that candidate's
+    /// exact peak boundary storage (inputs and escaping outputs). An explicit
+    /// value overrides that default; the total arena budget remains mandatory.
+    pub intermediate_budget_bytes: Option<usize>,
     /// Prune individual intermediate materializations above this size before
     /// extraction, preserving boundary storage and zero-copy view alternatives.
     pub max_intermediate_bytes: Option<usize>,
@@ -78,6 +84,7 @@ impl Default for CompileOptions {
             candidate_timeout: None,
             keep_finalists: 4,
             device_budget_bytes: None,
+            intermediate_budget_bytes: None,
             max_intermediate_bytes: None,
             serialized_graph_passes: Vec::new(),
         }
@@ -103,6 +110,13 @@ pub struct SearchOutcome {
     pub best_genome: Genome,
     pub memory_pruning: crate::egraph_postpass::MemoryPruning,
     pub best_nanos: u128,
+    /// Usable device arena resolved for this search after applying the caller's
+    /// optional total cap.
+    pub arena_budget_bytes: usize,
+    /// Peak program-owned intermediate allowance used for candidate admission.
+    /// When the caller did not override it, this is the arena budget minus the
+    /// finalized plan's exact peak boundary storage.
+    pub intermediate_budget_bytes: usize,
     /// Plans actually profiled (distinct fingerprints).
     pub plans_profiled: usize,
     /// Proposed genomes rejected because their extracted plan fingerprint was
@@ -174,7 +188,7 @@ impl Evaluator<'_> {
     ) -> Priced {
         #[cfg(feature = "device")]
         {
-            let Self::Device { device, staged } = self;
+            let Self::Device { device, staged, .. } = self;
             let measured = crate::profile::profile_candidate_at(
                 device,
                 plan,
@@ -266,6 +280,48 @@ struct Best {
     nanos: u128,
     genome: Genome,
     plan: BufferIrGraph<luminal::layouts::DecodedLayout>,
+    intermediate_budget_bytes: usize,
+}
+
+/// The closest arena-refused genome. It is never admitted or measured, but it
+/// provides a mutation parent when no executable incumbent exists yet. This
+/// gives the hard memory constraint a gradient without weakening it: children
+/// still must pass both exact arena checks before profiling.
+struct MemoryGuide {
+    score: (usize, usize, usize),
+    genome: Genome,
+}
+
+impl MemoryGuide {
+    fn consider(
+        current: &mut Option<Self>,
+        genome: &Genome,
+        arena_overage: usize,
+        intermediate_overage: usize,
+        slab_bytes: usize,
+    ) {
+        let score = (
+            arena_overage.max(intermediate_overage),
+            arena_overage.saturating_add(intermediate_overage),
+            slab_bytes,
+        );
+        if current.as_ref().is_none_or(|guide| score < guide.score) {
+            *current = Some(Self {
+                score,
+                genome: genome.clone(),
+            });
+        }
+    }
+}
+
+pub(crate) fn resolve_intermediate_budget(
+    arena_budget_bytes: usize,
+    peak_boundary_bytes: usize,
+    requested: Option<usize>,
+) -> usize {
+    requested
+        .unwrap_or_else(|| arena_budget_bytes.saturating_sub(peak_boundary_bytes))
+        .min(arena_budget_bytes)
 }
 
 /// What pricing one candidate produced. A cost is ranked; the other
@@ -369,8 +425,19 @@ pub fn search_implementations(
     let analysis_start = Instant::now();
     let decoders = luminal::egglog_snippet::decoder_registry_for(matchers)?;
     let arena_budget_bytes = evaluator.arena_budget(options.device_budget_bytes)?;
+    let intermediate_budget_override = options
+        .intermediate_budget_bytes
+        .map(|requested| requested.min(arena_budget_bytes));
     let mut resolved_options = options.clone();
     resolved_options.device_budget_bytes = Some(arena_budget_bytes);
+    resolved_options.intermediate_budget_bytes = intermediate_budget_override;
+    resolved_options.max_intermediate_bytes =
+        match (options.max_intermediate_bytes, intermediate_budget_override) {
+            (Some(materialization), Some(intermediates)) => {
+                Some(materialization.min(intermediates))
+            }
+            (materialization, intermediates) => materialization.or(intermediates),
+        };
     let options = &resolved_options;
     let memory_pruning = crate::egraph_postpass::run(
         egraph,
@@ -391,6 +458,20 @@ pub fn search_implementations(
             memory_pruning.removed_nodes,
             arena_budget_bytes as f64 / 1073741824.0
         );
+    }
+    if options.search_log_enabled() {
+        if let Some(intermediate_budget_bytes) = intermediate_budget_override {
+            eprintln!(
+                "Arena budgets: total {:.2} GiB, intermediates {:.2} GiB (override)",
+                arena_budget_bytes as f64 / 1073741824.0,
+                intermediate_budget_bytes as f64 / 1073741824.0,
+            );
+        } else {
+            eprintln!(
+                "Arena budget: total {:.2} GiB; each candidate's intermediate cap subtracts its exact peak boundary storage",
+                arena_budget_bytes as f64 / 1073741824.0,
+            );
+        }
     }
 
     // The allow list narrows the caller's matcher set; None = the whole set.
@@ -454,6 +535,7 @@ pub fn search_implementations(
     // choice.
     let mut ranked: Vec<(u128, Genome)> = Vec::new();
     let mut best: Option<Best> = None;
+    let mut memory_guide: Option<MemoryGuide> = None;
     // Live progress (#391), on stderr (via the capture-aware adapter, so
     // test output stays clean) and never on a caller's stdout.
     // `None` = the option (or `SEARCH_LOG`) says quiet.
@@ -466,10 +548,15 @@ pub fn search_implementations(
         // genomes. Mutation is transactional: retain the parent, propose a
         // child, extract and arena-plan it, and admit it only after the exact
         // physical-lifetime plan is within budget. Rejection does not repair
-        // the child into some other graph; it simply draws another mutation.
+        // the child into some other graph; the closest memory refusal becomes
+        // the next generation's mutation parent until an executable incumbent
+        // exists.
         // This keeps genotype diversity meaningful because duplicate plans do
         // not consume population slots either.
-        let parent = best.as_ref().map(|incumbent| incumbent.genome.clone());
+        let parent = best
+            .as_ref()
+            .map(|incumbent| incumbent.genome.clone())
+            .or_else(|| memory_guide.as_ref().map(|guide| guide.genome.clone()));
         let max_attempts = options.generation_size.saturating_mul(32).max(1);
         let mut attempts = 0usize;
         let mut admitted = 0usize;
@@ -584,13 +671,41 @@ pub fn search_implementations(
                         continue;
                     }
                 };
-            if arena.slab_bytes > arena_budget_bytes {
+            let arena_overage = arena.slab_bytes.saturating_sub(arena_budget_bytes);
+            let intermediate_budget_bytes = resolve_intermediate_budget(
+                arena_budget_bytes,
+                arena.peak_boundary_bytes,
+                intermediate_budget_override,
+            );
+            let intermediate_overage = arena
+                .peak_intermediate_bytes
+                .saturating_sub(intermediate_budget_bytes);
+            if arena_overage > 0 || intermediate_overage > 0 {
+                MemoryGuide::consider(
+                    &mut memory_guide,
+                    &genome,
+                    arena_overage,
+                    intermediate_overage,
+                    arena.slab_bytes,
+                );
                 breakdown.arena_refusals += 1;
                 if refusals.len() < 8 {
-                    refusals.push(format!(
-                        "arena: {} bytes exceeds budget {arena_budget_bytes}",
-                        arena.slab_bytes
-                    ));
+                    refusals.push(if arena_overage > 0 && intermediate_overage > 0 {
+                        format!(
+                            "arena: {} bytes exceeds total budget {arena_budget_bytes}; peak intermediates {} bytes exceed budget {intermediate_budget_bytes}",
+                            arena.slab_bytes, arena.peak_intermediate_bytes
+                        )
+                    } else if arena_overage > 0 {
+                        format!(
+                            "arena: {} bytes exceeds total budget {arena_budget_bytes}",
+                            arena.slab_bytes
+                        )
+                    } else {
+                        format!(
+                            "arena: peak intermediates {} bytes exceed budget {intermediate_budget_bytes}",
+                            arena.peak_intermediate_bytes
+                        )
+                    });
                 }
                 continue;
             }
@@ -646,6 +761,7 @@ pub fn search_implementations(
                     nanos,
                     genome: genome.clone(),
                     plan,
+                    intermediate_budget_bytes,
                 });
             }
         }
@@ -667,6 +783,8 @@ pub fn search_implementations(
         best_genome: best.genome,
         memory_pruning,
         best_nanos: best.nanos,
+        arena_budget_bytes,
+        intermediate_budget_bytes: best.intermediate_budget_bytes,
         plans_profiled,
         fingerprint_hits,
         timings,
@@ -692,7 +810,7 @@ pub fn finalist_validate(
 ) -> Result<(), String> {
     #[cfg(feature = "device")]
     {
-        let Evaluator::Device { device, staged } = evaluator;
+        let Evaluator::Device { device, staged, .. } = evaluator;
         let ran = crate::profile::warmup_candidate(
             device,
             &pending.plan,
@@ -727,6 +845,14 @@ pub fn select_finalist(
                 candidate.arena.slab_bytes
             ));
         }
+        if let Some(budget) = options.intermediate_budget_bytes
+            && candidate.arena.peak_intermediate_bytes > budget
+        {
+            return Err(format!(
+                "program requires {} peak intermediate bytes, budget {budget}",
+                candidate.arena.peak_intermediate_bytes
+            ));
+        }
         finalist_validate(candidate, options, evaluator)
     };
     if !finalists.ensure(0, &mut validate) {
@@ -753,5 +879,37 @@ pub fn harness_search_options() -> CompileOptions {
         seed: 0,
         search_log: false,
         ..CompileOptions::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_intermediate_budget_subtracts_boundaries_and_overrides_clamp_to_arena() {
+        assert_eq!(resolve_intermediate_budget(1_000, 400, None), 600);
+        assert_eq!(resolve_intermediate_budget(1_000, 1_200, None), 0);
+        assert_eq!(resolve_intermediate_budget(1_000, 400, Some(750)), 750);
+        assert_eq!(resolve_intermediate_budget(1_000, 400, Some(1_500)), 1_000);
+    }
+
+    #[test]
+    fn memory_guide_keeps_the_closest_refused_genome() {
+        let first = Genome::default();
+        let mut second = Genome::default();
+        second.choices.insert(
+            "class".into(),
+            extractor::ProducerChoice {
+                enode: luminal::prelude::egraph_serialize::NodeId::from("node"),
+                output_index: 0,
+            },
+        );
+        let mut guide = None;
+        MemoryGuide::consider(&mut guide, &first, 500, 0, 1_500);
+        MemoryGuide::consider(&mut guide, &second, 100, 50, 1_100);
+        let guide = guide.expect("one guide retained");
+        assert_eq!(guide.score, (100, 150, 1_100));
+        assert_eq!(guide.genome.choices.len(), 1);
     }
 }

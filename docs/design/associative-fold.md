@@ -164,8 +164,9 @@ If this idea is revisited:
 ## Open questions
 
 - Should the operation be named `Fold`, `AssociativeFold`, or `Aggregate`?
-- Which floating-point reassociations are legal, and which output differences
-  are part of the backend contract?
+- What association freedom, if any, does each authored logical reducer define?
+  Backends may use only that declared freedom; they cannot independently make
+  output differences part of their contracts.
 - Should maximum/minimum expose latest-index semantics directly, or should
   value-and-index folds be a separate operation?
 - How should an explicit initial value be represented and typed?

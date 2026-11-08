@@ -71,8 +71,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::snapshot::compact::ClassId;
 use anyhow::Result;
-use egraph_serialize::ClassId;
 use fixedbitset::FixedBitSet;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};

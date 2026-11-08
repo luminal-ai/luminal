@@ -312,7 +312,7 @@ impl AllGatherTransport for TcpAllGather {
 /// Build a deterministic viable plan without running it. Distributed programs
 /// must not execute collectives in rank-local timing/autotuning loops.
 pub fn compile_first(
-    graph: &egraph_serialize::EGraph,
+    graph: &crate::snapshot::compact::EGraph,
     decoders: &crate::egglog_utils::eclass::ConstructorRegistry,
     matchers: &[Box<dyn crate::layout_ir::OpMatcher>],
     allow: &[&str],

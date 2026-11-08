@@ -85,6 +85,7 @@ pub struct LtCMatrixInput {
 pub struct LtBiasInput {
     pub data_type: luminal::dtype::PlanDtype,
     pub operand: usize,
+    pub batch_stride_in_elements: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,26 +98,59 @@ pub enum LtActivation {
 /// The explicitly admitted input-rounding and computation contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LtComputation {
+    Float16,
     Float32,
     TensorFloat32,
+    Float32FastFloat16,
+    Float32FastBfloat16,
+    Float64,
 }
 
 impl LtComputation {
     pub fn egglog_constructor(self) -> &'static str {
         match self {
+            Self::Float16 => "CublasLtFloat16Computation",
             Self::Float32 => "CublasLtFloat32Computation",
             Self::TensorFloat32 => "CublasLtTensorFloat32Computation",
+            Self::Float32FastFloat16 => "CublasLtFloat32FastFloat16Computation",
+            Self::Float32FastBfloat16 => "CublasLtFloat32FastBfloat16Computation",
+            Self::Float64 => "CublasLtFloat64Computation",
         }
     }
 }
 
-/// Host values retain their FP32 bits, including signed zero and NaN payloads.
+/// Allowed reduction schemes, elected by the complete whitelist configuration.
+/// Both masks permit NONE (zero), so this does not require split-K execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LtReductionSchemeMask {
+    All,
+    ComputeType,
+}
+
+impl LtReductionSchemeMask {
+    pub fn egglog_constructor(self) -> &'static str {
+        match self {
+            Self::All => "CublasLtReductionSchemeMaskAll",
+            Self::ComputeType => "CublasLtReductionSchemeMaskComputeType",
+        }
+    }
+}
+
+/// Host values retain their declared precision, including signed zero and NaN bits.
 /// Device values are ordinary read operands; replay reads their current bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LtScalars {
+    HostF16 {
+        alpha_bits: u16,
+        beta_bits: u16,
+    },
     Host {
         alpha_bits: u32,
         beta_bits: u32,
+    },
+    HostF64 {
+        alpha_bits: u64,
+        beta_bits: u64,
     },
     Device {
         alpha_operand: usize,
@@ -125,6 +159,12 @@ pub enum LtScalars {
 }
 
 impl LtScalars {
+    pub fn host_f16(alpha: half::f16, beta: half::f16) -> Self {
+        Self::HostF16 {
+            alpha_bits: alpha.to_bits(),
+            beta_bits: beta.to_bits(),
+        }
+    }
     pub fn host(alpha: f32, beta: f32) -> Self {
         Self::Host {
             alpha_bits: alpha.to_bits(),
@@ -133,10 +173,36 @@ impl LtScalars {
     }
     pub fn host_values(self) -> Option<(f32, f32)> {
         match self {
+            Self::HostF16 {
+                alpha_bits,
+                beta_bits,
+            } => Some((
+                half::f16::from_bits(alpha_bits).to_f32(),
+                half::f16::from_bits(beta_bits).to_f32(),
+            )),
             Self::Host {
                 alpha_bits,
                 beta_bits,
             } => Some((f32::from_bits(alpha_bits), f32::from_bits(beta_bits))),
+            Self::HostF64 { .. } | Self::Device { .. } => None,
+        }
+    }
+    pub fn host_f64(alpha: f64, beta: f64) -> Self {
+        Self::HostF64 {
+            alpha_bits: alpha.to_bits(),
+            beta_bits: beta.to_bits(),
+        }
+    }
+    /// Inspect host values without narrowing. FP16 and FP32 widen exactly.
+    pub fn host_values_f64(self) -> Option<(f64, f64)> {
+        match self {
+            Self::HostF64 {
+                alpha_bits,
+                beta_bits,
+            } => Some((f64::from_bits(alpha_bits), f64::from_bits(beta_bits))),
+            Self::Host { .. } | Self::HostF16 { .. } => self
+                .host_values()
+                .map(|(a, b)| (f64::from(a), f64::from(b))),
             Self::Device { .. } => None,
         }
     }
@@ -149,7 +215,9 @@ impl LtScalars {
     }
     pub fn pointer_mode_constructor(self) -> &'static str {
         match self {
-            Self::Host { .. } => "CublasLtHostScalarPointerMode",
+            Self::Host { .. } | Self::HostF16 { .. } | Self::HostF64 { .. } => {
+                "CublasLtHostScalarPointerMode"
+            }
             Self::Device { .. } => "CublasLtDeviceScalarPointerMode",
         }
     }
@@ -161,6 +229,7 @@ impl LtScalars {
 pub struct LtCall {
     pub form: CublasLtForm,
     pub computation: LtComputation,
+    pub reduction_scheme_mask: LtReductionSchemeMask,
     pub m: i64,
     pub n: i64,
     pub k: i64,
@@ -259,11 +328,29 @@ impl LtCall {
     /// count — the pre-dispatch gate (contract 4). `elems` follows the elected
     /// read order; the destination's capacity is checked separately.
     pub fn validate_against(&self, operand_elems: &[usize], dest_elems: usize) -> Result<()> {
-        if self.scale_dtype != luminal::dtype::PlanDtype::F32 {
+        let scalar_dtype = match self.computation {
+            LtComputation::Float16 => luminal::dtype::PlanDtype::F16,
+            LtComputation::Float32
+            | LtComputation::TensorFloat32
+            | LtComputation::Float32FastFloat16
+            | LtComputation::Float32FastBfloat16 => luminal::dtype::PlanDtype::F32,
+            LtComputation::Float64 => luminal::dtype::PlanDtype::F64,
+        };
+        if self.scale_dtype != scalar_dtype {
             bail!(
-                "cuBLASLt: admitted compute modes require FP32 alpha/beta, got {:?}",
+                "cuBLASLt: {:?} requires {scalar_dtype:?} alpha/beta, got {:?}",
+                self.computation,
                 self.scale_dtype
             );
+        }
+        if matches!(self.scalars, LtScalars::HostF16 { .. })
+            && scalar_dtype != luminal::dtype::PlanDtype::F16
+            || matches!(self.scalars, LtScalars::Host { .. })
+                && scalar_dtype != luminal::dtype::PlanDtype::F32
+            || matches!(self.scalars, LtScalars::HostF64 { .. })
+                && scalar_dtype != luminal::dtype::PlanDtype::F64
+        {
+            bail!("cuBLASLt: host scalar storage does not match {scalar_dtype:?}");
         }
         let arity = self.form.lit_arity() + self.scalars.input_count();
         if operand_elems.len() != arity {
@@ -284,10 +371,12 @@ impl LtCall {
         {
             for (name, operand) in [("alpha", alpha_operand), ("beta", beta_operand)] {
                 if operand_elems.get(operand).is_none_or(|&len| len < 1) {
-                    bail!("cuBLASLt: device {name} operand {operand} needs one FP32 element");
+                    bail!(
+                        "cuBLASLt: device {name} operand {operand} needs one {scalar_dtype:?} element"
+                    );
                 }
             }
-        } else if self.c.is_none() && self.scalars.host_values().unwrap().1 != 0.0 {
+        } else if self.c.is_none() && self.scalars.host_values_f64().unwrap().1 != 0.0 {
             bail!("cuBLASLt: absent C requires beta zero");
         }
         if let Some(c) = self.c {
@@ -306,12 +395,32 @@ impl LtCall {
             let Some(&elems) = operand_elems.get(i) else {
                 bail!("cuBLASLt: bias operand index {i} out of operand range");
             };
-            // The bias vector is length m: one entry per vendor D row.
-            if (elems as i128) < self.m as i128 {
+            if bias.batch_stride_in_elements < 0 || self.m < 1 {
+                bail!("cuBLASLt bias: invalid vector length or negative batch stride");
+            }
+            let needed = (self.d.batch_count - 1)
+                .checked_mul(bias.batch_stride_in_elements)
+                .and_then(|n| n.checked_add(self.m))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("cuBLASLt bias: batched element reach overflows i64")
+                })?;
+            // Match the conservative egglog bias layout contract. Keeping
+            // this guard here also protects direct descriptor callers.
+            let alignment_elements = 128 / bias.data_type.egglog_bits();
+            if bias.batch_stride_in_elements % alignment_elements != 0 {
+                bail!("cuBLASLt bias: batch pitch must preserve 16-byte alignment");
+            }
+            if self.d.batch_count > 1
+                && bias.batch_stride_in_elements != 0
+                && bias.batch_stride_in_elements < self.m
+            {
+                bail!("cuBLASLt bias: nonzero batch pitch overlaps feature vectors");
+            }
+            if (elems as i128) < needed as i128 {
                 bail!(
-                    "cuBLASLt bias: buffer holds {elems} elements, epilogue reads m = {} \
+                    "cuBLASLt bias: buffer holds {elems} elements, epilogue needs {} \
                      — refused before dispatch",
-                    self.m
+                    needed
                 );
             }
         }

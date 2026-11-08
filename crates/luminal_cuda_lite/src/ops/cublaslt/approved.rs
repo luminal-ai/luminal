@@ -2,7 +2,8 @@
 //! decodes the elected configuration and evaluates its descriptor expressions.
 use super::CublasLtForm;
 use super::exec::{
-    LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation, LtDesc, LtOrder, LtScalars,
+    LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation, LtDesc, LtOrder,
+    LtReductionSchemeMask, LtScalars,
 };
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
@@ -98,6 +99,7 @@ impl OpMatcher for ApprovedCublasLtMatcher {
         Box::new(ApprovedCublasLt {
             configuration: site.child_class(0),
             computation,
+            reduction_scheme_mask: reduction_scheme_mask(site, &child(14)),
             logical_a: semantic(2),
             logical_b: semantic(3),
             logical_out: semantic(1),
@@ -127,8 +129,10 @@ pub(super) fn member(site: &ExtractionSite<'_>, class: &ClassId, name: &str) -> 
 pub(super) fn dtype(site: &ExtractionSite<'_>, class: &ClassId) -> PlanDtype {
     for (name, dtype) in [
         ("F32", PlanDtype::F32),
+        ("F64", PlanDtype::F64),
         ("F16", PlanDtype::F16),
         ("Bf16", PlanDtype::Bf16),
+        ("I8", PlanDtype::I8),
     ] {
         if site.nodes_in_class_value(class, name).next().is_some() {
             return dtype;
@@ -141,12 +145,15 @@ pub(super) fn dtype(site: &ExtractionSite<'_>, class: &ClassId) -> PlanDtype {
 pub struct Bias {
     pub tensor: ClassId,
     pub dtype: PlanDtype,
+    pub batch_stride_in_elements: IotaExpr,
 }
 
 /// Scalar arguments are decoded independently of the matrix element types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scalars {
+    HostF16 { alpha_bits: u16, beta_bits: u16 },
     Host { alpha_bits: u32, beta_bits: u32 },
+    HostF64 { alpha_bits: u64, beta_bits: u64 },
     Device { alpha: ClassId, beta: ClassId },
 }
 
@@ -159,10 +166,24 @@ impl Scalars {
     }
     pub fn resolve(&self) -> LtScalars {
         match self {
+            Self::HostF16 {
+                alpha_bits,
+                beta_bits,
+            } => LtScalars::HostF16 {
+                alpha_bits: *alpha_bits,
+                beta_bits: *beta_bits,
+            },
             Self::Host {
                 alpha_bits,
                 beta_bits,
             } => LtScalars::Host {
+                alpha_bits: *alpha_bits,
+                beta_bits: *beta_bits,
+            },
+            Self::HostF64 {
+                alpha_bits,
+                beta_bits,
+            } => LtScalars::HostF64 {
                 alpha_bits: *alpha_bits,
                 beta_bits: *beta_bits,
             },
@@ -172,13 +193,45 @@ impl Scalars {
             },
         }
     }
+    pub fn host_f64(alpha: f64, beta: f64) -> Self {
+        Self::HostF64 {
+            alpha_bits: alpha.to_bits(),
+            beta_bits: beta.to_bits(),
+        }
+    }
 }
 
 pub(super) fn scalars(site: &ExtractionSite<'_>, class: &ClassId, mode: &ClassId) -> Scalars {
     if let Some(node) = site
-        .nodes_in_class_value(class, "CublasLtHostScalarArguments")
+        .nodes_in_class_value(class, "CublasLtHostFloat16ScalarArguments")
         .next()
     {
+        member(site, mode, "CublasLtHostScalarPointerMode");
+        let bits = |n| {
+            let child = site.class_of_child(node, n).unwrap();
+            let value = site
+                .index
+                .nodes_of(&child)
+                .iter()
+                .find_map(|id| site.egraph.nodes[id].op.parse::<f64>().ok())
+                .expect("cuBLASLt host FP16 scalar literal");
+            half::f16::from_f32(value as f32).to_bits()
+        };
+        return Scalars::HostF16 {
+            alpha_bits: bits(0),
+            beta_bits: bits(1),
+        };
+    }
+    let host = site
+        .nodes_in_class_value(class, "CublasLtHostScalarArguments")
+        .next()
+        .map(|node| (node, false))
+        .or_else(|| {
+            site.nodes_in_class_value(class, "CublasLtHostFloat64ScalarArguments")
+                .next()
+                .map(|node| (node, true))
+        });
+    if let Some((node, fp64)) = host {
         member(site, mode, "CublasLtHostScalarPointerMode");
         let value = |index| {
             let child = site.class_of_child(node, index).unwrap();
@@ -186,9 +239,13 @@ pub(super) fn scalars(site: &ExtractionSite<'_>, class: &ClassId, mode: &ClassId
                 .nodes_of(&child)
                 .iter()
                 .find_map(|id| site.egraph.nodes[id].op.parse::<f64>().ok())
-                .expect("cuBLASLt host scalar literal") as f32
+                .expect("cuBLASLt host scalar literal")
         };
-        Scalars::host(value(0), value(1))
+        if fp64 {
+            Scalars::host_f64(value(0), value(1))
+        } else {
+            Scalars::host(value(0) as f32, value(1) as f32)
+        }
     } else {
         member(site, mode, "CublasLtDeviceScalarPointerMode");
         let node = member(site, class, "CublasLtDeviceScalarArguments");
@@ -204,6 +261,13 @@ pub(super) fn bias(site: &ExtractionSite<'_>, class: &ClassId) -> Option<Bias> {
         Some(Bias {
             tensor: site.class_of_child(node, 0).unwrap(),
             dtype: dtype(site, &site.class_of_child(node, 1).unwrap()),
+            batch_stride_in_elements: luminal::index_expr::parse_int_expr(
+                site,
+                &site.class_of_child(node, 2).unwrap(),
+                128,
+                None,
+            )
+            .expect("bias batch stride expression"),
         })
     } else {
         member(site, class, "CublasLtBiasAbsent");
@@ -212,7 +276,14 @@ pub(super) fn bias(site: &ExtractionSite<'_>, class: &ClassId) -> Option<Bias> {
 }
 
 pub(super) fn computation(site: &ExtractionSite<'_>, class: &ClassId) -> LtComputation {
-    for mode in [LtComputation::Float32, LtComputation::TensorFloat32] {
+    for mode in [
+        LtComputation::Float16,
+        LtComputation::Float32,
+        LtComputation::TensorFloat32,
+        LtComputation::Float32FastFloat16,
+        LtComputation::Float32FastBfloat16,
+        LtComputation::Float64,
+    ] {
         if site
             .nodes_in_class_value(class, mode.egglog_constructor())
             .next()
@@ -222,6 +293,25 @@ pub(super) fn computation(site: &ExtractionSite<'_>, class: &ClassId) -> LtCompu
         }
     }
     panic!("cuBLASLt approved contract: unsupported computation constructor in {class}");
+}
+
+pub(super) fn reduction_scheme_mask(
+    site: &ExtractionSite<'_>,
+    class: &ClassId,
+) -> LtReductionSchemeMask {
+    for mask in [
+        LtReductionSchemeMask::All,
+        LtReductionSchemeMask::ComputeType,
+    ] {
+        if site
+            .nodes_in_class_value(class, mask.egglog_constructor())
+            .next()
+            .is_some()
+        {
+            return mask;
+        }
+    }
+    panic!("cuBLASLt approved contract: unsupported reduction scheme mask in {class}");
 }
 
 pub(super) fn activation(site: &ExtractionSite<'_>, class: &ClassId) -> LtActivation {
@@ -311,6 +401,7 @@ impl Matrix {
 pub struct ApprovedCublasLt {
     pub configuration: ClassId,
     pub computation: LtComputation,
+    pub reduction_scheme_mask: LtReductionSchemeMask,
     pub logical_a: ClassId,
     pub logical_b: ClassId,
     pub logical_out: ClassId,
@@ -343,6 +434,7 @@ impl ApprovedCublasLt {
         Self {
             configuration: ClassId::from("prototype"),
             computation: LtComputation::Float32,
+            reduction_scheme_mask: LtReductionSchemeMask::All,
             logical_a: matrix.tensor.clone(),
             logical_b: matrix.tensor.clone(),
             logical_out: matrix.tensor.clone(),
@@ -374,6 +466,7 @@ impl ApprovedCublasLt {
         let d = self.d.resolve(dims);
         LtCall {
             computation: self.computation,
+            reduction_scheme_mask: self.reduction_scheme_mask,
             form: match (self.c.is_some(), self.bias.is_some()) {
                 (false, false) => CublasLtForm::Base,
                 (false, true) => CublasLtForm::Bias,
@@ -404,6 +497,7 @@ impl ApprovedCublasLt {
             bias: self.bias.as_ref().map(|bias| LtBiasInput {
                 operand: 2 + self.scalars.resolve().input_count(),
                 data_type: bias.dtype,
+                batch_stride_in_elements: bias.batch_stride_in_elements.eval_with_dims(&[], dims),
             }),
         }
     }
@@ -454,6 +548,7 @@ impl crate::HostOp for ApprovedCublasLt {
     fn capture_dims(&self) -> Option<Vec<luminal::shape::Symbol>> {
         Some(capture_dimensions(
             [&self.a, &self.b, &self.d].into_iter().chain(self.c.iter()),
+            self.bias.as_ref(),
         ))
     }
 
@@ -475,6 +570,7 @@ impl crate::HostOp for ApprovedCublasLt {
 /// Capture dependencies of the already-selected descriptor expressions.
 pub(super) fn capture_dimensions<'a>(
     matrices: impl IntoIterator<Item = &'a Matrix>,
+    bias: Option<&Bias>,
 ) -> Vec<luminal::shape::Symbol> {
     fn visit(expr: &IotaExpr, out: &mut std::collections::BTreeSet<luminal::shape::Symbol>) {
         use IotaExpr::*;
@@ -507,6 +603,9 @@ pub(super) fn capture_dimensions<'a>(
         ] {
             visit(expr, &mut out);
         }
+    }
+    if let Some(bias) = bias {
+        visit(&bias.batch_stride_in_elements, &mut out);
     }
     out.into_iter().collect()
 }

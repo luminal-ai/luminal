@@ -6,7 +6,9 @@ use cudarc::cublaslt::sys;
 use cudarc::driver::{CudaStream, DevicePtr};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::exec::{LtActivation, LtCall, LtComputation, LtDesc, LtOrder, LtScalars};
+use super::exec::{
+    LtActivation, LtCall, LtComputation, LtDesc, LtOrder, LtReductionSchemeMask, LtScalars,
+};
 
 /// Workspace owned by US (contract: no silent fallback algos). 32 MiB —
 /// cuBLASLt's own recommendation ceiling for pre-Hopper devices is
@@ -107,8 +109,10 @@ impl Layout {
     fn new(desc: &LtDesc, dtype: luminal::dtype::PlanDtype) -> Result<Self> {
         let dtype = match dtype {
             luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+            luminal::dtype::PlanDtype::F64 => sys::cudaDataType_t::CUDA_R_64F,
             luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
             luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
+            luminal::dtype::PlanDtype::I8 => sys::cudaDataType_t::CUDA_R_8I,
             dtype => return Err(anyhow!("cuBLASLt unsupported matrix dtype {dtype:?}")),
         };
         let raw = lt::create_matrix_layout(
@@ -225,11 +229,23 @@ pub fn prepare(
     // cast proofs and a complete whitelist row; there is no global math flag.
     // As agreed, the configured mode executes and NVIDIA_TF32_OVERRIDE is unset.
     let computation = match call.computation {
+        LtComputation::Float16 => sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
         LtComputation::Float32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
         LtComputation::TensorFloat32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+        LtComputation::Float32FastFloat16 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+        LtComputation::Float32FastBfloat16 => {
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF
+        }
+        LtComputation::Float64 => sys::cublasComputeType_t::CUBLAS_COMPUTE_64F,
+    };
+    let scalar_type = match call.scale_dtype {
+        luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
+        luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+        luminal::dtype::PlanDtype::F64 => sys::cudaDataType_t::CUDA_R_64F,
+        other => anyhow::bail!("unsupported cuBLASLt scalar storage {other:?}"),
     };
     let desc = Desc {
-        raw: lt::create_matmul_desc(computation, sys::cudaDataType_t::CUDA_R_32F)
+        raw: lt::create_matmul_desc(computation, scalar_type)
             .map_err(|e| anyhow!("cublasLtMatmulDescCreate: {e:?}"))?,
     };
     let set_desc = |attr: sys::cublasLtMatmulDescAttributes_t,
@@ -240,7 +256,9 @@ pub fn prepare(
             .map_err(|e| anyhow!("cublasLtMatmulDescSetAttribute({attr:?}): {e:?}"))
     };
     let pointer_mode = match call.scalars {
-        LtScalars::Host { .. } => sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_HOST,
+        LtScalars::Host { .. } | LtScalars::HostF16 { .. } | LtScalars::HostF64 { .. } => {
+            sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_HOST
+        }
         LtScalars::Device { .. } => sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_DEVICE,
     };
     set_desc(
@@ -261,8 +279,9 @@ pub fn prepare(
         std::mem::size_of::<i32>(),
     )?;
 
-    // Decode only the elected activation and optional bias. Their admission
-    // and approximation policy are owned by the egglog configuration proof.
+    // Decode only the elected activation and optional bias. Egglog must already
+    // have proved the complete call equivalent to the authored expression;
+    // dispatch does not introduce an approximation policy.
     let epilogue = match (call.activation, call.bias.is_some()) {
         (LtActivation::Identity, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
         (LtActivation::RectifiedLinear, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU,
@@ -283,6 +302,11 @@ pub fn prepare(
         std::mem::size_of::<sys::cublasLtEpilogue_t>(),
     )?;
     if let Some(bias) = call.bias {
+        set_desc(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE,
+            (&bias.batch_stride_in_elements) as *const _ as *const _,
+            std::mem::size_of::<i64>(),
+        )?;
         let bias_idx = bias.operand;
         let bias_ptr = operands
             .get(bias_idx)
@@ -290,6 +314,7 @@ pub fn prepare(
             .ptr;
         let bias_type = match bias.data_type {
             luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+            luminal::dtype::PlanDtype::F64 => sys::cudaDataType_t::CUDA_R_64F,
             luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
             luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
             other => anyhow::bail!("unsupported cuBLASLt bias storage {other:?}"),
@@ -338,28 +363,37 @@ pub fn prepare(
     }
     .map_err(|e| anyhow!("workspace preference: {e:?}"))?;
 
-    if call.d_dtype != luminal::dtype::PlanDtype::F32 {
-        // The graph rounds only the final output. Split-K reductions must
-        // keep their partial sums in FP32, never the narrow output type.
-        // NONE (zero) remains available alongside COMPUTE_TYPE.
-        let reduction_mask =
-            sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
-        unsafe {
-            lt::set_matmul_pref_attribute(pref.raw,
-                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
-                (&reduction_mask) as *const _ as *const _, std::mem::size_of::<u32>())
-        }.map_err(|e| anyhow!("FP32 intermediate reduction preference: {e:?}"))?;
+    let reduction_mask = match call.reduction_scheme_mask {
+        LtReductionSchemeMask::All => {
+            sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_MASK as u32
+        }
+        LtReductionSchemeMask::ComputeType => {
+            sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32
+        }
+    };
+    unsafe {
+        lt::set_matmul_pref_attribute(
+            pref.raw,
+            sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+            (&reduction_mask) as *const _ as *const _,
+            std::mem::size_of::<u32>(),
+        )
     }
+    .map_err(|e| anyhow!("reduction scheme preference: {e:?}"))?;
 
-    if call.computation == LtComputation::TensorFloat32 {
-        // FAST_TF32 alone permits a full-F32 algorithm (observed for 1x1 on
-        // A100), which would skip authored input rounding. Request algorithms
-        // whose multiplication inputs actually use TF32 precision. Unsupported
-        // geometries retain ordinary materialized-rounding candidates.
+    let input_implementation = match call.computation {
+        LtComputation::Float16 | LtComputation::Float32 | LtComputation::Float64 => None,
+        LtComputation::TensorFloat32 => Some(0x04_u64 << 16),
+        LtComputation::Float32FastFloat16 => Some(0x01_u64 << 16),
+        LtComputation::Float32FastBfloat16 => Some(0x02_u64 << 16),
+    };
+    if let Some(input_implementation) = input_implementation {
+        // FAST modes alone may choose another input precision. The authored
+        // round trip requires this exact inner dot-product input type.
+        // Unsupported geometries retain materialized-rounding alternatives.
         // cublasLt.h macros are absent from cudarc's generated Rust bindings.
         const INPUT_TYPE_MASK: u64 = 0xff << 16;
-        const INPUT_TF32: u64 = 0x04 << 16;
-        let implementation_mask = !INPUT_TYPE_MASK | INPUT_TF32;
+        let implementation_mask = !INPUT_TYPE_MASK | input_implementation;
         unsafe {
             lt::set_matmul_pref_attribute(
                 pref.raw,
@@ -368,7 +402,7 @@ pub fn prepare(
                 std::mem::size_of::<u64>(),
             )
         }
-        .map_err(|e| anyhow!("TF32 numerical implementation preference: {e:?}"))?;
+        .map_err(|e| anyhow!("input precision implementation preference: {e:?}"))?;
     }
 
     let heuristic = unsafe {
@@ -413,7 +447,7 @@ pub fn prepare(
         )
     };
     let required_pointer_mode = match call.scalars {
-        LtScalars::Host { .. } => {
+        LtScalars::Host { .. } | LtScalars::HostF16 { .. } | LtScalars::HostF64 { .. } => {
             sys::cublasLtPointerModeMask_t::CUBLASLT_POINTER_MODE_MASK_HOST as u32
         }
         LtScalars::Device { .. } => {
@@ -432,9 +466,20 @@ pub fn prepare(
     // The approved scalar arguments determine both pointers. Host literals
     // are owned by PreparedCall; device values stay live graph dependencies.
     let scalars = match call.scalars {
+        LtScalars::HostF16 {
+            alpha_bits,
+            beta_bits,
+        } => PreparedScalars::HostF16 {
+            alpha: alpha_bits,
+            beta: beta_bits,
+        },
         LtScalars::Host { .. } => {
             let (alpha, beta) = call.scalars.host_values().unwrap();
             PreparedScalars::Host { alpha, beta }
+        }
+        LtScalars::HostF64 { .. } => {
+            let (alpha, beta) = call.scalars.host_values_f64().unwrap();
+            PreparedScalars::HostF64 { alpha, beta }
         }
         LtScalars::Device {
             alpha_operand,
@@ -480,7 +525,9 @@ pub struct PreparedCall {
     workspace: DeviceRange,
 }
 enum PreparedScalars {
+    HostF16 { alpha: u16, beta: u16 },
     Host { alpha: f32, beta: f32 },
+    HostF64 { alpha: f64, beta: f64 },
     Device { alpha: u64, beta: u64 },
 }
 impl PreparedHostOp for PreparedCall {
@@ -490,9 +537,17 @@ impl PreparedHostOp for PreparedCall {
             .map_err(|_| anyhow!("cuBLASLt handle mutex poisoned"))?;
         let (alpha, beta): (*const std::ffi::c_void, *const std::ffi::c_void) = match &self.scalars
         {
+            PreparedScalars::HostF16 { alpha, beta } => (
+                alpha as *const u16 as *const _,
+                beta as *const u16 as *const _,
+            ),
             PreparedScalars::Host { alpha, beta } => (
                 alpha as *const f32 as *const _,
                 beta as *const f32 as *const _,
+            ),
+            PreparedScalars::HostF64 { alpha, beta } => (
+                alpha as *const f64 as *const _,
+                beta as *const f64 as *const _,
             ),
             PreparedScalars::Device { alpha, beta } => (*alpha as *const _, *beta as *const _),
         };

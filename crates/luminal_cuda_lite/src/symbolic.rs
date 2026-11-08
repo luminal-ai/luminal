@@ -341,6 +341,41 @@ pub struct ShapeEnv {
     pub values: DynMap,
 }
 
+/// Choose the initial physical allocation domain for a semantic shape domain.
+///
+/// A PyTorch export spells an open upper bound as `i64::MAX - 1`. Planning
+/// storage over products of those sentinels either overflows or asks for an
+/// impossible device allocation. Start those axes in a geometric bucket around
+/// the profiling value instead. The runtime grows this physical domain before
+/// executing a later in-range call; the authored semantic bounds remain
+/// unchanged and continue to validate every call.
+pub fn initial_capacity_bounds(
+    semantic: &luminal::shape::SymbolBounds,
+    values: &DynMap,
+) -> Result<Bounds> {
+    const OPEN_UPPER_BOUND: usize = (i64::MAX - 1) as usize;
+
+    semantic
+        .iter()
+        .map(|(symbol, range)| {
+            let mut hi = range.max();
+            if hi >= OPEN_UPPER_BOUND {
+                let value = *values
+                    .get(symbol)
+                    .ok_or_else(|| anyhow!("missing profiling value for dimension `{symbol}`"))?;
+                let bucket = value
+                    .max(1)
+                    .checked_next_power_of_two()
+                    .unwrap_or(hi)
+                    .saturating_mul(2)
+                    .min(hi);
+                hi = bucket.max(value).max(range.min());
+            }
+            Ok((*symbol, (range.min(), hi)))
+        })
+        .collect()
+}
+
 /// C lexes a sign separately; spell i64::MIN without an out-of-range literal.
 pub fn integer_literal(v: i64) -> String {
     if v == i64::MIN {
@@ -381,6 +416,23 @@ mod tests {
                 assert!(usize::try_from(eval(&term, &dims).unwrap()).unwrap() <= capacity);
             }
         }
+    }
+
+    #[test]
+    fn open_semantic_ranges_start_in_finite_geometric_capacity_buckets() {
+        let open = (i64::MAX - 1) as usize;
+        let bounds = luminal::shape::SymbolBounds::from_ranges([
+            ("open".into(), (0, open)),
+            ("finite".into(), (2, 17)),
+        ])
+        .unwrap();
+        let values = [("open".into(), 4), ("finite".into(), 3)]
+            .into_iter()
+            .collect();
+        let capacity = initial_capacity_bounds(&bounds, &values).unwrap();
+        assert_eq!(capacity[&"open".into()], (0, 8));
+        assert_eq!(capacity[&"finite".into()], (2, 17));
+        assert_eq!(bounds.get(&"open".into()).unwrap().max(), open);
     }
     #[test]
     fn invalid_or_unbounded_allocations_refuse() {

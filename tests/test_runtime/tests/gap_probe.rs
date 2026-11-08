@@ -43,7 +43,7 @@ fn raw_strided_never_climbs_to_bit_offset() {
                 .nodes
                 .values()
                 .filter(|m| m.eclass == n.eclass)
-                .map(|m| m.op.clone())
+                .map(|m| m.op.to_string())
                 .collect();
             println!("class {:?} spellings {:?}", n.eclass, ops);
         }

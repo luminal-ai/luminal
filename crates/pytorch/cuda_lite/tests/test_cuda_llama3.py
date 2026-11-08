@@ -35,13 +35,16 @@ def test_dynamic_dim_reuse_no_recompile(device: torch.device):
 
     model = DynamicSeqModel().eval().to(device)
 
-    # Export the sequence domain explicitly; an unspecified export is static.
+    # Compile once with an authored dynamic sequence dimension. Integer dtype
+    # does not itself make an exported extent dynamic; the export constraint is
+    # the source of truth for which calls this program accepts.
     example = torch.tensor([[1, 2, 3, 4]], device=device)
+    seq = torch.export.Dim("seq", min=1)
     compiled = luminal_compile(
         model,
         example,
+        dynamic_shapes=({1: seq},),
         search_iterations=5,
-        dynamic_shapes=({1: torch.export.Dim("sequence", min=1, max=8)},),
     )
 
     # Execute with multiple different seq lengths — each call reuses the

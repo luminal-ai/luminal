@@ -6,6 +6,9 @@ use luminal::{bufferize::OutputBinding, layouts::DecodedLayout, prelude::NodeInd
 use luminal_cuda_lite::{CudaRuntime, HostBuffer};
 
 use luminal_cuda_lite::CudaArena;
+pub mod fp16;
+pub mod fp64;
+pub mod int8;
 mod memory;
 pub use memory::Allocation;
 
@@ -111,3 +114,5 @@ pub fn download_plan(
 pub fn allocate_arena(runtime: &CudaRuntime) -> Result<Allocation> {
     Allocation::new(runtime.cuda_stream()?.clone(), runtime.arena_bytes()?)
 }
+
+pub mod input_rounding;
