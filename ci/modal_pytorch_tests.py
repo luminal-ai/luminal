@@ -184,7 +184,18 @@ def create_app(backend: str, local_project_dir: Path):
             return DEFAULT_TIMEOUT
         return timeout
 
-    @app.cls(image=image, timeout=DEFAULT_TIMEOUT, serialized=True)
+    # The serialized class closes over both volume objects to commit test cache
+    # and profiling data. Register them as static class dependencies so Modal
+    # hydrates them before serializing the class definition.
+    @app.cls(
+        image=image,
+        timeout=DEFAULT_TIMEOUT,
+        serialized=True,
+        volumes={
+            HF_CACHE_PATH: HF_CACHE_VOLUME,
+            PROFILE_VOLUME_PATH: PROFILE_VOLUME,
+        },
+    )
     class TestRunner:
         @modal.method()
         def run(
@@ -357,18 +368,7 @@ def create_app(backend: str, local_project_dir: Path):
         runner_options = {"gpu": gpu} if gpu else {}
         hf_token_secret = _hf_token_secret()
 
-        # These volumes are attached dynamically through `Cls.with_options`,
-        # so Modal does not hydrate them while processing the static class
-        # decorator. The serialized class closes over both objects (for cache
-        # commits and profile export); resolve their object IDs before Modal
-        # serializes that closure.
-        HF_CACHE_VOLUME.hydrate()
-        PROFILE_VOLUME.hydrate()
-        runner_volumes = {HF_CACHE_PATH: HF_CACHE_VOLUME}
         runner_options["timeout"] = timeout
-        if profile_enabled:
-            runner_volumes[PROFILE_VOLUME_PATH] = PROFILE_VOLUME
-        runner_options["volumes"] = runner_volumes
         if hf_token_secret is not None:
             runner_options["secrets"] = [hf_token_secret]
         runner = TestRunner.with_options(**runner_options)()
