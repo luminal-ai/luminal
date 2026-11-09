@@ -228,7 +228,9 @@ def test_a_tensor_subclass_is_refused_by_name():
     assert "_Exotic" in message, message
 
     with pytest.raises(boundary.UnsupportedBoundary, match="expected a CUDA tensor"):
-        boundary.boundary_layout("w", torch.nn.Parameter(torch.empty(4, 4)))
+        boundary.boundary_layout(
+            "w", torch.nn.Parameter(torch.empty(4, 4, device="cpu"))
+        )
 
 
 def test_a_parameter_of_a_custom_tensor_type_is_refused_by_name():
