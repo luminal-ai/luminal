@@ -481,7 +481,12 @@ fn compiled_int8_calls_match_reference_preserve_narrowing_and_read_live_scalars(
                         assert_eq!(calls[0].computation, LtComputation::Float32);
                         assert_eq!(matches!(calls[0].scalars, LtScalars::Device { .. }), device);
                         if batched {
-                            assert_eq!(calls[0].b.batch_stride_in_elements, 0);
+                            // Search may keep the authored broadcast as a zero-stride
+                            // view or materialize its two batches. Both are exact
+                            // implementations; the descriptor must describe the
+                            // selected storage. The executions below compare either
+                            // choice against the semantic reference.
+                            assert!(matches!(calls[0].b.batch_stride_in_elements, 0 | 12));
                         }
                         execution = Some((
                             support::allocate_arena(&runtime).unwrap(),
