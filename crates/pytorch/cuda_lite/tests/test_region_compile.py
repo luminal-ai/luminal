@@ -237,13 +237,6 @@ def test_compile_region_uses_current_cuda_stream() -> None:
 @pytest.mark.skipif(
     _CUDA_SKIP_REASON is not None, reason=_CUDA_SKIP_REASON or "CUDA is unavailable"
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "external CUDA graph capture cannot record Luminal's nested cuGraphLaunch; "
-        "the external_cuda_graph execution path is not implemented yet"
-    ),
-)
 def test_compile_region_can_be_captured_by_pytorch() -> None:
     from torch._subclasses.fake_tensor import FakeTensorMode
 
