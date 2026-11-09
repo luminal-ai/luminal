@@ -204,17 +204,11 @@ def test_writeback_consumed_downstream():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.xfail(
-    strict=True,
-    reason="LUM-830: eager's pointwise output inherits the operand layout; "
-    "no strided-destination write yet",
-)
 def test_transposed_input_binds_zero_copy():
     """A transposed input is bound at the strides it has — (1, 8) — never
     copied and never reinterpreted; that the chain is column-major is the
     e-graph's discovery. Eager gives the pointwise output the operand's
-    layout too, so the output is bound at that chain and the search refuses
-    by name until a strided-destination write lands."""
+    layout too, so generic copy writes that exact injective destination."""
 
     def fn(x):
         return x * 2 + 1
@@ -264,12 +258,10 @@ def test_dynamic_batch_output_is_returned_at_eagers_strides():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.xfail(strict=True, reason="LUM-830: no strided-destination write yet")
 def test_transposed_output_keeps_eagers_strides():
     """Eager lays this output out the way its operands are laid out, so it
     is column-major, and the output is bound at those exact strides. No
-    elected op writes a non-row-major destination today: the search refuses
-    by name until the layout-changing copy into the bound output lands."""
+    generic copy writes that exact injective destination layout."""
 
     def fn(a, b):
         return a.t() + b.t()
@@ -354,17 +346,11 @@ def test_int32_and_bool_inputs_bind_external():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.xfail(
-    strict=True,
-    reason="LUM-830: eager's pointwise output inherits the operand layout; "
-    "no strided-destination write yet",
-)
 def test_transposed_dynamic_batch_input():
     """The transposed input's element stride IS the dynamic batch dimension,
     so the binding states that dimension rather than the number one example
     call had: one compile serves every extent in the domain. Eager's output
-    is column-major here, so the search refuses by name until a
-    strided-destination write lands."""
+    is column-major here, and generic copy writes that destination."""
 
     def fn(x):
         return x * 2 + 1
@@ -379,17 +365,11 @@ def test_transposed_dynamic_batch_input():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.xfail(
-    strict=True,
-    reason="LUM-830: eager's pointwise output inherits the operand layout; "
-    "no strided-destination write yet",
-)
 def test_permuted_dynamic_view_states_its_size_derived_strides():
     """A permuted view is neither row- nor column-major, and every one of
     its strides is a product of the program's own dimensions: the binding
     states those expressions, so one searched plan serves every extent in
-    the domain. Eager's output carries the same permuted strides, so the
-    search refuses by name until a strided-destination write lands."""
+    the domain. Eager's output carries the same injective permuted strides."""
 
     def fn(x):
         return x * 2 + 1
