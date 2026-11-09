@@ -10,10 +10,12 @@ preparation (dynamic-shape handling, scalar-output boxing, decomposition
 fallback, dead-op/guard cleanup) is backend-neutral, so it is imported
 from the reference package rather than duplicated.
 
-DEVICE MODEL: every boundary tensor is the caller's own device memory.
+DEVICE MODEL: every CUDA boundary tensor is the caller's own device memory.
 Its element strides are read once at compile time (``boundary.py``) and
 declared to the runtime, which binds it on one buffer id; each call hands
-that buffer the tensor's address. Which map a chain is — contiguous,
+that buffer the tensor's address. PyTorch's rank-zero CPU-scalar operand
+exception is preserved by copying that exact scalar into a persistent CUDA
+scalar on every call; larger CPU tensors are refused. Which map a chain is — contiguous,
 column-major, neither — is discovered in the e-graph, never decided here.
 A user-visible output is bound at eager's exact strides — read from the
 same fake value the input layouts are read from — and allocated per call
@@ -77,6 +79,7 @@ from .boundary import (
     declared_strides,
     layout_from_spec,
     layout_spec,
+    requires_device_staging,
     storage_dtype,
     storage_shape,
     storage_span,
@@ -407,6 +410,7 @@ class CompiledModel:
         held_tensors: dict[str, torch.Tensor] | None = None,
         held_bindings: Sequence[Binding] = (),
         output_aliases: dict[str, tuple[str, int]] | None = None,
+        device_staging: dict[str, torch.Tensor] | None = None,
     ):
         self._graph = graph
         # Output name -> (the boundary tensor whose storage it is a view of,
@@ -426,6 +430,11 @@ class CompiledModel:
         # program that still passes every guard.
         self._held: dict[str, torch.Tensor] = dict(held_tensors or {})
         self._held_bindings = list(held_bindings)
+        # Rank-zero CPU tensors are legal scalar operands of CUDA operations
+        # in eager PyTorch. They keep their authored host identity at the
+        # Python boundary while this persistent mirror supplies device bytes
+        # to the runtime. Its contents are refreshed on every invocation.
+        self._device_staging: dict[str, torch.Tensor] = dict(device_staging or {})
         # Fixed once a program is searched; the per-execution arena sizes to it.
         self._arena_bytes = graph.arena_bytes()
         self._host_staging = graph.allocate_staging()
@@ -453,6 +462,7 @@ class CompiledModel:
             self._held,
             self._held_bindings,
             self._output_aliases,
+            {name: value.clone() for name, value in self._device_staging.items()},
         )
 
     @property
@@ -540,14 +550,34 @@ class CompiledModel:
                 f"luminal_cuda_lite expected {len(self._input_bindings)} inputs, "
                 f"got {len(inputs)}"
             )
+        named_bound = list(zip(self._input_bindings, inputs)) + [
+            (binding, self._held[binding.name]) for binding in self._held_bindings
+        ]
+        cuda_values = [value for _, value in named_bound if value.is_cuda]
         device = (
-            inputs[0].device
-            if inputs
-            else next(iter(self._held.values())).device
-            if self._held
+            cuda_values[0].device
+            if cuda_values
+            else next(iter(self._device_staging.values())).device
+            if self._device_staging
             else torch.device("cuda", torch.cuda.current_device())
         )
-        for value in inputs:
+        for binding, value in named_bound:
+            host_staged = requires_device_staging(value)
+            if binding.host_staged != host_staged:
+                expected = (
+                    "a rank-zero CPU scalar" if binding.host_staged else "a CUDA tensor"
+                )
+                raise UnsupportedBoundary(
+                    f"{binding.name}: bound as {expected}, called with shape "
+                    f"{tuple(value.shape)} on device {value.device}"
+                )
+            if host_staged:
+                continue
+            if not value.is_cuda:
+                raise UnsupportedBoundary(
+                    f"{binding.name}: expected a CUDA tensor or rank-zero CPU scalar, "
+                    f"got shape {tuple(value.shape)} on device {value.device}"
+                )
             if value.device != device:
                 raise RuntimeError(
                     "luminal_cuda_lite requires all inputs on one device, got "
@@ -595,9 +625,7 @@ class CompiledModel:
         # declared ones is refused by name. The dimension map is the whole
         # call's, so a stride declared over a dimension ANOTHER input
         # carries is still checked here.
-        bound = list(zip(self._input_bindings, inputs)) + [
-            (binding, self._held[binding.name]) for binding in self._held_bindings
-        ]
+        bound = named_bound
         dims = call_dim_values(bound)
         for binding, value in bound:
             check_binding(binding, value, dims)
@@ -609,6 +637,24 @@ class CompiledModel:
                 list(zip(self._input_names, inputs)) + list(self._held.items()),
                 self._writebacks,
             )
+
+        host_scalars = [
+            (binding.name, value) for binding, value in bound if binding.host_staged
+        ]
+        if capturing and host_scalars:
+            raise RuntimeError(
+                "external CUDA graph capture cannot preserve a rank-zero CPU scalar "
+                "boundary; CUDA-lite refuses instead of changing its authored device"
+            )
+        # Refresh after all boundary checks, on the caller's stream. The side
+        # stream waits for this stream below before any kernel can read the
+        # persistent mirrors.
+        for name, value in host_scalars:
+            staged = self._device_staging.get(name)
+            if staged is None or staged.device != device or staged.dtype != value.dtype:
+                staged = torch.empty((), dtype=value.dtype, device=device)
+                self._device_staging[name] = staged
+            staged.copy_(value)
 
         # The dimensions THIS call states, read off its every input at once:
         # a compound extent is checked against them, so reading input by
@@ -735,8 +781,11 @@ class CompiledModel:
         # `finally`, so no refusal of this call can leave one standing.
         per_call: list[int] = []
         try:
-            # Every input is bound as it is, on the buffer it was declared on.
+            # CUDA inputs bind directly. Rank-zero CPU scalar operands bind
+            # their exact-value device mirrors refreshed above.
             for binding, value in zip(self._input_bindings, inputs):
+                if binding.host_staged:
+                    value = self._device_staging[binding.name]
                 self._graph.set_device_ptr(
                     binding.buffer, value.data_ptr(), buffer_nbytes(value)
                 )
@@ -748,6 +797,8 @@ class CompiledModel:
             # — the thing an execute refuses by name.
             for binding in self._held_bindings:
                 tensor = self._held[binding.name]
+                if binding.host_staged:
+                    tensor = self._device_staging[binding.name]
                 self._graph.set_device_ptr(
                     binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
                 )
@@ -762,8 +813,13 @@ class CompiledModel:
                 per_call.append(binding.buffer)
 
             if static and warmed:
-                for value in [*inputs, *self._held.values(), *out_tensors]:
-                    if value is not None:
+                for value in [
+                    *inputs,
+                    *self._held.values(),
+                    *self._device_staging.values(),
+                    *out_tensors,
+                ]:
+                    if value is not None and value.is_cuda:
                         value.record_stream(side)
                 self._graph.execute_async(arena, arena_bytes, self._host_staging)
             else:
@@ -943,12 +999,35 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
 
     dynamic_shapes = {"args": tuple(specs)} if any_dynamic else None
 
+    # Eager permits a rank-zero CPU tensor as a scalar operand of CUDA ops.
+    # PT2 correctly records placeholder devices, and the translator correctly
+    # refuses a mixed-device program, so model the backend's boundary transfer
+    # explicitly: capture the internal program with a device scalar while
+    # retaining `inputs` as the authored host values that CompiledModel checks
+    # and refreshes at every call.
+    capture_device = next(
+        (
+            value.device
+            for value in inputs
+            if isinstance(value, torch.Tensor) and value.is_cuda
+        ),
+        torch.device("cuda", torch.cuda.current_device()),
+    )
+    capture_inputs = [
+        value.to(device=capture_device)
+        if isinstance(value, torch.Tensor) and requires_device_staging(value)
+        else value
+        for value in inputs
+    ]
+
     # `torch.export` runs its own Dynamo pass. Running that inside the caller's
     # compile pollutes the caller's guard manager (the inner frame's `args`
     # guards leak into the outer sanity check), so isolate the nested compile
     # on its own thread with a fresh Dynamo compile context.
     def _export():
-        return export(gm, tuple(inputs), dynamic_shapes=dynamic_shapes, strict=False)
+        return export(
+            gm, tuple(capture_inputs), dynamic_shapes=dynamic_shapes, strict=False
+        )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         ep = pool.submit(_export).result()
@@ -991,7 +1070,11 @@ def _compile_graph(
     # the same CUDA device as the graph so export does not invent a CPU tensor
     # in an otherwise CUDA program.
     tensor_device = next(
-        (value.device for value in example_inputs if isinstance(value, torch.Tensor)),
+        (
+            value.device
+            for value in example_inputs
+            if isinstance(value, torch.Tensor) and value.is_cuda
+        ),
         None,
     )
     if tensor_device is not None:
@@ -1121,6 +1204,12 @@ def compile_exported(
     writebacks = frozenset(
         mutation for mutation in graph.output_mutations if mutation is not None
     )
+    for mutation in writebacks:
+        if mutation in tensors and requires_device_staging(tensors[mutation]):
+            raise UnsupportedBoundary(
+                f"{mutation}: a rank-zero CPU scalar is device-staged read-only; "
+                "writing it would require a synchronous host writeback"
+            )
     # Region inputs can be metadata-only FakeTensors. Check the real storage
     # available now; __call__ checks every actual input and held tensor before
     # installing addresses, including pairs involving these placeholders.
@@ -1140,6 +1229,24 @@ def compile_exported(
     held: dict[str, torch.Tensor] = {}
     held_bindings: list[Binding] = []
     input_bindings: list[Binding] = []
+    cuda_device = next(
+        (value.device for value in tensors.values() if value.is_cuda),
+        torch.device("cuda", torch.cuda.current_device()),
+    )
+    device_staging: dict[str, torch.Tensor] = {}
+
+    def addressed_value(name: str, value: torch.Tensor) -> torch.Tensor | None:
+        """The device storage search/execution reads for this boundary."""
+        if not requires_device_staging(value):
+            return value
+        if isinstance(value, FakeTensor):
+            return None
+        staged = device_staging.get(name)
+        if staged is None:
+            staged = value.to(device=cuda_device)
+            device_staging[name] = staged
+        return staged
+
     for name in graph.input_names:
         if name not in tensors:
             raise RuntimeError(
@@ -1166,11 +1273,23 @@ def compile_exported(
         graph.input_names, graph.input_kinds, graph.input_buffers
     ):
         value = tensors[name]
-        binding = Binding(name, buffer, value.dtype, shapes[name], layouts[name])
+        binding = Binding(
+            name,
+            buffer,
+            value.dtype,
+            shapes[name],
+            layouts[name],
+            host_staged=requires_device_staging(value),
+        )
         if kind == "user_input":
             input_bindings.append(binding)
             continue
-        graph.set_device_ptr(buffer, value.data_ptr(), buffer_nbytes(value))
+        addressed = addressed_value(name, value)
+        if addressed is None:
+            raise UnsupportedBoundary(
+                f"{name}: held rank-zero CPU scalar has no concrete value to stage"
+            )
+        graph.set_device_ptr(buffer, addressed.data_ptr(), buffer_nbytes(addressed))
         held_bindings.append(binding)
         held[name] = value
 
@@ -1190,7 +1309,12 @@ def compile_exported(
         # will still bind the real per-call tensor before execution.
         if isinstance(value, FakeTensor):
             continue
-        graph.set_device_ptr(binding.buffer, value.data_ptr(), buffer_nbytes(value))
+        addressed = addressed_value(binding.name, value)
+        if addressed is None:
+            continue
+        graph.set_device_ptr(
+            binding.buffer, addressed.data_ptr(), buffer_nbytes(addressed)
+        )
         profiled_input_bindings.append(binding)
     try:
         graph.search(
@@ -1245,4 +1369,5 @@ def compile_exported(
         held,
         held_bindings,
         aliases,
+        device_staging,
     )
