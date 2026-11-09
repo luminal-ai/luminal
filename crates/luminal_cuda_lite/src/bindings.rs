@@ -142,6 +142,7 @@ pub struct BufferDecl {
 pub struct CudaBindings {
     inputs: Vec<Bound>,
     outputs: Vec<Bound>,
+    roots: Vec<ValueId>,
     buffers: BTreeMap<i64, BufferDecl>,
     next: i64,
     facts: String,
@@ -383,6 +384,14 @@ impl CudaBindings {
         &self.outputs
     }
 
+    /// Keep a logical value in the rendered cone without declaring it as a
+    /// runtime output. Metadata-only boundary values, such as an authored
+    /// nonzero-offset view, are reconstructed by the caller but still need
+    /// their logical definitions and declarations available to compilation.
+    pub fn root(&mut self, value: ValueId) {
+        self.roots.push(value);
+    }
+
     pub fn buffers(&self) -> &BTreeMap<i64, BufferDecl> {
         &self.buffers
     }
@@ -491,6 +500,7 @@ impl CudaBindings {
             .iter()
             .map(|b| b.value)
             .chain(self.inputs.iter().map(|b| b.value))
+            .chain(self.roots.iter().copied())
             .collect();
         let cone = graph.cone(&roots);
         for input in graph.inputs() {
@@ -673,6 +683,25 @@ mod tests {
         let externals = bindings.bind(&cx.logical).unwrap().externals();
         assert_eq!(externals, [out].into_iter().collect());
         assert!(!externals.contains(&arena_input));
+    }
+
+    /// A metadata-only root keeps its definition in the compilation cone
+    /// without inventing a runtime output slot for that logical value.
+    #[test]
+    fn a_metadata_root_is_rendered_but_not_bound_as_an_output() {
+        let (cx, a, b, sum) = pair();
+        let mut bindings = CudaBindings::new();
+        let home = bindings.input(a);
+        bindings.input(b);
+        bindings.declare(home, Access::ReadWrite, FreedBy::Caller);
+        bindings.output_on(a, home);
+        bindings.root(sum);
+
+        let bound = bindings.bind(&cx.logical).unwrap();
+        let definition = format!("(let {} ", cx.logical.let_name(sum));
+        assert!(bound.prefix.contains(&definition), "{}", bound.prefix);
+        assert_eq!(bound.outputs.len(), 1);
+        assert_eq!(bound.outputs[0].value, a);
     }
 
     /// A SYMBOLIC STRIDE REACHES THE PREAMBLE AS THE DIM ITSELF: the

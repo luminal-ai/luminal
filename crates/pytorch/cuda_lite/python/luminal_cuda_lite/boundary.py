@@ -7,9 +7,11 @@ discovered from the chain itself in the e-graph, so this module states
 what the tensor has and never interprets it. A tensor the runtime cannot
 address as it lies is refused by name, never repacked.
 
-A binding names a buffer's BASE, so a boundary tensor whose storage
-offset is non-zero is refused: two bindings on one buffer share that
-base, and there is no way to say "same buffer, different offset".
+A standalone input binding names a buffer's BASE, so an input whose
+storage offset is non-zero is refused: two bindings on one buffer share
+that base. Returned aliases are different: the compiled boundary states
+their owner plus a relative byte offset, and Python reconstructs the
+authored view after execution.
 
 A stride is stated in the exported program's own vocabulary. Given a fake
 example value, an axis strided by a dynamic dimension states THAT
@@ -20,8 +22,9 @@ cross to the runtime as sympy ``srepr`` strings.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any
 
 import sympy
 import torch
@@ -52,6 +55,42 @@ SUPPORTED_DTYPES: dict[torch.dtype, str] = {
     torch.float8_e4m3fnuz: "F8E4M3FNUZ",
     torch.float8_e5m2fnuz: "F8E5M2FNUZ",
 }
+
+# Complex is a frontend virtual dtype. The translated graph sees the exact
+# interleaved storage as a real tensor with one trailing extent-2 component
+# axis; the Python caller continues to pass and receive the authored complex
+# tensor. No bytes are copied or numerically converted.
+COMPLEX_COMPONENT_DTYPES: dict[torch.dtype, torch.dtype] = {
+    torch.complex32: torch.float16,
+    torch.complex64: torch.float32,
+    torch.complex128: torch.float64,
+}
+
+
+def complex_component_dtype(dtype: torch.dtype) -> torch.dtype | None:
+    """The real storage dtype of a complex dtype, if ``dtype`` is complex."""
+    return COMPLEX_COMPONENT_DTYPES.get(dtype)
+
+
+def storage_dtype(dtype: torch.dtype) -> torch.dtype:
+    """The dtype CUDA kernels read from this caller-facing tensor."""
+    return complex_component_dtype(dtype) or dtype
+
+
+def storage_shape(tensor: torch.Tensor, fake: Any | None = None) -> tuple[Any, ...]:
+    """The translated tensor's shape over the exact same storage bytes."""
+    source = fake if fake is not None else tensor
+    shape = tuple(_extent(size) for size in source.shape)
+    return (*shape, 2) if complex_component_dtype(tensor.dtype) is not None else shape
+
+
+def storage_strides(tensor: torch.Tensor, fake: Any | None = None) -> tuple[Any, ...]:
+    """Component-element strides over the exact same storage bytes."""
+    source = fake if fake is not None else tensor
+    strides = tuple(_extent(stride) for stride in source.stride())
+    if complex_component_dtype(tensor.dtype) is None:
+        return strides
+    return (*(stride * 2 for stride in strides), 1)
 
 
 @dataclass(frozen=True)
@@ -93,7 +132,9 @@ def _reads_as_plain_storage(value: Any) -> bool:
     return type(value) in (torch.Tensor, torch.nn.Parameter, FakeTensor)
 
 
-def _refuse_unreadable(name: str, value: Any) -> None:
+def _refuse_unreadable(
+    name: str, value: Any, *, allow_storage_offset: bool = False
+) -> None:
     """Refuse a boundary value whose storage a binding cannot state: a
     tensor subclass, a layout that is not dense strides, or storage whose
     base the binding cannot name."""
@@ -108,22 +149,24 @@ def _refuse_unreadable(name: str, value: Any) -> None:
             "element strides over dense storage"
         )
     offset = _extent(value.storage_offset())
-    if offset != 0:
+    if offset != 0 and not allow_storage_offset:
         raise UnsupportedBoundary(
             f"{name}: storage offset {offset} is not bound today; a binding names a "
             "buffer's base, and two bindings on one buffer share that base"
         )
 
 
-def boundary_shape(tensor: torch.Tensor, fake: Optional[Any] = None) -> tuple[Any, ...]:
-    """The declared extents: a literal stays an ``int``, a dynamic one is
-    the exported program's own sympy expression."""
-    source = fake if fake is not None else tensor
-    return tuple(_extent(size) for size in source.shape)
+def boundary_shape(tensor: torch.Tensor, fake: Any | None = None) -> tuple[Any, ...]:
+    """Translated storage extents in the exported program's vocabulary."""
+    return storage_shape(tensor, fake)
 
 
 def boundary_layout(
-    name: str, tensor: torch.Tensor, fake: Optional[Any] = None
+    name: str,
+    tensor: torch.Tensor,
+    fake: Any | None = None,
+    *,
+    allow_storage_offset: bool = False,
 ) -> Strided:
     """The element strides a boundary tensor is bound at, or a refusal.
 
@@ -135,19 +178,19 @@ def boundary_layout(
     classified here and nothing is reinterpreted: a tensor this boundary
     cannot state is an error naming it and the offending fact.
     """
-    _refuse_unreadable(name, tensor)
+    _refuse_unreadable(name, tensor, allow_storage_offset=allow_storage_offset)
     if fake is not None:
-        _refuse_unreadable(name, fake)
+        _refuse_unreadable(name, fake, allow_storage_offset=allow_storage_offset)
     if not tensor.is_cuda:
         raise UnsupportedBoundary(
             f"{name}: expected a CUDA tensor, got device {tensor.device}"
         )
-    if tensor.dtype not in SUPPORTED_DTYPES:
+    component_dtype = storage_dtype(tensor.dtype)
+    if component_dtype not in SUPPORTED_DTYPES:
         raise UnsupportedBoundary(
             f"{name}: dtype {tensor.dtype} has no CUDA-lite storage dtype"
         )
-    source = fake if fake is not None else tensor
-    strides = tuple(_extent(stride) for stride in source.stride())
+    strides = storage_strides(tensor, fake)
     for axis, stride in enumerate(strides):
         if isinstance(stride, int) and stride < 0:
             raise UnsupportedBoundary(
@@ -217,7 +260,7 @@ def _dim_values(binding: Binding, tensor: torch.Tensor) -> dict[str, int]:
     (``s0*2``) is not inverted here; a dimension only this binding spells
     compound is pinned by whichever boundary spells it bare."""
     values: dict[str, int] = {}
-    for declared, size in zip(binding.shape, tensor.shape):
+    for declared, size in zip(binding.shape, storage_shape(tensor)):
         if isinstance(declared, sympy.Symbol):
             values.setdefault(declared.name, int(size))
     return values
@@ -273,7 +316,7 @@ def declared_strides(
 
 
 def check_binding(
-    binding: Binding, tensor: torch.Tensor, dims: Optional[dict[str, int]] = None
+    binding: Binding, tensor: torch.Tensor, dims: dict[str, int] | None = None
 ) -> None:
     """Refuse a call-time tensor that does not match its declared binding:
     the storage it describes, the dtype, the rank, every extent — literal,
@@ -291,7 +334,7 @@ def check_binding(
         raise UnsupportedBoundary(
             f"{binding.name}: bound as {binding.dtype}, called with {tensor.dtype}"
         )
-    shape = tuple(int(size) for size in tensor.shape)
+    shape = tuple(int(size) for size in storage_shape(tensor))
     if len(shape) != len(binding.shape):
         raise UnsupportedBoundary(
             f"{binding.name}: bound at rank {len(binding.shape)} (shape {binding.shape}), "
@@ -331,7 +374,7 @@ def check_binding(
                 f"dimensions make {int(extent)}, but the tensor's extent is {size}"
             )
     expected = declared_strides(binding, shape, dims)
-    actual = tuple(int(stride) for stride in tensor.stride())
+    actual = tuple(int(stride) for stride in storage_strides(tensor))
     # Which strides carry information is torch's own contract, spelled in
     # inductor's `significant_strides_equal`: an axis of extent 0 or 1 has
     # no significant stride, and one empty axis makes every stride
