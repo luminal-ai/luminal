@@ -214,6 +214,7 @@ def test_hf_llama3_real_config_1layer(device: torch.device):
     config.num_hidden_layers = 1
     config.use_cache = False
 
+    torch.manual_seed(0)
     model = LlamaForCausalLM(config).eval().to(device)
     compiled = torch.compile(model, backend=luminal_backend)
     input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
