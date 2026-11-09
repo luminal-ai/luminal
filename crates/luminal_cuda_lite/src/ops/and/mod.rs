@@ -24,12 +24,12 @@ impl ToDps for And {
 }
 impl LayoutIrOp for And {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AndDps;
 impl OpSlotNames for AndDps {}
 impl BufferTensorIrOp for AndDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
     fn label(&self) -> &str {
         "AndGeneric"

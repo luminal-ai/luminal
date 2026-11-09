@@ -91,6 +91,11 @@ pub struct CudaRuntime {
     /// assembly tripwire checks each saturated program against them. A
     /// `Default` runtime carries an empty registry, like `matchers`.
     decoders: std::rc::Rc<luminal::egglog_utils::eclass::ConstructorRegistry>,
+    /// Deserializers for the executable DPS op types in this instance's
+    /// registry. Rank zero uses the same runtime interfaces to encode a
+    /// bufferized plan; profiling workers use these callbacks to reconstruct
+    /// that exact plan without running any compiler pass.
+    wire_decoders: std::rc::Rc<crate::collective_search::WireDecoders>,
     plan: Option<BufferIrGraph<DecodedLayout>>,
     storage: Option<crate::arena::ArenaPlan>,
     /// Boundaries supplied as caller-owned device pointers.
@@ -145,6 +150,7 @@ impl CudaRuntime {
             matchers: self.matchers.clone(),
             allow: self.allow.clone(),
             decoders: self.decoders.clone(),
+            wire_decoders: self.wire_decoders.clone(),
             plan: Some(plan.clone()),
             storage: self.storage.clone(),
             bounds: self.bounds.clone(),
@@ -254,6 +260,7 @@ impl CudaRuntime {
         // Derive the claim set BEFORE the rows are consumed: the allow
         // list reads the prototypes, the search reads the matchers.
         let allow = Self::allow_list_over(&registry);
+        let wire_decoders = Self::wire_decoders_over(&registry)?;
         let matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>> =
             registry.into_iter().map(|entry| entry.matcher).collect();
         // The decoders for that same vocabulary. Refused here if two
@@ -283,6 +290,7 @@ impl CudaRuntime {
             matchers: std::rc::Rc::new(matchers),
             allow,
             decoders: std::rc::Rc::new(decoders),
+            wire_decoders: std::rc::Rc::new(wire_decoders),
             input_buffers,
             output_slots,
             output_buffers,
@@ -378,36 +386,30 @@ impl CudaRuntime {
             .collect()
     }
 
-    /// Select a deterministic viable plan without running rank-local timing
-    /// loops. Collective graphs must use this entry point instead of search.
-    pub fn compile(&mut self, bounds: &shape::SymbolBounds, dims: &shape::DynMap) -> Result<()> {
-        bounds.validate_values(dims)?;
-        let (snapshot, _) = self.assemble_and_saturate(bounds)?;
-        let mut plan = luminal::collective::compile_first(
-            &snapshot,
-            &self.decoders,
-            &self.matchers,
-            &self.allow,
-        )?;
-        Self::retarget_external_outputs(&mut plan, &self.native.as_ref().unwrap().bound.outputs)?;
-        self.storage = Some(crate::storage::plan_storage(
-            &plan,
-            &bounds.ranges(),
-            &self.externals,
-        )?);
-        self.plan = Some(plan);
-        // Collective compilation installs the full authored domain as its
-        // physical allocation domain. Keep the replanning source in sync with
-        // the storage plan above: staging/arena queries deliberately rebuild
-        // from `capacity_bounds`, just like searched programs do.
-        self.capacity_bounds = bounds.clone();
-        self.bounds = bounds.clone();
-        self.dims = dims.clone();
-        #[cfg(feature = "device")]
-        if self.device.is_none() {
-            self.device = Some(crate::device::CudaDevice::new(0)?.executable());
+    fn wire_decoders_over(
+        registry: &[crate::ops::RegisteredOp],
+    ) -> Result<crate::collective_search::WireDecoders> {
+        let mut decoders = crate::collective_search::WireDecoders::new();
+        for entry in registry {
+            let dps = entry.prototype.to_dps();
+            let executable = dps.as_deref().unwrap_or(entry.prototype.as_ref());
+            let Some(interface) = executable
+                .runtime_interface()
+                .and_then(|interface| interface.downcast_ref::<crate::CudaOpInterface>())
+            else {
+                continue;
+            };
+            let Some((name, _, decode)) = interface.wire_parts() else {
+                continue;
+            };
+            if let Some(previous) = decoders.insert(name.into(), decode) {
+                ensure!(
+                    std::ptr::fn_addr_eq(previous, decode),
+                    "CUDA wire op name {name} has two decoders"
+                );
+            }
         }
-        Ok(())
+        Ok(decoders)
     }
 
     /// The SATURATED, SERIALIZED e-graph this runtime's search reads —
@@ -488,6 +490,22 @@ impl CudaRuntime {
         Ok((serialized, program))
     }
 
+    fn requires_coordinated_profiling(
+        &self,
+        graph: &luminal::prelude::egraph_serialize::EGraph,
+    ) -> bool {
+        let constructors: std::collections::BTreeSet<_> = self
+            .matchers
+            .iter()
+            .filter(|matcher| matcher.requires_coordinated_profiling())
+            .map(|matcher| matcher.egglog_constructor())
+            .collect();
+        graph
+            .nodes
+            .values()
+            .any(|node| constructors.contains(node.op.as_str()))
+    }
+
     /// Assemble, saturate, and search — with THIS backend's allow list.
     /// On saturation failure the labeled post-checks are re-run in
     /// isolation to name the door, mirroring the reference runtime.
@@ -501,10 +519,73 @@ impl CudaRuntime {
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
+        self.search_coordinator(bounds, profile_dims, input_data, options, None)
+    }
+
+    /// Search a collective-containing graph with rank zero as the sole
+    /// compiler through bufferization. Every rank calls this concurrently with
+    /// the same model, bounds and options. Rank zero returns the search outcome;
+    /// worker ranks only instantiate/profile received physical plans and return
+    /// `None` after installing the coordinator-selected finalist.
+    ///
+    /// Model collectives must also be bound with [`crate::collective::with_group`]
+    /// for the duration of this call. `control` may be that same communicator
+    /// or a separate communicator spanning every profiling rank.
+    #[cfg(feature = "device")]
+    pub fn search_collective(
+        &mut self,
+        bounds: &shape::SymbolBounds,
+        profile_dims: &shape::DynMap,
+        input_data: &FxHashMap<NodeIndex, HostBuffer>,
+        options: &CompileOptions,
+        control: std::rc::Rc<crate::collective::NcclCommunicator>,
+    ) -> Result<Option<SearchOutcome>> {
+        if control.rank() == 0 {
+            self.search_coordinator(bounds, profile_dims, input_data, options, Some(control))
+                .map(Some)
+        } else {
+            self.collective_profile_worker(bounds, profile_dims, input_data, options, control)?;
+            Ok(None)
+        }
+    }
+
+    fn search_coordinator(
+        &mut self,
+        bounds: &shape::SymbolBounds,
+        profile_dims: &shape::DynMap,
+        input_data: &FxHashMap<NodeIndex, HostBuffer>,
+        options: &CompileOptions,
+        #[cfg(feature = "device")] collective: Option<
+            std::rc::Rc<crate::collective::NcclCommunicator>,
+        >,
+        #[cfg(not(feature = "device"))] _collective: Option<()>,
+    ) -> Result<SearchOutcome> {
         #[cfg(feature = "device")]
         if let Some(device) = self.device.as_mut() {
             device.uninstall();
         }
+        #[cfg(feature = "device")]
+        if self.device.is_none() {
+            self.device = Some(crate::device::CudaDevice::new(0)?.executable());
+        }
+        // Create the coordinator before any fallible compiler work. Its Drop
+        // path sends the worker handshake/command abort, so a saturation or
+        // admission error cannot leave nonzero ranks blocked forever.
+        #[cfg(feature = "device")]
+        let requested_collective = collective.is_some();
+        #[cfg(feature = "device")]
+        let mut collective_coordinator = collective
+            .map(|group| {
+                crate::collective_search::Coordinator::new(
+                    group,
+                    self.device
+                        .as_ref()
+                        .expect("device initialized")
+                        .stream()
+                        .clone(),
+                )
+            })
+            .transpose()?;
         bounds.validate_values(profile_dims)?;
         let native = self
             .native
@@ -520,12 +601,20 @@ impl CudaRuntime {
         );
         let (mut serialized, program) = self.assemble_and_saturate(bounds)?;
         let capacity_bounds = crate::symbolic::initial_capacity_bounds(bounds, profile_dims)?;
+        let has_collective = self.requires_coordinated_profiling(&serialized);
+        #[cfg(feature = "device")]
         ensure!(
-            !serialized
-                .nodes
-                .values()
-                .any(|n| n.op == "LogicalAllGather"),
-            "AllGather graphs require compile(), not rank-local autotuning"
+            has_collective == requested_collective,
+            if has_collective {
+                "AllGather graphs require search_collective(), not rank-local search()"
+            } else {
+                "search_collective() requires a graph containing a collective"
+            }
+        );
+        #[cfg(not(feature = "device"))]
+        ensure!(
+            !has_collective,
+            "AllGather graphs require CUDA collective search"
         );
         let shapes = crate::symbolic::ShapeEnv {
             bounds: capacity_bounds.clone(),
@@ -559,10 +648,6 @@ impl CudaRuntime {
             .copied()
             .collect();
         #[cfg(feature = "device")]
-        if self.device.is_none() {
-            self.device = Some(crate::device::CudaDevice::new(0)?.executable());
-        }
-        #[cfg(feature = "device")]
         let external_ptrs: FxHashMap<i64, crate::device::ExternalPtr> = self
             .device_ptrs
             .iter()
@@ -582,62 +667,74 @@ impl CudaRuntime {
                 )
             })
             .collect();
-        let mut evaluator = {
-            #[cfg(feature = "device")]
-            {
-                crate::search::Evaluator::Device {
-                    device: self.device.as_mut().expect("device initialized"),
-                    staged: &staged,
-                    external_ptrs: &external_ptrs,
+        let mut outcome = {
+            let mut evaluator = {
+                #[cfg(feature = "device")]
+                {
+                    if let Some(coordinator) = collective_coordinator.as_mut() {
+                        crate::search::Evaluator::CollectiveCoordinator {
+                            device: self.device.as_mut().expect("device initialized"),
+                            staged: &staged,
+                            external_ptrs: &external_ptrs,
+                            coordinator,
+                        }
+                    } else {
+                        crate::search::Evaluator::Device {
+                            device: self.device.as_mut().expect("device initialized"),
+                            staged: &staged,
+                            external_ptrs: &external_ptrs,
+                        }
+                    }
                 }
-            }
-            #[cfg(not(feature = "device"))]
-            {
-                crate::search::Evaluator::NoDevice(std::marker::PhantomData)
-            }
+                #[cfg(not(feature = "device"))]
+                {
+                    crate::search::Evaluator::NoDevice(std::marker::PhantomData)
+                }
+            };
+            let mut outcome = crate::search::search_implementations(
+                &mut serialized,
+                &program,
+                &shapes,
+                options,
+                Some(self.allow.clone()),
+                &self.matchers,
+                evaluator.reborrow(),
+            )
+            .with_context(|| {
+                let outputs = program
+                    .outputs
+                    .iter()
+                    .map(|bound| {
+                        format!(
+                            "v{} at {:?} on buffer {}",
+                            bound.value.index(),
+                            bound.layout,
+                            bound.buffer
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!("no plan writes the bound outputs: {outputs}")
+            })?;
+            let finalists = crate::finalists::Finalists::new(
+                "program",
+                &serialized,
+                Some(self.allow.clone()),
+                &self.matchers,
+                outcome.ranked.clone(),
+                Some(outcome.best_plan.clone()),
+            )
+            .with_shapes(shapes)
+            .with_external_bindings(profile_externals);
+            let (finalist, rejections) =
+                crate::search::select_finalist(finalists, options, &mut evaluator)?;
+            outcome.finalist_rejections = rejections;
+            outcome.finalist_rank = finalist.rank;
+            outcome.best_plan = finalist.plan;
+            outcome.best_genome = finalist.genome;
+            outcome.best_nanos = finalist.metric;
+            outcome
         };
-        let mut outcome = crate::search::search_implementations(
-            &mut serialized,
-            &program,
-            &shapes,
-            options,
-            Some(self.allow.clone()),
-            &self.matchers,
-            evaluator.reborrow(),
-        )
-        .with_context(|| {
-            let outputs = program
-                .outputs
-                .iter()
-                .map(|bound| {
-                    format!(
-                        "v{} at {:?} on buffer {}",
-                        bound.value.index(),
-                        bound.layout,
-                        bound.buffer
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            format!("no plan writes the bound outputs: {outputs}")
-        })?;
-        let finalists = crate::finalists::Finalists::new(
-            "program",
-            &serialized,
-            Some(self.allow.clone()),
-            &self.matchers,
-            outcome.ranked.clone(),
-            Some(outcome.best_plan.clone()),
-        )
-        .with_shapes(shapes)
-        .with_external_bindings(profile_externals);
-        let (finalist, rejections) =
-            crate::search::select_finalist(finalists, options, &mut evaluator)?;
-        outcome.finalist_rejections = rejections;
-        outcome.finalist_rank = finalist.rank;
-        outcome.best_plan = finalist.plan;
-        outcome.best_genome = finalist.genome;
-        outcome.best_nanos = finalist.metric;
         Self::retarget_external_outputs(&mut outcome.best_plan, &native.bound.outputs)?;
         self.storage = Some(crate::storage::plan_storage(
             &outcome.best_plan,
@@ -658,7 +755,155 @@ impl CudaRuntime {
         self.dims = profile_dims.clone();
         self.device_budget_bytes = Some(outcome.arena_budget_bytes);
         self.intermediate_budget_bytes = Some(outcome.intermediate_budget_bytes);
+        #[cfg(feature = "device")]
+        if let Some(coordinator) = collective_coordinator.as_mut() {
+            coordinator.finish(
+                self.device.as_ref().expect("device initialized").stream(),
+                &outcome.best_plan,
+            )?;
+        }
         Ok(outcome)
+    }
+
+    #[cfg(feature = "device")]
+    fn collective_profile_worker(
+        &mut self,
+        bounds: &shape::SymbolBounds,
+        profile_dims: &shape::DynMap,
+        input_data: &FxHashMap<NodeIndex, HostBuffer>,
+        options: &CompileOptions,
+        control: std::rc::Rc<crate::collective::NcclCommunicator>,
+    ) -> Result<()> {
+        bounds.validate_values(profile_dims)?;
+        let native = self
+            .native
+            .as_ref()
+            .ok_or_else(|| anyhow!("load before collective search"))?;
+        for tensor in input_data.keys() {
+            ensure!(
+                native
+                    .bound
+                    .inputs
+                    .iter()
+                    .any(|bound| bound.value == *tensor),
+                "tensor {tensor:?} is not a bound input"
+            );
+        }
+        if self.device.is_none() {
+            self.device = Some(crate::device::CudaDevice::new(0)?.executable());
+        }
+        self.device
+            .as_mut()
+            .expect("device initialized")
+            .uninstall();
+        let stream = self
+            .device
+            .as_ref()
+            .expect("device initialized")
+            .stream()
+            .clone();
+        let worker = crate::collective_search::Worker::receive(control, &stream)?;
+        let device = self.device.as_mut().expect("device initialized");
+        let capacity_bounds = crate::symbolic::initial_capacity_bounds(bounds, profile_dims)?;
+        let shapes = crate::symbolic::ShapeEnv {
+            bounds: capacity_bounds.clone(),
+            values: profile_dims.clone(),
+        };
+        let staged: FxHashMap<i64, &HostBuffer> = native
+            .bound
+            .inputs
+            .iter()
+            .filter_map(|bound| {
+                input_data
+                    .get(&bound.value)
+                    .map(|data| (bound.buffer, data))
+            })
+            .collect();
+        let external_ptrs: FxHashMap<i64, crate::device::ExternalPtr> = self
+            .device_ptrs
+            .iter()
+            .filter(|(buffer, _)| self.profiling_externals.contains(buffer))
+            .map(|(buffer, (ptr, bytes))| {
+                (
+                    *buffer,
+                    crate::device::ExternalPtr {
+                        ptr: *ptr,
+                        bytes: *bytes,
+                    },
+                )
+            })
+            .collect();
+        loop {
+            match worker.next(&stream, &self.wire_decoders)? {
+                crate::collective_search::WorkerCommand::Candidate(plan) => {
+                    let candidate = crate::profile::PreparedCandidate::new(
+                        device,
+                        &plan,
+                        &staged,
+                        &external_ptrs,
+                        &shapes,
+                        Some(worker.begin.arena_budget_bytes),
+                    );
+                    let local_ready = candidate.is_ok();
+                    if !worker.all_ready(&stream, local_ready)? {
+                        continue;
+                    }
+                    let mut candidate = candidate.expect("all ranks reported ready");
+                    for run in crate::collective_search::fixed_profile_runs(worker.begin.trials) {
+                        let started = std::time::Instant::now();
+                        let ran = candidate.run();
+                        let elapsed = started.elapsed().as_nanos();
+                        if !worker.all_ready(&stream, ran.is_ok())? {
+                            break;
+                        }
+                        if run == crate::collective_search::ProfileRun::Trial {
+                            let local = u64::try_from(elapsed).unwrap_or(u64::MAX);
+                            worker.max_nanos(&stream, local)?;
+                        }
+                    }
+                }
+                crate::collective_search::WorkerCommand::Finish(plan) => {
+                    let installed = (|| -> Result<_> {
+                        let storage =
+                            crate::storage::plan_storage(&plan, &capacity_bounds, &self.externals)?;
+                        ensure!(
+                            storage.slab_bytes <= worker.begin.arena_budget_bytes,
+                            "coordinator finalist needs {} bytes on this rank, budget {}",
+                            storage.slab_bytes,
+                            worker.begin.arena_budget_bytes
+                        );
+                        let intermediate_budget = crate::search::resolve_intermediate_budget(
+                            worker.begin.arena_budget_bytes,
+                            storage.peak_boundary_bytes,
+                            options.intermediate_budget_bytes,
+                        );
+                        ensure!(
+                            storage.peak_intermediate_bytes <= intermediate_budget,
+                            "coordinator finalist needs {} peak intermediate bytes on this rank, budget {}",
+                            storage.peak_intermediate_bytes,
+                            intermediate_budget
+                        );
+                        let capacity = shape::SymbolBounds::from_ranges(capacity_bounds.clone())?;
+                        Ok((plan, storage, intermediate_budget, capacity))
+                    })();
+                    let all_installed = worker.all_ready(&stream, installed.is_ok())?;
+                    ensure!(
+                        all_installed,
+                        "a rank could not install the selected finalist"
+                    );
+                    let (plan, storage, intermediate_budget, capacity) = installed?;
+                    device.uninstall();
+                    self.storage = Some(storage);
+                    self.plan = Some(plan);
+                    self.capacity_bounds = capacity;
+                    self.bounds = bounds.clone();
+                    self.dims = profile_dims.clone();
+                    self.device_budget_bytes = Some(worker.begin.arena_budget_bytes);
+                    self.intermediate_budget_bytes = Some(intermediate_budget);
+                    return Ok(());
+                }
+            }
+        }
     }
 
     /// The buffers the bindings declared CALLER-OWNED device memory — the

@@ -97,7 +97,7 @@ impl OpMatcher for CublasLtAccumulateInPlaceMatcher {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CublasLtAccumulateInPlace {
     pub configuration: ClassId,
     pub computation: LtComputation,
@@ -205,7 +205,7 @@ impl BufferTensorIrOp for CublasLtAccumulateInPlace {
         "CublasLtAccumulateInPlace"
     }
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::host::<Self>())
+        Some(crate::CudaOpInterface::host_wire::<Self>())
     }
 }
 impl Bufferizable for CublasLtAccumulateInPlace {

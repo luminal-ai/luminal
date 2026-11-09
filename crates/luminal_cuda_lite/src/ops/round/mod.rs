@@ -43,7 +43,7 @@ impl ToDps for RoundFunctional {
 impl LayoutIrOp for RoundFunctional {}
 
 /// Destination-passing form: `Round(input: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RoundFunctionalDps;
 
 impl OpSlotNames for RoundFunctionalDps {
@@ -58,7 +58,7 @@ impl OpSlotNames for RoundFunctionalDps {
 
 impl BufferTensorIrOp for RoundFunctionalDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

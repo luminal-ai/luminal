@@ -44,7 +44,7 @@ impl ToDps for TruncRemFunctional {
 impl LayoutIrOp for TruncRemFunctional {}
 
 /// Destination-passing form: `TruncRem(numerator: read, denominator: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TruncRemFunctionalDps;
 
 impl OpSlotNames for TruncRemFunctionalDps {
@@ -60,7 +60,7 @@ impl OpSlotNames for TruncRemFunctionalDps {
 
 impl BufferTensorIrOp for TruncRemFunctionalDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

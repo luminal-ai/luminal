@@ -132,7 +132,7 @@ pub enum Owner {
 /// allocation is `span-of-layout` bytes for the backed tensor's layout,
 /// which the runtime already knows (it elected it) and which Option B
 /// ADDITIONALLY carries here as `layout`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Buffer<L: PlanLayout> {
     pub id: BufferId,
     pub access: Access,
@@ -188,7 +188,7 @@ pub struct Buffer<L: PlanLayout> {
 /// The runtime hands the user this buffer and may attach the layout it
 /// already knows ("maybe it can be typed — not essential"); Option B
 /// carries that layout here so externally loaded plans can do the same.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutputBinding<L: PlanLayout> {
     pub index: usize,
     pub value: ClassId,
@@ -203,7 +203,7 @@ pub struct OutputBinding<L: PlanLayout> {
 
 /// A program input slot: a value pinned to a caller-owned buffer. Slot order
 /// is declaration order (the vec position is the index).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InputBinding {
     pub value: ClassId,
     pub buffer: BufferId,
@@ -223,7 +223,7 @@ pub enum EdgeKind {
 /// the consumer's port label. Every value of the extracted graph has become a
 /// buffer here (a BufferTensor); [`BufferIrGraph::value_buffer`] still records the
 /// value→buffer map for cross-reference with the source graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BufferEdge {
     pub buffer: BufferId,
     pub port: String,
@@ -244,7 +244,7 @@ pub struct BufferEdge {
 /// kernel wants to remember from its claimed site (extents, dtypes,
 /// masks) is the OP RECORD's private business (its matcher captured it) —
 /// never plan vocabulary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SlotDescriptor<L: PlanLayout> {
     /// The value occupying this slot (operand read / result written).
     pub value: ClassId,

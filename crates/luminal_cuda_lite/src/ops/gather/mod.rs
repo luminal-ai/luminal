@@ -56,7 +56,7 @@ impl LayoutIrOp for Gather {}
 /// Destination-passing form: `Gather(data: read, coord0..: read,
 /// dest0: write ↔ out0)` — the destination is the trailing operand at
 /// index `rank + 1`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GatherDps {
     pub rank: usize,
 }
@@ -83,7 +83,7 @@ impl OpSlotNames for GatherDps {
 
 impl BufferTensorIrOp for GatherDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

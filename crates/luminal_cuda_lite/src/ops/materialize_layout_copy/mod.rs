@@ -44,7 +44,7 @@ impl ToDps for MaterializeLayoutCopy {
 impl LayoutIrOp for MaterializeLayoutCopy {}
 
 /// Destination-passing form: `Copy(input: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MaterializeLayoutCopyDps;
 
 impl OpSlotNames for MaterializeLayoutCopyDps {
@@ -59,7 +59,7 @@ impl OpSlotNames for MaterializeLayoutCopyDps {
 
 impl BufferTensorIrOp for MaterializeLayoutCopyDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

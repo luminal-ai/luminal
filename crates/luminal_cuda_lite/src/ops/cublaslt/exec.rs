@@ -5,7 +5,7 @@
 use super::CublasLtForm;
 use anyhow::{Result, bail};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LtOrder {
     /// `CUBLASLT_ORDER_ROW`: element `(r, c)` at `r*ld + c`; `ld` is the
     /// ROW pitch and the descriptor reaches `ld*(rows-1) + cols`.
@@ -88,7 +88,7 @@ pub struct LtBiasInput {
     pub batch_stride_in_elements: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LtActivation {
     Identity,
     RectifiedLinear,
@@ -96,7 +96,7 @@ pub enum LtActivation {
 }
 
 /// The explicitly admitted input-rounding and computation contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LtComputation {
     Float16,
     Float32,
@@ -121,7 +121,7 @@ impl LtComputation {
 
 /// Allowed reduction schemes, elected by the complete whitelist configuration.
 /// Both masks permit NONE (zero), so this does not require split-K execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LtReductionSchemeMask {
     All,
     ComputeType,

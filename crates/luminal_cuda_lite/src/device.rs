@@ -383,6 +383,20 @@ impl CudaExecutable {
         self.execute_external_mode(arena, staging, dims, external_ptrs, false)
     }
 
+    /// Compile kernels, resolve library descriptors and capture host-operation
+    /// child graphs without launching the program. Collective search uses this
+    /// as a readiness barrier: no rank enters an authored collective until
+    /// every profiling worker has prepared the exact candidate successfully.
+    pub(crate) fn prepare_external(
+        &mut self,
+        arena: CudaArena<'_>,
+        staging: &mut CudaStaging,
+        dims: &DynMap,
+        external_ptrs: &FxHashMap<i64, ExternalPtr>,
+    ) -> Result<()> {
+        self.run_external_mode(arena, staging, dims, external_ptrs, false, false)
+    }
+
     pub(crate) fn execute_external_mode(
         &mut self,
         arena: CudaArena<'_>,
@@ -390,6 +404,18 @@ impl CudaExecutable {
         dims: &DynMap,
         external_ptrs: &FxHashMap<i64, ExternalPtr>,
         asynchronous: bool,
+    ) -> Result<()> {
+        self.run_external_mode(arena, staging, dims, external_ptrs, asynchronous, true)
+    }
+
+    fn run_external_mode(
+        &mut self,
+        arena: CudaArena<'_>,
+        staging: &mut CudaStaging,
+        dims: &DynMap,
+        external_ptrs: &FxHashMap<i64, ExternalPtr>,
+        asynchronous: bool,
+        launch: bool,
     ) -> Result<()> {
         self.ctx.bind_to_thread()?;
         let capturing = self.stream.capture_status()?
@@ -522,7 +548,9 @@ impl CudaExecutable {
                 &mut self.stats,
             )?;
         }
-        let result = if capturing {
+        let result = if !launch {
+            Ok(())
+        } else if capturing {
             let result = compiled.record_capture(
                 &installed.plan,
                 &installed.storage,
@@ -564,7 +592,7 @@ impl CudaExecutable {
             }
             self.pending_async = false;
         } else {
-            self.pending_async = asynchronous;
+            self.pending_async = launch && asynchronous;
         }
         result
     }

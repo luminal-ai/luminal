@@ -50,7 +50,7 @@ impl ToDps for SelectFunctional {
 impl LayoutIrOp for SelectFunctional {}
 
 /// Destination-passing form: `Select(condition: read, if_true: read, if_false: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SelectFunctionalDps;
 
 impl OpSlotNames for SelectFunctionalDps {
@@ -67,7 +67,7 @@ impl OpSlotNames for SelectFunctionalDps {
 
 impl BufferTensorIrOp for SelectFunctionalDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

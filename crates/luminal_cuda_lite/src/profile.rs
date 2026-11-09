@@ -106,29 +106,17 @@ pub(crate) fn profile_candidate_external_at(
 ) -> Result<Measurement, ProfileFailure> {
     // 1. PREPARE: compile + stage + one untimed run (warmup + validity).
     luminal::collective::ensure_local_profile(plan).map_err(ProfileFailure::Prepare)?;
-    let staged = prepare_candidate(device, plan, staged, external_ptrs, shapes, arena_budget)
-        .map_err(ProfileFailure::Prepare)?;
-    let mut arena = ProfilingMemory::new(device.stream().clone(), device.slab_bytes())
-        .map_err(ProfileFailure::Prepare)?;
-    let mut staging = device
-        .allocate_staging(device.stats().staging_bytes)
-        .map_err(ProfileFailure::Prepare)?;
-    initialize_inputs(device, plan, &mut arena, &staged, &shapes.values)
-        .map_err(ProfileFailure::Prepare)?;
-    device
-        .execute_external(arena.arena(), &mut staging, &shapes.values, external_ptrs)
-        .map_err(ProfileFailure::Prepare)?;
+    let mut candidate =
+        PreparedCandidate::new(device, plan, staged, external_ptrs, shapes, arena_budget)
+            .map_err(ProfileFailure::Prepare)?;
+    candidate.run().map_err(ProfileFailure::Prepare)?;
 
     let total = trials.max(1);
     let mut sum = 0u128;
     for trial in 0..total {
         // Mutable/donated inputs are restored by the profiling harness, not the executable.
-        initialize_inputs(device, plan, &mut arena, &staged, &shapes.values)
-            .map_err(ProfileFailure::Prepare)?;
         let start = Instant::now();
-        device
-            .execute_external(arena.arena(), &mut staging, &shapes.values, external_ptrs)
-            .map_err(ProfileFailure::Execute)?;
+        candidate.run().map_err(ProfileFailure::Execute)?;
         sum += start.elapsed().as_nanos();
         let completed = trial + 1;
         if completed == total {
@@ -164,6 +152,63 @@ pub(crate) fn profile_candidate_external_at(
     })
 }
 
+/// One fully compiled candidate with private profiling storage. Construction
+/// performs every fallible compilation/capture step but launches no model
+/// work. Coordinated collective search can therefore establish an all-rank
+/// readiness barrier before the first authored collective is entered.
+pub(crate) struct PreparedCandidate<'a> {
+    device: &'a mut CudaExecutable,
+    plan: &'a BufferIrGraph<DecodedLayout>,
+    external_ptrs: &'a FxHashMap<i64, crate::device::ExternalPtr>,
+    shapes: &'a crate::symbolic::ShapeEnv,
+    inputs: FxHashMap<i64, std::borrow::Cow<'a, HostBuffer>>,
+    arena: ProfilingMemory,
+    staging: crate::device::CudaStaging,
+}
+
+impl<'a> PreparedCandidate<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        device: &'a mut CudaExecutable,
+        plan: &'a BufferIrGraph<DecodedLayout>,
+        staged: &'a FxHashMap<i64, &'a HostBuffer>,
+        external_ptrs: &'a FxHashMap<i64, crate::device::ExternalPtr>,
+        shapes: &'a crate::symbolic::ShapeEnv,
+        arena_budget: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        let inputs = prepare_candidate(device, plan, staged, external_ptrs, shapes, arena_budget)?;
+        let mut arena = ProfilingMemory::new(device.stream().clone(), device.slab_bytes())?;
+        let mut staging = device.allocate_staging(device.stats().staging_bytes)?;
+        initialize_inputs(device, plan, &mut arena, &inputs, &shapes.values)?;
+        device.prepare_external(arena.arena(), &mut staging, &shapes.values, external_ptrs)?;
+        Ok(Self {
+            device,
+            plan,
+            external_ptrs,
+            shapes,
+            inputs,
+            arena,
+            staging,
+        })
+    }
+
+    pub(crate) fn run(&mut self) -> anyhow::Result<()> {
+        initialize_inputs(
+            self.device,
+            self.plan,
+            &mut self.arena,
+            &self.inputs,
+            &self.shapes.values,
+        )?;
+        self.device.execute_external(
+            self.arena.arena(),
+            &mut self.staging,
+            &self.shapes.values,
+            self.external_ptrs,
+        )
+    }
+}
+
 /// Static-plan entry point retained for lower-level callers.
 pub fn profile_candidate(
     device: &mut CudaExecutable,
@@ -197,7 +242,6 @@ fn prepare_candidate<'a>(
     shapes: &crate::symbolic::ShapeEnv,
     arena_budget: Option<usize>,
 ) -> anyhow::Result<FxHashMap<i64, std::borrow::Cow<'a, HostBuffer>>> {
-    luminal::collective::ensure_local_profile(plan)?;
     let mut owned = FxHashMap::default();
     for buffer in plan.buffers.values() {
         if let Some(lit) = buffer.lit
@@ -261,6 +305,7 @@ pub(crate) fn warmup_candidate(
     shapes: &crate::symbolic::ShapeEnv,
     arena_budget: Option<usize>,
 ) -> anyhow::Result<()> {
+    luminal::collective::ensure_local_profile(plan)?;
     let inputs = prepare_candidate(device, plan, inputs, external_ptrs, shapes, arena_budget)?;
     let mut arena = ProfilingMemory::new(device.stream().clone(), device.slab_bytes())?;
     initialize_inputs(device, plan, &mut arena, &inputs, &shapes.values)?;

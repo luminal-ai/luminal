@@ -42,7 +42,7 @@ impl ToDps for RoundingCast {
 impl LayoutIrOp for RoundingCast {}
 
 /// Destination-passing form: `RoundingCast(input: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RoundingCastDps;
 
 impl OpSlotNames for RoundingCastDps {
@@ -57,7 +57,7 @@ impl OpSlotNames for RoundingCastDps {
 
 impl BufferTensorIrOp for RoundingCastDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

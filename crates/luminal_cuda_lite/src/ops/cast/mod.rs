@@ -44,7 +44,7 @@ impl ToDps for Cast {
 impl LayoutIrOp for Cast {}
 
 /// Destination-passing form: `Cast(input: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CastDps;
 
 impl OpSlotNames for CastDps {
@@ -59,7 +59,7 @@ impl OpSlotNames for CastDps {
 
 impl BufferTensorIrOp for CastDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

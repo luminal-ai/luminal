@@ -10,7 +10,7 @@ pub struct AllGather {
     pub spec: AllGatherSpec,
     pub dtype: luminal::dtype::PlanDtype,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AllGatherDps {
     pub spec: AllGatherSpec,
     pub dtype: luminal::dtype::PlanDtype,
@@ -30,7 +30,7 @@ impl BufferTensorIrOp for AllGatherDps {
         operand == 0
     }
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::host::<Self>())
+        Some(crate::CudaOpInterface::host_wire::<Self>())
     }
 }
 impl Bufferizable for AllGather {}
@@ -84,6 +84,9 @@ impl OpMatcher for AllGatherMatcher {
                 text: include_str!("match.egg"),
             },
         ]
+    }
+    fn requires_coordinated_profiling(&self) -> bool {
+        true
     }
     fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
         let input = site.child_class(0);

@@ -36,6 +36,12 @@ the self-contained repo-side summary.
   reservations; `device_budget_bytes` can lower it. Complete candidate
   arenas are checked against the same limit before allocation.
 - Both search and execution refuse without the `device` feature.
+- Collective graphs call `CudaRuntime::search_collective` concurrently on all
+  ranks. Rank zero owns the whole compiler/search through bufferization;
+  nonzero ranks receive already-bufferized physical plans and participate only
+  in local CUDA instantiation plus fixed candidate profiling. They never
+  assemble, saturate, prune, extract, DPS-rewrite, decode layouts, or bufferize.
+  The former deterministic `compile_first` CUDA escape hatch no longer exists.
 - The predecessor crate targeting the deleted HLIR pipeline is parked
   at `../luminal_cuda_lite_hlir` — a PARTS LIBRARY (NVRTC plumbing in
   its `lib.rs`, kernel codegen patterns, cuBLASLt/FlashInfer/MoE

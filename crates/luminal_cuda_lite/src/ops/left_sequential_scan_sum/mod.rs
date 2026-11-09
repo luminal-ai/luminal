@@ -44,7 +44,7 @@ impl ToDps for LeftSequentialScanSum {
 impl LayoutIrOp for LeftSequentialScanSum {}
 
 /// Destination-passing form: `LeftSequentialScanSum(input: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeftSequentialScanSumDps {
     /// Scan axis, zero-based FROM THE END (the term's i64 metadata).
     pub axis: i64,
@@ -62,7 +62,7 @@ impl OpSlotNames for LeftSequentialScanSumDps {
 
 impl BufferTensorIrOp for LeftSequentialScanSumDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

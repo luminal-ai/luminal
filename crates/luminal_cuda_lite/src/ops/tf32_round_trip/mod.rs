@@ -27,7 +27,7 @@ impl ToDps for Tf32RoundTrip {
 }
 impl LayoutIrOp for Tf32RoundTrip {}
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Tf32RoundTripDps;
 
 impl OpSlotNames for Tf32RoundTripDps {}
@@ -36,7 +36,7 @@ impl BufferTensorIrOp for Tf32RoundTripDps {
         "Tf32RoundTrip"
     }
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
     fn operand_reads_memory(&self, operand: usize) -> bool {
         operand != 1

@@ -60,7 +60,7 @@ impl LayoutIrOp for IndexMapApplyMaterialize {}
 
 /// Destination-passing form:
 /// `IndexMapApplyMaterialize(input: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IndexMapApplyMaterializeDps {
     /// See [`IndexMapApplyMaterialize::entries`].
     pub entries: Option<Vec<IotaExpr>>,
@@ -78,7 +78,7 @@ impl OpSlotNames for IndexMapApplyMaterializeDps {
 
 impl BufferTensorIrOp for IndexMapApplyMaterializeDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

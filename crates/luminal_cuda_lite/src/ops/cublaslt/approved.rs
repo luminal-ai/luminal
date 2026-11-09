@@ -141,7 +141,7 @@ pub(super) fn dtype(site: &ExtractionSite<'_>, class: &ClassId) -> PlanDtype {
     panic!("cuBLASLt approved contract: unsupported dtype constructor in {class}");
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Bias {
     pub tensor: ClassId,
     pub dtype: PlanDtype,
@@ -149,7 +149,7 @@ pub struct Bias {
 }
 
 /// Scalar arguments are decoded independently of the matrix element types.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Scalars {
     HostF16 { alpha_bits: u16, beta_bits: u16 },
     Host { alpha_bits: u32, beta_bits: u32 },
@@ -340,7 +340,7 @@ pub(super) fn activation(site: &ExtractionSite<'_>, class: &ClassId) -> LtActiva
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Matrix {
     pub tensor: ClassId,
     pub dtype: PlanDtype,
@@ -397,7 +397,7 @@ impl Matrix {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApprovedCublasLt {
     pub configuration: ClassId,
     pub computation: LtComputation,
@@ -513,7 +513,7 @@ impl BufferTensorIrOp for ApprovedCublasLt {
         "CublasLtCall"
     }
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::host::<Self>())
+        Some(crate::CudaOpInterface::host_wire::<Self>())
     }
     fn operand_reads_memory(&self, operand: usize) -> bool {
         !self.dps || operand < self.input_count()

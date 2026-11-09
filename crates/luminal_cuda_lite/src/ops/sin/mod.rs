@@ -43,7 +43,7 @@ impl ToDps for SinFunctional {
 impl LayoutIrOp for SinFunctional {}
 
 /// Destination-passing form: `Sin(input: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SinFunctionalDps;
 
 impl OpSlotNames for SinFunctionalDps {
@@ -58,7 +58,7 @@ impl OpSlotNames for SinFunctionalDps {
 
 impl BufferTensorIrOp for SinFunctionalDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {
