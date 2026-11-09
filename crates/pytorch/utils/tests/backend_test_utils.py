@@ -80,7 +80,29 @@ def stage_one_only(monkeypatch):
 @pytest.fixture(autouse=True)
 def reset_dynamo():
     torch.set_float32_matmul_precision("highest")
+    cudnn_flags = None
+    if selected_backend() == "cuda_lite":
+        # Shared parity cases compare against eager CUDA. Keep that reference
+        # at the authored FP32 precision instead of allowing TF32 input
+        # conversion in either the matmul or convolution backend.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+            torch.backends.cuda.matmul.fp32_precision = "ieee"
+        cudnn_flags = {
+            "enabled": True,
+            "allow_tf32": False,
+            "deterministic": True,
+            "benchmark": False,
+        }
+        if hasattr(torch.backends.cudnn, "fp32_precision"):
+            cudnn_flags["fp32_precision"] = "ieee"
     torch._dynamo.config.cache_size_limit = 1
     torch._dynamo.config.suppress_errors = False
-    yield
+    if cudnn_flags is None:
+        yield
+    else:
+        # Some slow tests freeze global backend flags. The scoped API is the
+        # supported way to override cuDNN policy after that point.
+        with torch.backends.cudnn.flags(**cudnn_flags):
+            yield
     torch._dynamo.reset()
