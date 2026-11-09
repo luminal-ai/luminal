@@ -42,6 +42,7 @@ fn ctx(inputs: usize, in_dims: &[i64], out_dims: &[i64], dtype: PlanDtype) -> Co
         dest_dims: vec![extents(out_dims)],
         dest_dtypes: vec![dtype],
         operand_layouts,
+        dest_layouts: vec![layout(out_dims, dtype)],
     }
 }
 

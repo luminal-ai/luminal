@@ -155,6 +155,7 @@ mod tests {
             dest_dims: vec![vec![4usize.into()]],
             dest_dtypes: vec![PlanDtype::F32],
             operand_layouts: vec![],
+            dest_layouts: vec![],
         }
     }
 

@@ -34,6 +34,7 @@ fn pack_codes(target: PlanDtype, codes: &[u64]) -> Result<Vec<u8>, DriverError> 
             layout(input.len() as i64, PlanDtype::Bool, 1),
             layout(codes.len() as i64, target, width as i64),
         ],
+        dest_layouts: vec![layout(codes.len() as i64, target, width as i64)],
     };
     let source = BoolsToBitsDps {
         width: width as i64,

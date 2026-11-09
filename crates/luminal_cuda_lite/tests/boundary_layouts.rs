@@ -450,16 +450,15 @@ fn a_zero_stride_sink_binds_and_the_search_names_it() {
     );
 }
 
-/// A COLUMN-MAJOR WRITEBACK TARGET binds — the sink takes the layout its
-/// target has — and the search answers: today no kernel writes a
-/// left-major destination, so the refusal names the output and the
-/// layout instead of a bind-time prior about writability.
+/// A COLUMN-MAJOR WRITEBACK TARGET is writable through the generic copy's
+/// destination index. The plan must deliver the result on the input's own
+/// buffer rather than silently substituting a row-major allocation.
 #[test]
 #[cfg_attr(
     not(feature = "device"),
     ignore = "candidate search requires a CUDA device"
 )]
-fn a_column_major_sink_binds_and_the_search_names_it() {
+fn a_column_major_sink_plans_on_its_input_buffer() {
     let mut cx = Graph::new();
     let x = cx.tensor(vec![2usize, 3usize], DType::F32);
     let delta = cx.tensor(vec![2usize, 3usize], DType::F32);
@@ -472,33 +471,25 @@ fn a_column_major_sink_binds_and_the_search_names_it() {
     bindings.output_on_with(out.id, home, BoundaryLayout::ColumnMajor);
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a column-major sink binds");
-    let refusal = match rt.search(
+    rt.search(
         &Default::default(),
         &Default::default(),
         &Default::default(),
         &harness_search_options(),
-    ) {
-        Ok(_) => panic!("no kernel writes a left-major destination today"),
-        Err(refusal) => format!("{refusal:#}"),
-    };
-    assert!(
-        refusal.contains(&format!("v{}", out.id.index())) && refusal.contains("ColumnMajor"),
-        "the refusal must name the output and its bound layout: {refusal}"
-    );
+    )
+    .expect("generic copy writes the left-major destination");
+    assert_eq!(rt.input_buffer(x.id).expect("input binding"), home);
+    assert!(rt.output_slot_index(out.id).is_ok());
 }
 
-/// A USER-VISIBLE OUTPUT IS BOUND AT THE CALLER'S OWN STRIDES, and
-/// whether a kernel writes them is the search's question: today no
-/// elected op writes a left-major destination, so the search plans
-/// nothing and names the output and the layout it is bound at. LUM-830
-/// — a layout-changing copy into the bound output layout — is the flip
-/// that makes this one plan.
+/// A USER-VISIBLE OUTPUT IS BOUND AT THE CALLER'S OWN STRIDES. Generic
+/// copy writes its injective left-major destination from logical coordinates.
 #[test]
 #[cfg_attr(
     not(feature = "device"),
     ignore = "candidate search requires a CUDA device"
 )]
-fn a_column_major_output_binds_and_the_search_names_it() {
+fn a_column_major_output_plans_at_the_bound_layout() {
     let mut cx = Graph::new();
     let a = cx.tensor(vec![2usize, 3usize], DType::F32);
     let b = cx.tensor(vec![2usize, 3usize], DType::F32);
@@ -507,23 +498,20 @@ fn a_column_major_output_binds_and_the_search_names_it() {
     let mut bindings = CudaBindings::new();
     bindings.input_external(a.id);
     bindings.input_external(b.id);
-    bindings.output_external_with(out.id, BoundaryLayout::ColumnMajor);
+    let buffer = bindings.output_external_with(out.id, BoundaryLayout::ColumnMajor);
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a column-major output binds");
 
-    let refusal = match rt.search(
+    rt.search(
         &Default::default(),
         &Default::default(),
         &Default::default(),
         &harness_search_options(),
-    ) {
-        Ok(_) => panic!("no kernel writes a left-major destination today"),
-        Err(refusal) => format!("{refusal:#}"),
-    };
-    assert!(
-        refusal.contains(&format!("v{}", out.id.index())) && refusal.contains("ColumnMajor"),
-        "the refusal must name the output and its bound layout: {refusal}"
-    );
+    )
+    .expect("generic copy writes the left-major destination");
+    assert_eq!(rt.output_buffer(out.id).expect("output binding"), buffer);
+    rt.check_external_outputs()
+        .expect("the elected slot sits on the bound buffer");
 }
 
 /// THE SAME PROGRAM AT THE OTHER BOUND LAYOUT PLANS: a row-major output
@@ -560,22 +548,15 @@ fn a_row_major_output_bound_external_plans() {
         .expect("the elected slot sits on the bound buffer");
 }
 
-/// A ZERO EXTENT AT TORCH'S OWN CONTIGUOUS CHAIN: torch's running
-/// product multiplies by `max(size, 1)`, so a contiguous (4, 0) arrives
-/// at [1, 1]; the preamble's right-major fold multiplies by the raw
-/// extent and renders [0, 1]. They differ on the axis OUTSIDE the empty
-/// one, whose coordinate is not zero, so the bound chain is no
-/// contiguous spelling — and only a contiguous spelling certifies a
-/// destination injective. The search answers by naming the output and
-/// the layout it is bound at, exactly as it does for a left-major
-/// destination; at the chain the preamble itself renders, the same
-/// empty output plans.
+/// EMPTY OUTPUTS are vacuously injective: no pair of logical coordinates can
+/// alias because there are no coordinates. Both Torch's contiguous chain and
+/// the preamble's canonical empty chain therefore plan.
 #[test]
 #[cfg_attr(
     not(feature = "device"),
     ignore = "candidate search requires a CUDA device"
 )]
-fn a_zero_extent_output_at_torchs_contiguous_chain_is_named_by_the_search() {
+fn zero_extent_outputs_plan_at_both_contiguous_stride_spellings() {
     let plan_at = |strides: [i64; 2]| {
         let mut cx = Graph::new();
         let a = cx.tensor(vec![4usize, 0usize], DType::F32);
@@ -599,15 +580,8 @@ fn a_zero_extent_output_at_torchs_contiguous_chain_is_named_by_the_search() {
         (out.id, result)
     };
 
-    let (out, refused) = plan_at([1, 1]);
-    let refusal = match refused {
-        Ok(()) => panic!("torch's zero-extent chain is no contiguous spelling here"),
-        Err(refusal) => format!("{refusal:#}"),
-    };
-    assert!(
-        refusal.contains(&format!("v{}", out.index())) && refusal.contains("[1, 1]"),
-        "the refusal must name the output and its bound chain: {refusal}"
-    );
+    let (_, torch) = plan_at([1, 1]);
+    torch.expect("Torch's empty contiguous chain is vacuously injective");
 
     let (_, rendered) = plan_at([0, 1]);
     rendered.expect("the preamble's own right-major rendering of (4, 0) plans");

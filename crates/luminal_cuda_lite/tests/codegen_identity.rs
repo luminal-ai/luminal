@@ -113,6 +113,10 @@ fn sources_via_buffer_table(
                 .iter()
                 .map(|id| plan.buffers[id].layout.clone())
                 .collect(),
+            dest_layouts: writes
+                .iter()
+                .map(|id| plan.buffers[id].layout.clone())
+                .collect(),
         };
         out.push((
             label,
@@ -648,32 +652,9 @@ mod strided {
         }
     }
 
-    // ===================================================================
-    // THREE WRITE-FENCE TESTS WERE DELETED HERE (ruling 2026-09-01).
-    //
-    //   * result_that_does_not_write_at_the_identity_index_refuses
-    //   * dest_operand_that_does_not_write_at_the_identity_index_refuses
-    //   * expression_kernel_write_sides_stay_fail_closed
-    //
-    // Each asserted that a destination whose layout is not the flat
-    // index over its dims REFUSES ("strided writes are not lowered";
-    // iota's variant, "does not lower"). Austin ruled that fence out of
-    // the backend entirely — "we should not have it in the codebase
-    // here. delete it" — so their subject no longer exists.
-    //
-    // They are deleted rather than reworded because the honest
-    // restatement of today's behavior would be "a strided destination
-    // silently emits a kernel that writes the wrong addresses", and
-    // pinning that would pin a BUG as a contract.
-    //
-    // WHERE THE PROPERTY LIVES NOW: `tests/view_admission.rs` asserts of
-    // every compute RESULT in every searched plan that its elected
-    // layout IS the flat index. That is the same property, checked where
-    // it can actually hold — over real elections — and it is the
-    // standing evidence that the unguarded gap is not being hit. When
-    // the egglog output-layout constraint lands, that assertion becomes
-    // its regression test.
-    // ===================================================================
+    // Writes use the same decoded-layout indexing path as reads. Egglog
+    // matchers still decide which operations may target which layouts; the
+    // generic copy deliberately admits every proven-injective destination.
 
     /// THE BYTE-IDENTITY PIN — unchanged text, changed meaning.
     ///
@@ -858,6 +839,26 @@ mod strided {
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i];
 }"#
+        );
+    }
+
+    #[test]
+    fn a_transposed_destination_is_written_at_its_layout_index() {
+        let column_major = strided_layout(&[2, 3], vec![mul(coord(0), lit(2)), coord(1)]);
+        let op = ops::materialize_layout_copy::MaterializeLayoutCopyDps;
+        let source = generate(
+            &op,
+            &[slot(vec![2, 3]), slot_l(column_major.clone())],
+            &[slot_l(column_major)],
+        );
+        assert_contains(
+            &source,
+            &[
+                "long long c1 = (long long)(rem % 3LL); rem /= 3LL;",
+                "long long c0 = (long long)(rem % 2LL); rem /= 2LL;",
+                "long long out_idx = (c1 * 2LL) + c0;",
+                "out[out_idx] = a[i];",
+            ],
         );
     }
 
