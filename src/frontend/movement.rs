@@ -83,6 +83,43 @@ impl ViewChain {
         self.step(Movement::RemoveDim { axis })
     }
 
+    /// Fix one current axis at `index` and remove it from the view domain.
+    /// This composes directly into the chain's single eventual index map, so
+    /// selecting a field from structured/interleaved storage never creates an
+    /// intermediate materialization candidate.
+    pub fn select_axis(mut self, axis: usize, index: impl Into<IntExpr>) -> Self {
+        assert!(axis < self.rank(), "select axis {axis} out of bounds");
+        let index = index.into();
+        if let (Some(index), Some(extent)) = (index.to_usize(), self.dims[axis].to_usize()) {
+            assert!(
+                index < extent,
+                "select index {index} out of bounds for axis {axis} of extent {extent}"
+            );
+        }
+        let old_rank = self.rank();
+        let mut new_dims = self.dims.clone();
+        new_dims.remove(axis);
+        let new_rank = new_dims.len();
+        let replacements: Vec<MapEntry> = (0..old_rank)
+            .map(|position| {
+                if position == axis {
+                    MapEntry::Lit(index)
+                } else {
+                    let out_position = position - usize::from(position > axis);
+                    MapEntry::Coord {
+                        from_end: new_rank - 1 - out_position,
+                        extent: new_dims[out_position],
+                    }
+                }
+            })
+            .collect();
+        for entry in &mut self.entries {
+            *entry = entry.substitute(&replacements, old_rank);
+        }
+        self.dims = new_dims;
+        self
+    }
+
     /// Same divisibility contract as `GraphTensor::split_dims`
     /// (decision-only simplify — never a recorded spelling).
     pub fn split_dims(self, axis: usize, new_dim_size: impl Into<IntExpr>) -> Self {

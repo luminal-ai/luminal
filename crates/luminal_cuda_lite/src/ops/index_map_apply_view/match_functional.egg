@@ -39,3 +39,17 @@
   :ruleset backend
   :name "cuda_lite/index_map_apply_view/match_functional: IndexMapApply as a view on the composed layout"
 )
+
+; A bound alias output must rejoin the exact layout authored at the boundary.
+; Demand the separately scheduled whole-expression affine certificate only for
+; those layouts.  It publishes one canonical ElementStridedLayoutLit without
+; adding unrestricted scalar reassociation to the global e-graph.
+(rule
+  (
+    (index-map-bound-output ?out-logical)
+    (= ?out-layout-tensor (LayoutTensorLit ?out-logical ?out-layout))
+  )
+  ((element-stride-discovery-demand ?out-layout))
+  :ruleset main_ruleset
+  :name "cuda_lite/index_map_apply_view/match_functional: demand affine proof for a bound output layout"
+)
