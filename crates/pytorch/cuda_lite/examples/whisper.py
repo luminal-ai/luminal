@@ -372,6 +372,12 @@ def greedy_decode(logits_row: torch.Tensor, suppress_first_eot: bool) -> int:
     return int(torch.argmax(masked).item())
 
 
+def find_default_audio() -> Path | None:
+    """Return the bundled JFK sample without downloading or mutating state."""
+    candidate = Path(__file__).resolve().parent / "assets" / "jfk.wav"
+    return candidate if candidate.is_file() else None
+
+
 def download_default_audio() -> Path:
     """Download the JFK sample once, then reuse the ignored local WAV."""
     destination = Path(__file__).resolve().parent / "assets" / "jfk.wav"
