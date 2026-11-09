@@ -607,7 +607,7 @@ impl Translator<'_> {
 
     pub(super) fn translate_scalar_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
         let dtype = self.output_meta_dtype(node)?;
-        self.scalar(&node.inputs[0], dtype)
+        self.scalar_operand(&node.inputs[0], dtype)
     }
 
     pub(super) fn translate_where(
