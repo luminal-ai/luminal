@@ -155,6 +155,7 @@ pub enum Evaluator<'a> {
     Device {
         device: &'a mut crate::device::CudaExecutable,
         staged: &'a FxHashMap<i64, &'a crate::host_buffer::HostBuffer>,
+        external_ptrs: &'a FxHashMap<i64, crate::device::ExternalPtr>,
     },
     /// The lifetime placeholder for builds WITHOUT the `device` feature,
     /// so [`search_implementations`]'s signature is the same in both.
@@ -188,11 +189,16 @@ impl Evaluator<'_> {
     ) -> Priced {
         #[cfg(feature = "device")]
         {
-            let Self::Device { device, staged, .. } = self;
-            let measured = crate::profile::profile_candidate_at(
+            let Self::Device {
+                device,
+                staged,
+                external_ptrs,
+            } = self;
+            let measured = crate::profile::profile_candidate_external_at(
                 device,
                 plan,
                 staged,
+                external_ptrs,
                 options.trials,
                 best_nanos,
                 options.candidate_timeout,
@@ -235,9 +241,29 @@ impl Evaluator<'_> {
     pub fn reborrow(&mut self) -> Evaluator<'_> {
         match self {
             #[cfg(feature = "device")]
-            Evaluator::Device { device, staged } => Evaluator::Device { device, staged },
+            Evaluator::Device {
+                device,
+                staged,
+                external_ptrs,
+            } => Evaluator::Device {
+                device,
+                staged,
+                external_ptrs,
+            },
             #[cfg(not(feature = "device"))]
             Evaluator::NoDevice(marker) => Evaluator::NoDevice(*marker),
+        }
+    }
+
+    fn external_bindings(&self) -> std::collections::BTreeSet<i64> {
+        #[cfg(feature = "device")]
+        {
+            let Self::Device { external_ptrs, .. } = self;
+            external_ptrs.keys().copied().collect()
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            Default::default()
         }
     }
 
@@ -425,6 +451,7 @@ pub fn search_implementations(
     let analysis_start = Instant::now();
     let decoders = luminal::egglog_snippet::decoder_registry_for(matchers)?;
     let arena_budget_bytes = evaluator.arena_budget(options.device_budget_bytes)?;
+    let external_bindings = evaluator.external_bindings();
     let intermediate_budget_override = options
         .intermediate_budget_bytes
         .map(|requested| requested.min(arena_budget_bytes));
@@ -445,6 +472,7 @@ pub fn search_implementations(
             decoders: &decoders,
             bounds: &shapes.bounds,
             arena_budget_bytes,
+            external_buffers: &external_bindings,
             max_intermediate_bytes: options.max_intermediate_bytes,
             matchers,
         },
@@ -661,7 +689,7 @@ pub fn search_implementations(
                 continue;
             }
             let arena =
-                match crate::storage::plan_storage(&plan, &shapes.bounds, &Default::default()) {
+                match crate::storage::plan_storage(&plan, &shapes.bounds, &external_bindings) {
                     Ok(arena) => arena,
                     Err(err) => {
                         breakdown.plan_build_refusals += 1;
@@ -810,11 +838,16 @@ pub fn finalist_validate(
 ) -> Result<(), String> {
     #[cfg(feature = "device")]
     {
-        let Evaluator::Device { device, staged, .. } = evaluator;
+        let Evaluator::Device {
+            device,
+            staged,
+            external_ptrs,
+        } = evaluator;
         let ran = crate::profile::warmup_candidate(
             device,
             &pending.plan,
             staged,
+            external_ptrs,
             &pending.shapes,
             _options.device_budget_bytes,
         );

@@ -489,8 +489,8 @@ impl CudaBindings {
         let roots: Vec<ValueId> = self
             .outputs
             .iter()
-            .chain(&self.inputs)
             .map(|b| b.value)
+            .chain(self.inputs.iter().map(|b| b.value))
             .collect();
         let cone = graph.cone(&roots);
         for input in graph.inputs() {

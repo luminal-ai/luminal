@@ -17,6 +17,9 @@ pub struct PostPassContext<'a> {
     pub decoders: &'a ConstructorRegistry,
     pub bounds: &'a crate::symbolic::Bounds,
     pub arena_budget_bytes: usize,
+    /// Boundary buffers backed by caller-owned allocations during profiling.
+    /// They consume no arena range and must survive arena-size pruning.
+    pub external_buffers: &'a BTreeSet<i64>,
     /// Optional cap on a single non-boundary materialization. Boundary inputs
     /// and outputs still obey the total arena budget.
     pub max_intermediate_bytes: Option<usize>,
@@ -54,11 +57,15 @@ pub fn run(
             })
             .transpose()
     };
-    let mut report = prune_oversized_materializations(
+    let external_boundaries = external_boundary_classes(graph, context.external_buffers);
+    let mut report = prune_materializations(
         graph,
         context.decoders,
         context.arena_budget_bytes,
         capacity,
+        false,
+        &external_boundaries,
+        &BTreeSet::new(),
     )
     .map_err(|error| {
         anyhow!(
@@ -68,9 +75,16 @@ pub fn run(
     })?;
     if let Some(limit) = context.max_intermediate_bytes {
         let transparent = transparent_producers(graph, context.matchers);
-        let intermediate =
-            prune_materializations(graph, context.decoders, limit, capacity, true, &transparent)
-                .map_err(|error| anyhow!("{limit}-byte intermediate budget: {error:#}"))?;
+        let intermediate = prune_materializations(
+            graph,
+            context.decoders,
+            limit,
+            capacity,
+            true,
+            &BTreeSet::new(),
+            &transparent,
+        )
+        .map_err(|error| anyhow!("{limit}-byte intermediate budget: {error:#}"))?;
         report.oversized_tensors += intermediate.oversized_tensors;
         report.producer_classes += intermediate.producer_classes;
         report.removed_nodes += intermediate.removed_nodes;
@@ -99,7 +113,59 @@ pub fn prune_oversized_materializations(
     budget: usize,
     capacity: impl Fn(&DecodedLayout) -> Result<Option<usize>>,
 ) -> Result<MemoryPruning> {
-    prune_materializations(graph, decoders, budget, capacity, false, &BTreeSet::new())
+    prune_materializations(
+        graph,
+        decoders,
+        budget,
+        capacity,
+        false,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+}
+
+/// Resolve the logical tensor classes whose storage is already supplied by
+/// the caller. `BufferLit` carries the stable boundary id used by
+/// `set_device_ptr`; preserving exactly these classes prevents an external
+/// allocation from being mistaken for scratch memory before extraction.
+fn external_boundary_classes(
+    graph: &EGraph,
+    external_buffers: &BTreeSet<i64>,
+) -> BTreeSet<ClassId> {
+    let numeric: BTreeMap<_, _> = graph
+        .nodes
+        .values()
+        .filter_map(|node| {
+            node.op
+                .parse::<i64>()
+                .ok()
+                .map(|n| (node.eclass.clone(), n))
+        })
+        .collect();
+    let buffers: BTreeMap<_, _> = graph
+        .nodes
+        .values()
+        .filter(|node| node.op == "BufferLit")
+        .filter_map(|node| {
+            let child = node.children.first()?;
+            Some((
+                node.eclass.clone(),
+                *numeric.get(&graph.nodes[child].eclass)?,
+            ))
+        })
+        .collect();
+    graph
+        .nodes
+        .values()
+        .filter(|node| node.op == "BufferTensorLit")
+        .filter_map(|node| {
+            let tensor = node.children.first()?;
+            let buffer = node.children.get(1)?;
+            external_buffers
+                .contains(buffers.get(&graph.nodes[buffer].eclass)?)
+                .then(|| graph.nodes[tensor].eclass.clone())
+        })
+        .collect()
 }
 
 fn transparent_producers(
@@ -137,6 +203,7 @@ fn prune_materializations(
     budget: usize,
     capacity: impl Fn(&DecodedLayout) -> Result<Option<usize>>,
     preserve_boundaries: bool,
+    preserved_boundaries: &BTreeSet<ClassId>,
     transparent: &BTreeSet<ClassId>,
 ) -> Result<MemoryPruning> {
     // Before bufferization, BufferTensorLit declarations describe boundary
@@ -154,7 +221,9 @@ fn prune_materializations(
     let mut oversized = BTreeSet::new();
     let mut largest = 0;
     for node in graph.nodes.values().filter(|n| n.op == "LayoutTensorLit") {
-        if preserve_boundaries && boundaries.contains(&node.eclass) {
+        if (preserve_boundaries && boundaries.contains(&node.eclass))
+            || preserved_boundaries.contains(&node.eclass)
+        {
             continue;
         }
         let layout_id = node
@@ -461,6 +530,7 @@ mod tests {
             decoders: &decoders,
             bounds: &bounds,
             arena_budget_bytes: 1024 * 1024,
+            external_buffers: &BTreeSet::new(),
             max_intermediate_bytes: None,
             matchers: &[],
         };
@@ -489,6 +559,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.removed_nodes, 0);
+    }
+
+    #[test]
+    fn total_arena_cap_preserves_only_live_external_boundaries() {
+        let decoders = ConstructorRegistry::new(luminal::egglog_snippet::core_decoders()).unwrap();
+        let bounds = [('q'.into(), (2, 128))].into();
+        let mut graph = materializations();
+        add(
+            &mut graph,
+            "input_logical",
+            "input_logical",
+            "LogicalInput",
+            &[],
+        );
+        add(
+            &mut graph,
+            "input_tensor",
+            "input_tensor",
+            "LayoutTensorLit",
+            &["input_logical", "dense"],
+        );
+        add(&mut graph, "seven", "seven", "7", &[]);
+        add(&mut graph, "buffer", "buffer", "BufferLit", &["seven"]);
+        add(
+            &mut graph,
+            "input_storage",
+            "input_storage",
+            "BufferTensorLit",
+            &["input_tensor", "buffer"],
+        );
+        add(
+            &mut graph,
+            "input",
+            "input",
+            "BufferInputLit",
+            &["input_storage"],
+        );
+        let external_buffers = [7].into_iter().collect();
+        let report = run(
+            &mut graph,
+            &PostPassContext {
+                decoders: &decoders,
+                bounds: &bounds,
+                arena_budget_bytes: 1024 * 1024,
+                external_buffers: &external_buffers,
+                max_intermediate_bytes: None,
+                matchers: &[],
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(report.oversized_tensors, 1);
+        assert!(graph.nodes.contains_key(&NodeId::from("input_tensor")));
+        assert!(graph.nodes.contains_key(&NodeId::from("input")));
+        assert!(!graph.nodes.contains_key(&NodeId::from("large")));
+        assert!(!graph.nodes.contains_key(&NodeId::from("implementation")));
     }
 
     #[test]
@@ -529,6 +655,7 @@ mod tests {
             decoders: &decoders,
             bounds: &bounds,
             arena_budget_bytes: 4 * 1024 * 1024,
+            external_buffers: &BTreeSet::new(),
             max_intermediate_bytes: Some(1024 * 1024),
             matchers: &[],
         };
@@ -583,6 +710,7 @@ mod tests {
                 decoders: &decoders,
                 bounds: &BTreeMap::new(),
                 arena_budget_bytes: 1024,
+                external_buffers: &BTreeSet::new(),
                 max_intermediate_bytes: None,
                 matchers: &[],
             },

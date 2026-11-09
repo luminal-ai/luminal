@@ -95,6 +95,9 @@ pub struct CudaRuntime {
     storage: Option<crate::arena::ArenaPlan>,
     /// Boundaries supplied as caller-owned device pointers.
     externals: std::collections::BTreeSet<i64>,
+    /// External buffers that candidate profiling may safely read in place.
+    /// Read/write buffers stay private while alternative plans are tried.
+    profiling_externals: std::collections::BTreeSet<i64>,
     device_budget_bytes: Option<usize>,
     intermediate_budget_bytes: Option<usize>,
     /// The caller's device address for each External buffer, supplied before
@@ -150,6 +153,7 @@ impl CudaRuntime {
             output_buffers: self.output_buffers.clone(),
             output_slots: self.output_slots.clone(),
             externals: self.externals.clone(),
+            profiling_externals: self.profiling_externals.clone(),
             device_budget_bytes: self.device_budget_bytes,
             intermediate_budget_bytes: self.intermediate_budget_bytes,
             capacity_bounds: self.capacity_bounds.clone(),
@@ -220,6 +224,16 @@ impl CudaRuntime {
         bindings: crate::bindings::CudaBindings,
         registry: Vec<crate::ops::RegisteredOp>,
     ) -> Result<Self> {
+        let profiling_externals = bindings
+            .inputs()
+            .iter()
+            .filter(|bound| {
+                bound.placement == crate::bindings::Placement::External
+                    && bindings.buffers()[&bound.buffer].access
+                        == luminal::layout_ir::Access::ReadOnly
+            })
+            .map(|bound| bound.buffer)
+            .collect();
         let bound = bindings
             .bind(&graph.logical)
             .map_err(|reason| anyhow!("load refused: {reason}"))?;
@@ -273,6 +287,7 @@ impl CudaRuntime {
             output_slots,
             output_buffers,
             externals,
+            profiling_externals,
             ..Self::default()
         })
     }
@@ -498,16 +513,43 @@ impl CudaRuntime {
                     .map(|data| (bound.buffer, data))
             })
             .collect();
+        let profile_externals: std::collections::BTreeSet<i64> = self
+            .device_ptrs
+            .keys()
+            .filter(|buffer| self.profiling_externals.contains(buffer))
+            .copied()
+            .collect();
         #[cfg(feature = "device")]
         if self.device.is_none() {
             self.device = Some(crate::device::CudaDevice::new(0)?.executable());
         }
+        #[cfg(feature = "device")]
+        let external_ptrs: FxHashMap<i64, crate::device::ExternalPtr> = self
+            .device_ptrs
+            .iter()
+            // Candidate profiling may read caller-owned parameters directly,
+            // but must never apply a functionalized buffer writeback to the
+            // caller while trying alternative plans. Read/write is the
+            // binding declaration's contract; a returned input view remains
+            // safe to read in place.
+            .filter(|(buffer, _)| self.profiling_externals.contains(buffer))
+            .map(|(buffer, (ptr, bytes))| {
+                (
+                    *buffer,
+                    crate::device::ExternalPtr {
+                        ptr: *ptr,
+                        bytes: *bytes,
+                    },
+                )
+            })
+            .collect();
         let mut evaluator = {
             #[cfg(feature = "device")]
             {
                 crate::search::Evaluator::Device {
                     device: self.device.as_mut().expect("device initialized"),
                     staged: &staged,
+                    external_ptrs: &external_ptrs,
                 }
             }
             #[cfg(not(feature = "device"))]
@@ -549,7 +591,7 @@ impl CudaRuntime {
             Some(outcome.best_plan.clone()),
         )
         .with_shapes(shapes)
-        .with_external_bindings(self.externals.clone());
+        .with_external_bindings(profile_externals);
         let (finalist, rejections) =
             crate::search::select_finalist(finalists, options, &mut evaluator)?;
         outcome.finalist_rejections = rejections;
@@ -1248,6 +1290,43 @@ fn elected_strides(layout: &DecodedLayout) -> Option<Vec<i64>> {
         }
     }
     strides.into_iter().collect()
+}
+
+#[cfg(test)]
+mod profiling_boundary_tests {
+    use super::*;
+    use luminal::layout_ir::{Access, FreedBy};
+    use luminal::prelude::*;
+
+    #[test]
+    fn profiling_uses_access_contract_not_output_membership() {
+        let mut graph = Graph::new();
+        let input = graph.tensor(vec![4], DType::F32);
+
+        let mut read_only = crate::bindings::CudaBindings::new();
+        let read_only_buffer = read_only.input_external(input.id);
+        // Returning the input aliases caller storage but does not write it.
+        read_only.output_on(input.id, read_only_buffer);
+        let runtime = CudaRuntime::load_with(
+            &graph,
+            read_only,
+            crate::ops::cuda_registry_without_cublaslt(),
+        )
+        .unwrap();
+        assert_eq!(runtime.profiling_externals, [read_only_buffer].into());
+
+        let mut read_write = crate::bindings::CudaBindings::new();
+        let read_write_buffer = read_write.input_external(input.id);
+        read_write.declare(read_write_buffer, Access::ReadWrite, FreedBy::Caller);
+        read_write.output_on(input.id, read_write_buffer);
+        let runtime = CudaRuntime::load_with(
+            &graph,
+            read_write,
+            crate::ops::cuda_registry_without_cublaslt(),
+        )
+        .unwrap();
+        assert!(runtime.profiling_externals.is_empty());
+    }
 }
 
 #[cfg(all(test, feature = "device"))]
