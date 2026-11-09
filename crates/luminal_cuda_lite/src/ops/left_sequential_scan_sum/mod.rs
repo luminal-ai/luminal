@@ -162,7 +162,8 @@ pub(crate) mod tests {
             operand_dtypes: vec![PlanDtype::F32; 2],
             dest_dims: vec![extents],
             dest_dtypes: vec![PlanDtype::F32],
-            operand_layouts: vec![layout.clone(), layout],
+            operand_layouts: vec![layout.clone(), layout.clone()],
+            dest_layouts: vec![layout],
         }
     }
 

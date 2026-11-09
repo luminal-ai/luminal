@@ -15,11 +15,11 @@ use luminal::layouts::{
     StridedElementLayout as ST,
 };
 
-/// Shapes, data types, and read layouts for one compute node.
+/// Shapes, data types, and physical layouts for one compute node.
 ///
 /// Operands follow plan order, with destinations last. Destinations are also
 /// listed separately. All metadata comes from the node's [`SlotDescriptor`]
-/// layouts, and all reads use [`layout_read_index`].
+/// layouts, and indexed reads and writes use [`layout_read_index`].
 #[derive(Debug)]
 pub struct CodegenCtx {
     pub operand_dims: Vec<Vec<Expr>>,
@@ -29,6 +29,8 @@ pub struct CodegenCtx {
     /// Read layouts in the same order as `operand_dims`.
     /// View layouts include the full mapping to the underlying buffer.
     pub operand_layouts: Vec<DecodedLayout>,
+    /// Write layouts in the same order as `dest_dims`.
+    pub dest_layouts: Vec<DecodedLayout>,
 }
 
 impl CodegenCtx {
@@ -51,10 +53,6 @@ impl CodegenCtx {
             .iter()
             .map(|s| dims_of(s, "dest"))
             .collect::<Result<_>>()?;
-        // Kernels write `out[i]`. The rules in `ops/*/match_functional.egg`
-        // require contiguous row-major destinations; enforce this there, not here.
-        // Views write nothing, and cuBLASLt checks its own destination requirements.
-        // See `tests/view_admission.rs` for coverage.
         Ok(CodegenCtx {
             operand_dims: operand_info
                 .iter()
@@ -70,12 +68,18 @@ impl CodegenCtx {
                 .map(|s| dtype_of(s, "dest"))
                 .collect::<Result<_>>()?,
             operand_layouts: operand_info.iter().map(|s| s.layout.clone()).collect(),
+            dest_layouts: result_info.iter().map(|s| s.layout.clone()).collect(),
         })
     }
 
     /// Return the layout used to compute this operand's read indices.
     pub fn operand_layout(&self, slot: usize) -> &DecodedLayout {
         &self.operand_layouts[slot]
+    }
+
+    /// Return the layout used to compute this destination's write indices.
+    pub fn dest_layout(&self, slot: usize) -> &DecodedLayout {
+        &self.dest_layouts[slot]
     }
 }
 
@@ -703,13 +707,14 @@ pub(crate) fn ternary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>>
 // BufferCopy copies whole buffers. Layout conversions use materialize kernels
 // selected by egglog rules.
 
-/// Generate one thread per output element, reading inputs through their layouts.
+/// Generate one thread per output element, reading inputs and writing the
+/// destination through their layouts.
 /// The template must refer to each input as `name[i]`; these tokens are replaced
 /// with the indices from [`layout_read_index`]. Omit coordinate calculations
 /// when every read simplifies to `name[i]`.
 ///
-/// Inputs must match the output shape. Egglog rules require contiguous
-/// row-major destinations.
+/// Inputs must match the output shape. Egglog rules decide which destination
+/// layouts each operation may implement.
 pub(crate) fn elementwise(
     ctx: &CodegenCtx,
     expr: &str,
@@ -746,8 +751,15 @@ pub(crate) fn elementwise(
         }
         rendered = rendered.replace(&flat, &format!("{name}[{idx}]"));
     }
+    let (output_chain, output_idx) = layout_read_index(
+        "out",
+        ctx.dest_layout(0),
+        out_dims,
+        Coords::FlatIndex { prefix: "c" },
+    )?;
+    chains.push_str(&output_chain);
     if chains.is_empty() {
-        // All reads use `i`, so no coordinate calculations are needed.
+        // Every read and the write use `i`, so no coordinates are needed.
         let source = format!(
             r#"extern "C" __global__ void k({sig}, {to}* out, const long long* params) {{
     const unsigned long long n = {n};
@@ -763,7 +775,7 @@ pub(crate) fn elementwise(
     const unsigned long long n = {n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-{prelude}{chains}    out[i] = {rendered};
+{prelude}{chains}    out[{output_idx}] = {rendered};
 }}"#
     );
     Ok(vec![KernelSource::plain(source, n)])

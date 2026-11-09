@@ -38,6 +38,7 @@ fn dense_ctx(arity: usize, dtype: PlanDtype, dest: PlanDtype) -> CodegenCtx {
         dest_dims: vec![extents],
         dest_dtypes: vec![dest],
         operand_layouts,
+        dest_layouts: vec![dense_layout(dest)],
     }
 }
 
