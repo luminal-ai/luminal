@@ -318,6 +318,34 @@ struct MemoryGuide {
     genome: Genome,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProposalKind {
+    CorrelatedRestart,
+    IndependentRestart,
+    Mutate,
+}
+
+/// Choose exploration versus local improvement. A memory-refused guide is not
+/// a feasible incumbent: while it is all we have, repeated global restarts
+/// remain part of every generation so a coherent implementation family across
+/// a large repeated graph stays reachable.
+fn proposal_kind(has_feasible: bool, has_memory_guide: bool, attempt: usize) -> ProposalKind {
+    if !has_feasible && !has_memory_guide {
+        return if attempt.is_multiple_of(2) {
+            ProposalKind::CorrelatedRestart
+        } else {
+            ProposalKind::IndependentRestart
+        };
+    }
+    if !has_feasible && attempt.is_multiple_of(8) {
+        ProposalKind::CorrelatedRestart
+    } else if !has_feasible && attempt % 8 == 1 {
+        ProposalKind::IndependentRestart
+    } else {
+        ProposalKind::Mutate
+    }
+}
+
 impl MemoryGuide {
     fn consider(
         current: &mut Option<Self>,
@@ -577,25 +605,28 @@ pub fn search_implementations(
         // child, extract and arena-plan it, and admit it only after the exact
         // physical-lifetime plan is within budget. Rejection does not repair
         // the child into some other graph; the closest memory refusal becomes
-        // the next generation's mutation parent until an executable incumbent
-        // exists.
+        // the next proposal's mutation parent until an executable incumbent
+        // exists, including when the caller requests only one generation.
         // This keeps genotype diversity meaningful because duplicate plans do
         // not consume population slots either.
-        let parent = best
-            .as_ref()
-            .map(|incumbent| incumbent.genome.clone())
-            .or_else(|| memory_guide.as_ref().map(|guide| guide.genome.clone()));
         let max_attempts = options.generation_size.saturating_mul(32).max(1);
         let mut attempts = 0usize;
         let mut admitted = 0usize;
         let mut generation_fingerprints: FxHashSet<u64> = FxHashSet::default();
         while admitted < options.generation_size && attempts < max_attempts {
-            let genome = match &parent {
-                None if attempts.is_multiple_of(2) => {
+            let genome = match proposal_kind(best.is_some(), memory_guide.is_some(), attempts) {
+                ProposalKind::CorrelatedRestart => {
                     sample_genome_correlated(&index, &space, &mut rng)
                 }
-                None => random_genome(&mut rng),
-                Some(parent) => mutate(parent, &mut rng, options.mutations),
+                ProposalKind::IndependentRestart => random_genome(&mut rng),
+                ProposalKind::Mutate => {
+                    let parent = best
+                        .as_ref()
+                        .map(|incumbent| &incumbent.genome)
+                        .or_else(|| memory_guide.as_ref().map(|guide| &guide.genome))
+                        .expect("mutation proposal requires a parent genome");
+                    mutate(parent, &mut rng, options.mutations)
+                }
             };
             attempts += 1;
             // Extraction failure = invalid genome (cycle, contract breach):
@@ -944,5 +975,46 @@ mod tests {
         let guide = guide.expect("one guide retained");
         assert_eq!(guide.score, (100, 150, 1_100));
         assert_eq!(guide.genome.choices.len(), 1);
+    }
+
+    #[test]
+    fn memory_guide_keeps_global_restarts_until_a_feasible_incumbent_exists() {
+        assert_eq!(
+            (0..16)
+                .map(|attempt| proposal_kind(false, true, attempt))
+                .collect::<Vec<_>>(),
+            vec![
+                ProposalKind::CorrelatedRestart,
+                ProposalKind::IndependentRestart,
+                ProposalKind::Mutate,
+                ProposalKind::Mutate,
+                ProposalKind::Mutate,
+                ProposalKind::Mutate,
+                ProposalKind::Mutate,
+                ProposalKind::Mutate,
+                ProposalKind::CorrelatedRestart,
+                ProposalKind::IndependentRestart,
+                ProposalKind::Mutate,
+                ProposalKind::Mutate,
+                ProposalKind::Mutate,
+                ProposalKind::Mutate,
+                ProposalKind::Mutate,
+                ProposalKind::Mutate,
+            ]
+        );
+        assert!(
+            (0..16).all(|attempt| proposal_kind(true, true, attempt) == ProposalKind::Mutate),
+            "once a feasible incumbent exists, proposals locally improve it"
+        );
+        assert_eq!(
+            proposal_kind(false, false, 2),
+            ProposalKind::CorrelatedRestart,
+            "without a guide the generation keeps drawing global candidates"
+        );
+        assert_eq!(
+            proposal_kind(false, true, 2),
+            ProposalKind::Mutate,
+            "the first memory refusal becomes a mutation parent immediately"
+        );
     }
 }

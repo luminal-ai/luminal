@@ -341,6 +341,34 @@ fn gather_lowers_a_folded_data_operand() {
     );
 }
 
+#[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
+fn gather_lowers_a_flattened_transposed_data_operand() {
+    let mut cx = Graph::new();
+    let base = cx.tensor(vec![2usize, 3usize, 4usize], DType::F32);
+    let data = base.permute(vec![0, 2, 1]);
+    let indexes = cx.tensor(vec![5usize], DType::Int);
+    let _out = data.gather1d(indexes);
+
+    let base_vals: Vec<f32> = (0..24).map(|v| v as f32).collect();
+    let inputs: Vec<(NodeIndex, HostBuffer)> = vec![
+        (base.id, base_vals.into()),
+        (indexes.id, vec![0i32, 1, 5, 12, 23].into()),
+    ];
+
+    let plan = plan_for(&cx, &inputs, 0);
+    let (sources, folded) = the_one(&plan, "GatherGeneric");
+    assert!(
+        folded.contains(&0),
+        "the transpose and flatten must fold onto gather's data operand:\n{}",
+        plan.summary()
+    );
+    assert_no_traps(&sources[0]);
+}
+
 /// SCATTER, coordinate operand through a fold: init (4,3), src (2,3),
 /// coord0 = rows(2,) broadcast to (2,3), coord1 = a column iota — the
 /// qwen3_moe field shape ("ScatterFunctional: operand 2 carries a
