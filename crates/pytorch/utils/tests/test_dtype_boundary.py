@@ -56,6 +56,12 @@ class ItemModel(torch.nn.Module):
         return x.item()
 
 
+class ItemScalarDataflowModel(torch.nn.Module):
+    def forward(self, x: torch.Tensor):
+        value = x.item()
+        return value + 1.5, value * 2.0, value > 0.0, value == 2.0, int(value)
+
+
 class ArangeModel(torch.nn.Module):
     def __init__(
         self,
@@ -329,6 +335,26 @@ def test_item_returns_exact_python_scalar(
 
     assert type(actual) is python_type
     assert type(actual) is type(expected)
+    assert actual == expected
+
+
+def test_item_scalar_dataflow_preserves_python_value_categories() -> None:
+    """Scalar arithmetic/comparisons after item compute as Python values,
+    then the backend restores scalar leaves at the returned pytree boundary."""
+    device = torch.get_default_device()
+    torch.set_default_device(None)
+    try:
+        model = ItemScalarDataflowModel()
+        compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
+        x = torch.tensor(2.0, dtype=torch.float32, device=device)
+        expected = model(x)
+        actual = compiled(x)
+    finally:
+        torch.set_default_device(device)
+
+    assert tuple(type(value) for value in actual) == tuple(
+        type(value) for value in expected
+    )
     assert actual == expected
 
 
