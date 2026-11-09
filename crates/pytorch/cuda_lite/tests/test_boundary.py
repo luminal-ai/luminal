@@ -254,6 +254,17 @@ def test_a_tensor_subclass_is_refused_by_name():
         )
 
 
+def test_rank_zero_cpu_scalar_is_the_only_host_boundary():
+    """PyTorch permits a host scalar as a CUDA operand; larger host storage
+    is not implicit scalar transfer and remains outside the CUDA boundary."""
+    scalar = torch.tensor(0.25, dtype=torch.float64)
+    assert boundary.requires_device_staging(scalar)
+    assert boundary.boundary_layout("scale", scalar) == boundary.Strided(())
+
+    with pytest.raises(boundary.UnsupportedBoundary, match="rank-zero CPU scalar"):
+        boundary.boundary_layout("vector", scalar.reshape(1))
+
+
 def test_a_parameter_of_a_custom_tensor_type_is_refused_by_name():
     """``Parameter`` of a custom tensor type IS that custom type, flagged:
     ``isinstance(t, torch.nn.Parameter)`` answers yes for any tensor

@@ -45,6 +45,30 @@ def test_linear_roundtrip_repeated_calls():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_rank_zero_cpu_scalar_is_staged_at_runtime():
+    """A CPU scalar is a legal PyTorch operand of a CUDA tensor. Keep it a
+    runtime input and refresh the device mirror rather than specializing its
+    example value or handing a host pointer to a kernel."""
+
+    def fn(x, scale):
+        return x * scale
+
+    backend_invocations = 0
+
+    def backend(gm, example_inputs):
+        nonlocal backend_invocations
+        backend_invocations += 1
+        return luminal_cuda_lite.Compiler()(gm, example_inputs)
+
+    x = torch.arange(8, dtype=torch.float64, device="cuda")
+    compiled = torch.compile(fn, backend=backend, fullgraph=True)
+    for value in (0.25, -3.5):
+        scale = torch.tensor(value, dtype=torch.float64)
+        torch.testing.assert_close(compiled(x, scale), fn(x, scale))
+    assert backend_invocations == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_dynamic_batch():
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()

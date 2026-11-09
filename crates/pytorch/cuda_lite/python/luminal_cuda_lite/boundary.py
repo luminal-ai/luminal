@@ -1,7 +1,10 @@
 """Boundary layouts of torch tensors for `luminal_cuda_lite` bindings.
 
-A boundary tensor is bound zero-copy in ONE form: the element strides it
-has, one per axis, relative to ``tensor.data_ptr()``. Nothing here
+A CUDA boundary tensor is bound zero-copy in ONE form: the element strides it
+has, one per axis, relative to ``tensor.data_ptr()``. A rank-zero CPU tensor is
+the one exception: PyTorch permits it as a scalar operand of CUDA operations,
+so the backend stages its exact value to a persistent device scalar each call.
+Nothing here
 classifies — whether a chain is contiguous, column-major or neither is
 discovered from the chain itself in the e-graph, so this module states
 what the tensor has and never interprets it. A tensor the runtime cannot
@@ -75,6 +78,11 @@ def complex_component_dtype(dtype: torch.dtype) -> torch.dtype | None:
 def storage_dtype(dtype: torch.dtype) -> torch.dtype:
     """The dtype CUDA kernels read from this caller-facing tensor."""
     return complex_component_dtype(dtype) or dtype
+
+
+def requires_device_staging(tensor: torch.Tensor) -> bool:
+    """Whether this is PyTorch's host-scalar exception to CUDA operands."""
+    return tensor.device.type == "cpu" and tensor.ndim == 0
 
 
 def storage_shape(tensor: torch.Tensor, fake: Any | None = None) -> tuple[Any, ...]:
@@ -181,9 +189,10 @@ def boundary_layout(
     _refuse_unreadable(name, tensor, allow_storage_offset=allow_storage_offset)
     if fake is not None:
         _refuse_unreadable(name, fake, allow_storage_offset=allow_storage_offset)
-    if not tensor.is_cuda:
+    if not tensor.is_cuda and not requires_device_staging(tensor):
         raise UnsupportedBoundary(
-            f"{name}: expected a CUDA tensor, got device {tensor.device}"
+            f"{name}: expected a CUDA tensor or rank-zero CPU scalar, got "
+            f"shape {tuple(tensor.shape)} on device {tensor.device}"
         )
     component_dtype = storage_dtype(tensor.dtype)
     if component_dtype not in SUPPORTED_DTYPES:
@@ -252,6 +261,7 @@ class Binding:
     dtype: torch.dtype
     shape: tuple[Any, ...]
     layout: Strided
+    host_staged: bool = False
 
 
 def _dim_values(binding: Binding, tensor: torch.Tensor) -> dict[str, int]:
