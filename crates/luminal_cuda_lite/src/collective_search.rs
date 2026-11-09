@@ -7,13 +7,12 @@
 //! enter the same fixed warmup/trial sequence, so every authored collective
 //! is launched in the same order on every rank.
 
-#[cfg(any(feature = "device", test))]
 use anyhow::{Context, Result};
 #[cfg(feature = "device")]
 use anyhow::{anyhow, ensure};
-#[cfg(any(feature = "device", test))]
 use serde::{Deserialize, Serialize};
 
+#[cfg_attr(not(any(feature = "device", test)), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileRun {
     Warmup,
@@ -23,6 +22,7 @@ pub(crate) enum ProfileRun {
 /// Authoritative launch sequence for every rank: one warmup followed by a
 /// fixed, nonzero number of timed trials. Neither timing nor early-stop state
 /// can alter this sequence on an individual rank.
+#[cfg_attr(not(any(feature = "device", test)), allow(dead_code))]
 pub(crate) fn fixed_profile_runs(trials: usize) -> impl Iterator<Item = ProfileRun> {
     std::iter::once(ProfileRun::Warmup).chain(std::iter::repeat_n(ProfileRun::Trial, trials.max(1)))
 }
