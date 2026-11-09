@@ -1431,8 +1431,7 @@ impl CudaRuntime {
 
     /// The bytes that backing buffer spans at the runtime's current dims.
     pub fn output_span_bytes(&self, tensor: NodeIndex) -> Result<usize> {
-        let (plan, slot) = self.installed_output_slot(tensor)?;
-        crate::symbolic::bytes(&plan.buffers[&slot.buffer].layout, &self.dims)
+        self.output_slot_span_bytes(self.output_slot_index(tensor)?)
     }
 
     /// The output's ELECTED element strides, one per axis, at the current dims.
@@ -1459,8 +1458,72 @@ impl CudaRuntime {
 
     /// [`Self::output_span_bytes`] by slot index.
     pub fn output_slot_span_bytes(&self, slot: usize) -> Result<usize> {
-        let (plan, binding) = self.installed_output_slot_at(slot)?;
-        crate::symbolic::bytes(&plan.buffers[&binding.buffer].layout, &self.dims)
+        let native = self
+            .native
+            .as_ref()
+            .ok_or_else(|| anyhow!("load before inspecting output storage"))?;
+        let bound = native
+            .bound
+            .outputs
+            .get(slot)
+            .ok_or_else(|| anyhow!("output slot {slot} has no binding"))?;
+        let plan = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("search before inspecting output storage"))?;
+
+        // One caller buffer may carry several authored output views. Their
+        // declared spans are the reach authority even when a nonzero-offset
+        // layout intentionally has no general-purpose `span_elements`
+        // spelling. Size for their union, then include any larger disclosed
+        // plan-cell span.
+        let mut bytes = native
+            .bound
+            .outputs
+            .iter()
+            .filter(|candidate| candidate.buffer == bound.buffer)
+            .map(|candidate| {
+                candidate
+                    .span_bytes
+                    .as_ref()
+                    .and_then(|span| span.exec(&self.dims))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "output v{} has no resolvable boundary span",
+                            candidate.value.index()
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .ok_or_else(|| anyhow!("output buffer {} has no binding", bound.buffer))?;
+        for candidate in plan
+            .dag
+            .node_weights()
+            .filter_map(|node| match node {
+                luminal::bufferize::BufferNode::BufferOutput { slots } => Some(slots),
+                _ => None,
+            })
+            .flatten()
+            .filter(|candidate| {
+                native
+                    .bound
+                    .outputs
+                    .get(candidate.index)
+                    .is_some_and(|candidate_bound| candidate_bound.buffer == bound.buffer)
+            })
+        {
+            if let Ok(cell) =
+                crate::symbolic::bytes(&plan.buffers[&candidate.buffer].layout, &self.dims)
+            {
+                bytes = bytes.max(cell);
+            }
+            if let Ok(view) = crate::symbolic::bytes(&candidate.layout, &self.dims) {
+                bytes = bytes.max(view);
+            }
+        }
+        Ok(bytes)
     }
 
     /// [`Self::output_elected_strides`] by slot index.

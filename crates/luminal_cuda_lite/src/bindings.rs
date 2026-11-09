@@ -26,8 +26,10 @@ use luminal::shape::{IntExpr, Term};
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 
-/// How a bound value's elements sit in its buffer. Element strides, no
-/// storage offset: a binding names the start of its own storage.
+/// How a bound value's elements sit in its buffer. Element strides are
+/// relative to the binding's storage offset; the offset itself belongs to
+/// [`Bound`] because two views may use this same layout on different regions
+/// of one buffer.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BoundaryLayout {
     /// Contiguous, last axis fastest.
@@ -73,6 +75,97 @@ impl BoundaryLayout {
                 format!("(StridedElementLayoutLit {shape} {chain} {width})")
             }
         })
+    }
+
+    /// The same layout shifted `offset_bytes` forward from the buffer base.
+    /// Keep zero-offset bindings in the constructor ladder; nonzero views use
+    /// the vocabulary's fundamental bit-offset form so byte offsets remain
+    /// exact for every element width, including sub-byte widths.
+    fn term_at(
+        &self,
+        shape: &str,
+        width: &str,
+        dims: &[IntExpr],
+        width_bits: usize,
+        offset_bytes: i64,
+    ) -> Result<String, String> {
+        if offset_bytes == 0 {
+            return self.term(shape, width);
+        }
+        let element_offset = self.element_offset_term(shape, dims)?;
+        let offset_bits = offset_bytes
+            .checked_mul(8)
+            .ok_or_else(|| format!("boundary byte offset {offset_bytes} overflows bits"))?;
+        Ok(format!(
+            "(BitOffsetExpressionLayoutLit (IntAdd (IntLit {offset_bits}) \
+             (IntMul {element_offset} (IntLit {width_bits}))) {shape} {width})"
+        ))
+    }
+
+    /// Render this layout's element-offset function structurally. Coordinates
+    /// are numbered from the end in egglog, while `dims` and boundary strides
+    /// use the authored front-to-back axis order.
+    fn element_offset_term(&self, shape: &str, dims: &[IntExpr]) -> Result<String, String> {
+        let strides = self.element_strides(dims);
+        let mut offset = "(IntLit 0)".to_string();
+        for (position, stride) in strides.iter().enumerate() {
+            let axis = strides.len() - 1 - position;
+            let stride = LogicalGraph::dim_term(stride)?;
+            offset = format!("(IntAdd {offset} (IntMul (CoordVar {shape} {axis}) {stride}))");
+        }
+        Ok(offset)
+    }
+
+    fn element_strides(&self, dims: &[IntExpr]) -> Vec<IntExpr> {
+        match self {
+            Self::Strided { strides } => strides.clone(),
+            Self::RowMajor => (0..dims.len())
+                .map(|axis| {
+                    dims[axis + 1..]
+                        .iter()
+                        .cloned()
+                        .fold(IntExpr::from(1usize), |product, dim| product * dim)
+                })
+                .collect(),
+            Self::ColumnMajor => (0..dims.len())
+                .map(|axis| {
+                    dims[..axis]
+                        .iter()
+                        .cloned()
+                        .fold(IntExpr::from(1usize), |product, dim| product * dim)
+                })
+                .collect(),
+        }
+    }
+
+    /// Exact bytes reachable from the buffer base by this boundary view.
+    /// `live` makes every zero-element tensor span zero without evaluating a
+    /// negative `(extent - 1)` as the final result.
+    fn span_bytes(
+        &self,
+        dims: &[IntExpr],
+        width_bits: usize,
+        offset_bytes: i64,
+    ) -> Result<IntExpr, String> {
+        let strides = self.element_strides(dims);
+        let elements = dims
+            .iter()
+            .cloned()
+            .fold(IntExpr::from(1usize), |product, dim| product * dim);
+        let live = elements.min(1usize);
+        let max_element = dims
+            .iter()
+            .cloned()
+            .zip(strides)
+            .fold(IntExpr::from(0usize), |reach, (dim, stride)| {
+                reach + (dim - 1) * stride
+            });
+        let offset_bits = offset_bytes
+            .checked_mul(8)
+            .ok_or_else(|| format!("boundary byte offset {offset_bytes} overflows bits"))?;
+        let bits =
+            live * (IntExpr::from(offset_bits) + (max_element + 1) * IntExpr::from(width_bits));
+        Ok(bits.ceil_div(8usize))
     }
     /// The declaration supplies the whole coefficient list before index
     /// simplification can erase singleton factors. This is a shape-owned
@@ -197,6 +290,13 @@ pub struct Bound {
     pub value: ValueId,
     pub buffer: i64,
     pub layout: BoundaryLayout,
+    /// Byte offset from the buffer's supplied base pointer. Inputs currently
+    /// enter at zero; computed output views may share one buffer at distinct
+    /// offsets.
+    pub offset_bytes: i64,
+    /// Exact reachable byte span from the buffer base, populated when the
+    /// binding is attached to its graph.
+    pub span_bytes: Option<IntExpr>,
     pub placement: Placement,
 }
 
@@ -335,6 +435,8 @@ impl CudaBindings {
             value,
             buffer,
             layout,
+            offset_bytes: 0,
+            span_bytes: None,
             placement,
         });
     }
@@ -344,12 +446,15 @@ impl CudaBindings {
         value: ValueId,
         buffer: i64,
         layout: BoundaryLayout,
+        offset_bytes: i64,
         placement: Placement,
     ) {
         self.outputs.push(Bound {
             value,
             buffer,
             layout,
+            offset_bytes,
+            span_bytes: None,
             placement,
         });
     }
@@ -428,7 +533,7 @@ impl CudaBindings {
     /// [`Self::output_external`] at the caller's layout.
     pub fn output_external_with(&mut self, value: ValueId, layout: BoundaryLayout) -> i64 {
         let buffer = self.buffer(Access::ReadWrite, FreedBy::Caller);
-        self.push_output(value, buffer, layout, Placement::External);
+        self.push_output(value, buffer, layout, 0, Placement::External);
         buffer
     }
 
@@ -442,8 +547,22 @@ impl CudaBindings {
 
     /// [`Self::output_on`] at the caller's layout.
     pub fn output_on_with(&mut self, value: ValueId, buffer: i64, layout: BoundaryLayout) {
+        self.output_on_with_offset_bytes(value, buffer, layout, 0);
+    }
+
+    /// Bind an output view on an existing buffer at an exact byte offset from
+    /// that buffer's base. This is the boundary spelling for authored output
+    /// aliasing: both logical values remain real output obligations while the
+    /// shared buffer and distinct layouts preserve their storage relation.
+    pub fn output_on_with_offset_bytes(
+        &mut self,
+        value: ValueId,
+        buffer: i64,
+        layout: BoundaryLayout,
+        offset_bytes: i64,
+    ) {
         let placement = self.placement_on(buffer);
-        self.push_output(value, buffer, layout, placement);
+        self.push_output(value, buffer, layout, offset_bytes, placement);
     }
 
     pub fn inputs(&self) -> &[Bound] {
@@ -536,6 +655,14 @@ impl CudaBindings {
                     }
                 }
             }
+            if bound.offset_bytes < 0 {
+                return Err(format!(
+                    "v{} is bound at byte offset {} before buffer {}'s base",
+                    bound.value.index(),
+                    bound.offset_bytes,
+                    bound.buffer
+                ));
+            }
         }
         // An input value is bound once per buffer. An output may repeat an
         // input's binding — the value passes through, the caller receives
@@ -611,14 +738,26 @@ impl CudaBindings {
                 "(let {stem}_layout {})\n\
                  (let {stem}_layout_tensor (LayoutTensorLit {logical} {stem}_layout))\n\
                  (let {stem}_buffer_tensor (BufferTensorLit {stem}_layout_tensor buf{}_id))\n\n",
-                bound.layout.term(&shape, &width)?,
+                bound.layout.term_at(
+                    &shape,
+                    &width,
+                    graph.value_dims(bound.value),
+                    if graph.value_dtype(bound.value) == DType::Bool {
+                        8
+                    } else {
+                        graph.value_dtype(bound.value).bits()
+                    },
+                    bound.offset_bytes,
+                )?,
                 bound.buffer
             ));
-            prefix.push_str(&bound.layout.stride_certificate(
-                &format!("{stem}_layout"),
-                &shape,
-                &width,
-            )?);
+            if bound.offset_bytes == 0 {
+                prefix.push_str(&bound.layout.stride_certificate(
+                    &format!("{stem}_layout"),
+                    &shape,
+                    &width,
+                )?);
+            }
             input_tensors.push(format!("{stem}_buffer_tensor"));
             let_names.insert(bound.value, logical);
         }
@@ -654,14 +793,26 @@ impl CudaBindings {
                  (let {stem}_layout {})\n\
                  (let {stem}_layout_tensor (LayoutTensorLit {boundary_name} {stem}_layout))\n\
                  (let {stem}_buffer_tensor (BufferTensorLit {stem}_layout_tensor buf{}_id))\n\n",
-                bound.layout.term(&shape, &width)?,
+                bound.layout.term_at(
+                    &shape,
+                    &width,
+                    graph.value_dims(bound.value),
+                    if dtype == DType::Bool {
+                        8
+                    } else {
+                        dtype.bits()
+                    },
+                    bound.offset_bytes,
+                )?,
                 bound.buffer
             ));
-            prefix.push_str(&bound.layout.stride_certificate(
-                &format!("{stem}_layout"),
-                &shape,
-                &width,
-            )?);
+            if bound.offset_bytes == 0 {
+                prefix.push_str(&bound.layout.stride_certificate(
+                    &format!("{stem}_layout"),
+                    &shape,
+                    &width,
+                )?);
+            }
             if bound
                 .layout
                 .is_provably_injective(graph.value_dims(bound.value))
@@ -707,12 +858,35 @@ impl CudaBindings {
             post_checks.push_str(text);
             labeled_checks.push((label.clone(), text.clone()));
         }
+        let attach_span = |mut bound: Bound| -> Result<Bound, String> {
+            let dtype = graph.value_dtype(bound.value);
+            bound.span_bytes = Some(bound.layout.span_bytes(
+                graph.value_dims(bound.value),
+                if dtype == DType::Bool {
+                    8
+                } else {
+                    dtype.bits()
+                },
+                bound.offset_bytes,
+            )?);
+            Ok(bound)
+        };
         Ok(BoundProgram {
             prefix,
             post_checks,
             labeled_checks,
-            inputs: self.inputs.clone(),
-            outputs: self.outputs.clone(),
+            inputs: self
+                .inputs
+                .iter()
+                .cloned()
+                .map(attach_span)
+                .collect::<Result<Vec<_>, _>>()?,
+            outputs: self
+                .outputs
+                .iter()
+                .cloned()
+                .map(attach_span)
+                .collect::<Result<Vec<_>, _>>()?,
             let_names,
         })
     }
@@ -851,6 +1025,36 @@ mod tests {
             output.id.index()
         );
         assert!(!prefix.contains(&certificate), "{prefix}");
+    }
+
+    #[test]
+    fn offset_output_views_are_distinct_obligations_on_one_buffer() {
+        let mut cx = luminal::graph::Graph::new();
+        let input = cx.tensor([4], DType::F32);
+        let first = input + 1.;
+        let second = input * 2.;
+        let mut bindings = CudaBindings::new();
+        bindings.input(input.id);
+        let home = bindings.output_external_with(first.id, BoundaryLayout::strided_literal([1]));
+        bindings.output_on_with_offset_bytes(
+            second.id,
+            home,
+            BoundaryLayout::strided_literal([1]),
+            16,
+        );
+
+        let bound = bindings.bind(&cx.logical).unwrap();
+        assert_eq!(bound.outputs.len(), 2);
+        assert_eq!(bound.outputs[0].buffer, bound.outputs[1].buffer);
+        assert_eq!(bound.outputs[0].offset_bytes, 0);
+        assert_eq!(bound.outputs[1].offset_bytes, 16);
+        let shape = cx.logical.value_shape_term(second.id).unwrap();
+        let shifted = format!(
+            "(BitOffsetExpressionLayoutLit (IntAdd (IntLit 128) \
+             (IntMul (IntAdd (IntLit 0) (IntMul (CoordVar {shape} 0) (IntLit 1))) \
+             (IntLit 32))) {shape} (bits-of (F32)))"
+        );
+        assert!(bound.prefix.contains(&shifted), "{}", bound.prefix);
     }
 
     /// TWO PLACEMENTS ON ONE BUFFER ARE REFUSED. The constructors cannot
