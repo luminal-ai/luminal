@@ -114,14 +114,12 @@ impl BoundaryLayout {
         while !remaining.is_empty() {
             let Some(position) = remaining.iter().position(|&axis| {
                 strides[axis] == dense_span
-                    || strides[axis]
-                        .simplify()
-                        .egglog_equal(dense_span.simplify())
+                    || strides[axis].simplify().egglog_equal(dense_span.simplify())
             }) else {
                 break;
             };
             let axis = remaining.remove(position);
-            dense_span *= dims[axis].clone();
+            dense_span *= dims[axis];
         }
         if remaining.is_empty() {
             return true;
