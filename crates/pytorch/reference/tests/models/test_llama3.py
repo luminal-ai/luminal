@@ -221,7 +221,9 @@ def test_hf_llama3_real_config_1layer(device: torch.device):
     with torch.no_grad():
         ref = model(input_ids)
         out = compiled(input_ids)
-    assert torch.allclose(out.logits, ref.logits, atol=1e-5), (
+    # FP32 reductions may associate differently across CUDA architectures;
+    # the model does not author an accumulation order.
+    assert torch.allclose(out.logits, ref.logits, atol=2e-5), (
         f"max_diff={torch.max(torch.abs(out.logits - ref.logits)).item():.2e}"
     )
 
