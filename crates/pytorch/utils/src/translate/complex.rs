@@ -9,8 +9,8 @@
 //! `translator/complex.rs`. The structural `ComplexTensor`, the target
 //! routing, and the arithmetic / elementary / movement / reduction surface
 //! are ported here; the remaining target families (FFT/DFT, index/scatter,
-//! cumulative scan, variance/product, `linalg_vector_norm`/`dist`,
-//! `constant_pad_nd`) still bail explicitly with the ATen target name.
+//! cumulative scan, variance, and `linalg_vector_norm`/`dist` still bail
+//! explicitly with the ATen target name.
 
 use anyhow::{Context, Result, anyhow, bail};
 use luminal::prelude::*;
@@ -31,6 +31,10 @@ pub(crate) struct ComplexTensor {
     pub(crate) real: GraphTensor,
     pub(crate) imag: GraphTensor,
     pub(crate) torch_dtype: TorchDType,
+    /// The interleaved storage view when this value is still an alias of a
+    /// boundary tensor. Arithmetic clears it; pure movement transforms it
+    /// alongside the component views so output aliasing remains structural.
+    pub(crate) backing: Option<GraphTensor>,
 }
 
 impl ComplexTensor {
@@ -41,6 +45,7 @@ impl ComplexTensor {
             real,
             imag,
             torch_dtype,
+            backing: None,
         }
     }
 
@@ -63,12 +68,18 @@ impl ComplexTensor {
         shape.pop();
         let real = gather_component(cx, backing, &shape, 0);
         let imag = gather_component(cx, backing, &shape, 1);
-        Ok(Self::new(real, imag, torch_dtype))
+        Ok(Self::new(real, imag, torch_dtype).with_backing(backing))
     }
 
     /// Repack two components into interleaved `[..., 2]` storage.
     pub(crate) fn pack(self, cx: &mut Graph) -> GraphTensor {
-        interleave(cx, self.real, self.imag)
+        self.backing
+            .unwrap_or_else(|| interleave(cx, self.real, self.imag))
+    }
+
+    fn with_backing(mut self, backing: GraphTensor) -> Self {
+        self.backing = Some(backing);
+        self
     }
 
     fn cast(self, torch_dtype: TorchDType) -> Self {
@@ -82,7 +93,8 @@ impl ComplexTensor {
         Self {
             real: f(self.real),
             imag: f(self.imag),
-            ..self
+            torch_dtype: self.torch_dtype,
+            backing: None,
         }
     }
 
@@ -90,8 +102,19 @@ impl ComplexTensor {
         Ok(Self {
             real: f(self.real)?,
             imag: f(self.imag)?,
-            ..self
+            torch_dtype: self.torch_dtype,
+            backing: None,
         })
+    }
+
+    fn map_view(
+        self,
+        mut component: impl FnMut(GraphTensor) -> GraphTensor,
+        backing: impl FnOnce(GraphTensor) -> GraphTensor,
+    ) -> Self {
+        let mut value = Self::new(component(self.real), component(self.imag), self.torch_dtype);
+        value.backing = self.backing.map(backing);
+        value
     }
 }
 
@@ -266,6 +289,19 @@ impl Translator<'_> {
                 let result = self.complex_pow(base, exponent);
                 self.store_complex(output_name, result);
             }
+            "ldexp.Tensor" => {
+                let value = self.get_complex_input(node, 0)?;
+                let exponent = self
+                    .get_input_tensor(node, 1)?
+                    .cast(value.real.dtype)
+                    .exp2();
+                let (real, scale) = broadcast_binary(value.real, exponent);
+                let (imag, scale_imag) = broadcast_binary(value.imag, scale);
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real * scale, imag * scale_imag, value.torch_dtype),
+                );
+            }
 
             // ---- conjugation and aliasing ----
             "_conj.default" | "_conj_physical.default" | "conj_physical.default" => {
@@ -275,9 +311,13 @@ impl Translator<'_> {
                     ComplexTensor::new(value.real, value.imag * -1.0, value.torch_dtype),
                 );
             }
-            "resolve_conj.default" | "alias.default" | "clone.default" => {
+            "resolve_conj.default" | "clone.default" => {
                 let value = self.get_complex_input(node, 0)?;
                 self.store_complex(output_name, value.map(materialize_tensor));
+            }
+            "alias.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                self.store_complex(output_name, value);
             }
 
             // ---- magnitude / components ----
@@ -288,11 +328,19 @@ impl Translator<'_> {
             }
             "real.default" => {
                 let value = self.get_complex_input(node, 0)?;
-                self.values.insert(output_name.to_string(), value.real);
+                let out = value.backing.map_or(value.real, |backing| {
+                    let axis = backing.rank() - 1;
+                    backing.slice_along(0..1, axis).squeeze(axis)
+                });
+                self.values.insert(output_name.to_string(), out);
             }
             "imag.default" => {
                 let value = self.get_complex_input(node, 0)?;
-                self.values.insert(output_name.to_string(), value.imag);
+                let out = value.backing.map_or(value.imag, |backing| {
+                    let axis = backing.rank() - 1;
+                    backing.slice_along(1..2, axis).squeeze(axis)
+                });
+                self.values.insert(output_name.to_string(), out);
             }
             "view_as_real.default" => {
                 let value = self.get_complex_input(node, 0)?;
@@ -320,10 +368,7 @@ impl Translator<'_> {
                 let shape = if target == "full_like.default" {
                     self.get_complex_input(node, 0)?.real.dims()
                 } else {
-                    self.get_ints_arg(node, 0)?
-                        .into_iter()
-                        .map(|v| IntExpr::from(v as usize))
-                        .collect()
+                    self.get_int_exprs_arg(node, 0)?
                 };
                 let value = self.complex_constructor_scalar_arg(node, 1, dtype)?;
                 let value = if shape.is_empty() {
@@ -605,6 +650,10 @@ impl Translator<'_> {
                 let value = self.translate_complex_reduction(node, ReductionOp::Mean)?;
                 self.store_complex(output_name, value);
             }
+            "prod.dim_int" | "prod.default" => {
+                let value = self.translate_complex_prod(node)?;
+                self.store_complex(output_name, value);
+            }
             "cumsum.default" => {
                 let value = self.get_complex_input(node, 0)?;
                 if value.real.rank() == 0 {
@@ -645,7 +694,14 @@ impl Translator<'_> {
                         .collect(),
                 };
                 let dims = resolve_neg1_dim_exprs(&target_shape, &value.real.dims());
-                let value = value.map(|component| reshape_tensor(component, &dims));
+                let value = value.map_view(
+                    |component| reshape_tensor(component, &dims),
+                    |backing| {
+                        let mut storage_dims = dims.clone();
+                        storage_dims.push(2usize.into());
+                        reshape_tensor(backing, &storage_dims)
+                    },
+                );
                 let value = if target == "view_copy.default" {
                     value.map(materialize_tensor)
                 } else {
@@ -662,33 +718,51 @@ impl Translator<'_> {
                     .map(|&dim| normalize_dim(dim, rank))
                     .collect();
                 let copy = target == "permute_copy.default";
-                let value = value.map(|component| {
-                    let component = component.permute(axes.clone());
-                    if copy {
-                        materialize_tensor(component)
-                    } else {
-                        component
-                    }
-                });
+                let value = if copy {
+                    value.map(|component| materialize_tensor(component.permute(axes.clone())))
+                } else {
+                    value.map_view(
+                        |component| component.permute(axes.clone()),
+                        |backing| {
+                            let mut storage_axes = axes.clone();
+                            storage_axes.push(backing.rank() - 1);
+                            backing.permute(storage_axes)
+                        },
+                    )
+                };
                 self.store_complex(output_name, value);
             }
             "unsqueeze.default" => {
                 let value = self.get_complex_input(node, 0)?;
                 let dim = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank() + 1);
-                self.store_complex(output_name, value.map(|component| component.unsqueeze(dim)));
+                self.store_complex(
+                    output_name,
+                    value.map_view(
+                        |component| component.unsqueeze(dim),
+                        |backing| backing.unsqueeze(dim),
+                    ),
+                );
             }
             "squeeze.default" | "squeeze.dim" | "squeeze.dims" => {
                 let value = self.get_complex_input(node, 0)?;
                 let axes = self.squeeze_axes(node, target, &value.real.dims())?;
                 self.store_complex(
                     output_name,
-                    value.map(|component| remove_axes(component, &axes)),
+                    value.map_view(
+                        |component| remove_axes(component, &axes),
+                        |backing| remove_axes(backing, &axes),
+                    ),
                 );
             }
             "expand.default" => {
                 let value = self.get_complex_input(node, 0)?;
-                let value =
+                let backing = value
+                    .backing
+                    .map(|backing| self.expand_complex_backing(backing, node))
+                    .transpose()?;
+                let mut value =
                     value.try_map(|component| self.expand_complex_component(component, node))?;
+                value.backing = backing;
                 self.store_complex(output_name, value);
             }
             "repeat.default" => {
@@ -714,14 +788,24 @@ impl Translator<'_> {
             }
             "slice.Tensor" => {
                 let value = self.get_complex_input(node, 0)?;
-                let value =
+                let backing = value
+                    .backing
+                    .map(|backing| self.slice_complex_component(backing, node))
+                    .transpose()?;
+                let mut value =
                     value.try_map(|component| self.slice_complex_component(component, node))?;
+                value.backing = backing;
                 self.store_complex(output_name, value);
             }
             "select.int" => {
                 let value = self.get_complex_input(node, 0)?;
-                let value =
+                let backing = value
+                    .backing
+                    .map(|backing| self.select_complex_component(backing, node))
+                    .transpose()?;
+                let mut value =
                     value.try_map(|component| self.select_complex_component(component, node))?;
+                value.backing = backing;
                 self.store_complex(output_name, value);
             }
             "cat.default" => {
@@ -739,7 +823,129 @@ impl Translator<'_> {
                 let end = start + IntExpr::from(length.max(0) as usize);
                 self.store_complex(
                     output_name,
-                    value.map(|component| component.slice_along(start..end, dim)),
+                    value.map_view(
+                        |component| component.slice_along(start..end, dim),
+                        |backing| backing.slice_along(start..end, dim),
+                    ),
+                );
+            }
+            "split_with_sizes.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let rank = value.real.rank();
+                anyhow::ensure!(rank > 0, "complex split_with_sizes needs rank > 0");
+                let sizes = self.get_ints_arg(node, 1)?;
+                let dim = normalize_dim(self.get_int_arg(node, 2).unwrap_or(0), rank);
+                let names = Self::tensor_output_names(node);
+                anyhow::ensure!(
+                    names.len() == sizes.len(),
+                    "complex split_with_sizes declared {} outputs for {} sizes",
+                    names.len(),
+                    sizes.len()
+                );
+                let mut start = IntExpr::from(0);
+                for (name, size) in names.into_iter().zip(sizes) {
+                    anyhow::ensure!(size >= 0, "complex split size must be nonnegative");
+                    let end = start + IntExpr::from(size);
+                    self.store_complex(
+                        &name,
+                        value.map_view(
+                            |component| component.slice_along(start..end, dim),
+                            |backing| backing.slice_along(start..end, dim),
+                        ),
+                    );
+                    start = end;
+                }
+            }
+            "unbind.int" | "unbind_copy.int" => {
+                let value = self.get_complex_input(node, 0)?;
+                let rank = value.real.rank();
+                anyhow::ensure!(rank > 0, "complex unbind needs rank > 0");
+                let dim = normalize_dim(self.get_int_arg(node, 1).unwrap_or(0), rank);
+                let names = Self::tensor_output_names(node);
+                let axis_size = value.real.dims()[dim]
+                    .to_usize()
+                    .context("complex unbind requires a concrete unbound dimension")?;
+                anyhow::ensure!(
+                    names.len() == axis_size,
+                    "complex unbind declared {} outputs for axis size {axis_size}",
+                    names.len()
+                );
+                for (index, name) in names.into_iter().enumerate() {
+                    let selected = value.map_view(
+                        |component| component.slice_along(index..index + 1, dim).squeeze(dim),
+                        |backing| backing.slice_along(index..index + 1, dim).squeeze(dim),
+                    );
+                    self.store_complex(&name, selected);
+                }
+            }
+            "constant_pad_nd.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let raw = self.get_ints_arg(node, 1)?;
+                let rank = value.real.rank();
+                let mut pairs = Vec::new();
+                let mut index = 0;
+                while index < raw.len() {
+                    pairs.push((
+                        IntExpr::from(raw[index]),
+                        IntExpr::from(raw.get(index + 1).copied().unwrap_or(0)),
+                    ));
+                    index += 2;
+                }
+                anyhow::ensure!(
+                    pairs.len() <= rank,
+                    "complex constant_pad_nd has too many padded dimensions"
+                );
+                pairs.reverse();
+                let mut padding = vec![(IntExpr::from(0), IntExpr::from(0)); rank - pairs.len()];
+                padding.extend(pairs);
+                let fill = if node.inputs.len() > 2 {
+                    self.complex_constructor_scalar_arg(node, 2, value.torch_dtype)?
+                } else {
+                    self.complex_constant_like(value.real, 0.0, 0.0, value.torch_dtype)
+                };
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(
+                        value.real.pad_with(padding.clone(), fill.real),
+                        value.imag.pad_with(padding, fill.imag),
+                        value.torch_dtype,
+                    ),
+                );
+            }
+            "scatter.src"
+            | "scatter.value"
+            | "scatter.reduce"
+            | "scatter.value_reduce"
+            | "scatter_add.default"
+            | "scatter_reduce.two" => {
+                let kind = match target {
+                    "scatter.src" => 0,
+                    "scatter.value" => 1,
+                    "scatter.reduce" => 2,
+                    "scatter.value_reduce" => 3,
+                    "scatter_add.default" => 4,
+                    _ => 5,
+                };
+                let value = self.get_complex_input(node, 0)?;
+                let updates = if matches!(kind, 1 | 3) {
+                    let (real, imag) = self.complex_scalar_arg(node, 3)?;
+                    let index_dims = self.get_input_tensor(node, 2)?.dims();
+                    self.complex_constant_scalars(real, imag, value.torch_dtype)?
+                        .map(|component| component.expand_rhs(index_dims.clone()))
+                } else {
+                    self.value_as_complex(self.input_value_name(node, 3)?, value.torch_dtype)?
+                };
+                let (real, imag) = self.translate_complex_scatter_components(
+                    node,
+                    kind,
+                    value.real,
+                    value.imag,
+                    updates.real,
+                    updates.imag,
+                )?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real, imag, value.torch_dtype),
                 );
             }
             "where.self" => {
@@ -912,9 +1118,21 @@ impl Translator<'_> {
     // ---------------------------------------------------------------
 
     fn complex_mul(&self, a: ComplexTensor, b: ComplexTensor) -> ComplexTensor {
+        let storage = a.real.dtype;
+        let compute = if storage.is_narrow_float() {
+            DType::F32
+        } else {
+            storage
+        };
+        let (ar, ai, br, bi) = (
+            a.real.cast(compute),
+            a.imag.cast(compute),
+            b.real.cast(compute),
+            b.imag.cast(compute),
+        );
         ComplexTensor::new(
-            a.real * b.real - a.imag * b.imag,
-            a.real * b.imag + a.imag * b.real,
+            super::util::round_to_storage(ar * br - ai * bi, storage),
+            super::util::round_to_storage(ar * bi + ai * br, storage),
             a.torch_dtype,
         )
     }
@@ -930,7 +1148,17 @@ impl Translator<'_> {
     fn add_complex(&self, lhs: ComplexTensor, rhs: ComplexTensor) -> ComplexTensor {
         let (lhs_real, rhs_real) = broadcast_binary(lhs.real, rhs.real);
         let (lhs_imag, rhs_imag) = broadcast_binary(lhs.imag, rhs.imag);
-        ComplexTensor::new(lhs_real + rhs_real, lhs_imag + rhs_imag, lhs.torch_dtype)
+        let storage = lhs_real.dtype;
+        let compute = if storage.is_narrow_float() {
+            DType::F32
+        } else {
+            storage
+        };
+        ComplexTensor::new(
+            super::util::round_to_storage(lhs_real.cast(compute) + rhs_real.cast(compute), storage),
+            super::util::round_to_storage(lhs_imag.cast(compute) + rhs_imag.cast(compute), storage),
+            lhs.torch_dtype,
+        )
     }
 
     fn apply_complex_binary(
@@ -941,8 +1169,30 @@ impl Translator<'_> {
     ) -> Result<ComplexTensor> {
         let dtype = a.torch_dtype;
         match op {
-            BinaryOp::Add => Ok(ComplexTensor::new(a.real + b.real, a.imag + b.imag, dtype)),
-            BinaryOp::Sub => Ok(ComplexTensor::new(a.real - b.real, a.imag - b.imag, dtype)),
+            BinaryOp::Add | BinaryOp::Sub => {
+                let storage = a.real.dtype;
+                let compute = if storage.is_narrow_float() {
+                    DType::F32
+                } else {
+                    storage
+                };
+                let apply = |lhs: GraphTensor, rhs: GraphTensor| {
+                    let (lhs, rhs) = (lhs.cast(compute), rhs.cast(compute));
+                    super::util::round_to_storage(
+                        if matches!(op, BinaryOp::Add) {
+                            lhs + rhs
+                        } else {
+                            lhs - rhs
+                        },
+                        storage,
+                    )
+                };
+                Ok(ComplexTensor::new(
+                    apply(a.real, b.real),
+                    apply(a.imag, b.imag),
+                    dtype,
+                ))
+            }
             BinaryOp::Mul => Ok(self.complex_mul(a, b)),
             BinaryOp::Div => self.stable_complex_div(a, b),
         }
@@ -1146,6 +1396,9 @@ impl Translator<'_> {
             Some(index) => self.complex_scalar_arg(node, index)?,
             None => (1.0, 0.0),
         };
+        if real == 1.0 && imag == 0.0 {
+            return Ok(value);
+        }
         let alpha = self.complex_constant_like(value.real, real, imag, value.torch_dtype);
         Ok(self.complex_mul(value, alpha))
     }
@@ -1530,6 +1783,30 @@ impl Translator<'_> {
         Ok(value.expand(target))
     }
 
+    fn expand_complex_backing(&self, mut value: GraphTensor, node: &Node) -> Result<GraphTensor> {
+        let mut raw = self
+            .resolve_shape_arg(node, 1)
+            .or_else(|| {
+                self.get_ints_arg(node, 1)
+                    .ok()
+                    .map(|dims| dims.into_iter().map(IntExpr::from).collect())
+            })
+            .context("complex expand shape is unresolved")?;
+        let logical_rank = value.rank() - 1;
+        anyhow::ensure!(raw.len() >= logical_rank, "complex expand rank mismatch");
+        for _ in 0..(raw.len() - logical_rank) {
+            value = value.unsqueeze(0);
+        }
+        let neg_one = IntExpr::from(-1i32);
+        for (axis, dim) in raw.iter_mut().enumerate() {
+            if *dim == neg_one {
+                *dim = value.dims()[axis];
+            }
+        }
+        raw.push(2usize.into());
+        Ok(value.expand(raw))
+    }
+
     fn slice_complex_component(&self, value: GraphTensor, node: &Node) -> Result<GraphTensor> {
         let rank = value.rank();
         let dim = normalize_dim(self.get_int_arg(node, 1).unwrap_or(0), rank);
@@ -1689,7 +1966,10 @@ impl Translator<'_> {
         if rank == 0 {
             return Ok(value);
         }
-        let dims = self.get_ints_arg(node, 1).ok();
+        let dims = self
+            .get_ints_arg(node, 1)
+            .ok()
+            .or_else(|| self.get_int_arg(node, 1).ok().map(|dim| vec![dim]));
         let axes: Vec<usize> = match dims {
             Some(dims) if !dims.is_empty() => dims
                 .into_iter()
@@ -1711,6 +1991,71 @@ impl Translator<'_> {
             }
         }
         Ok(result)
+    }
+
+    fn translate_complex_prod(&mut self, node: &Node) -> Result<ComplexTensor> {
+        let mut value = self.get_complex_input(node, 0)?;
+        let rank = value.real.rank();
+        if rank == 0 {
+            return Ok(value);
+        }
+        let dims = self
+            .get_ints_arg(node, 1)
+            .ok()
+            .or_else(|| self.get_int_arg(node, 1).ok().map(|dim| vec![dim]));
+        let mut axes: Vec<usize> = match dims {
+            Some(dims) if !dims.is_empty() => dims
+                .into_iter()
+                .map(|dim| normalize_dim(dim, rank))
+                .collect(),
+            _ => (0..rank).collect(),
+        };
+        axes.sort_unstable();
+        axes.dedup();
+        let keepdim = node.inputs.len() > 2 && self.get_bool_arg(node, 2).unwrap_or(false);
+        for &axis in axes.iter().rev() {
+            value = self.complex_prod_axis(value, axis)?;
+        }
+        if keepdim {
+            for axis in axes {
+                value = value.map(|component| component.expand_dim(axis, 1usize));
+            }
+        }
+        Ok(value)
+    }
+
+    fn complex_prod_axis(&mut self, value: ComplexTensor, axis: usize) -> Result<ComplexTensor> {
+        let extent = value.real.dims()[axis]
+            .to_usize()
+            .context("complex prod requires a concrete reduction dimension")?;
+        let mut output_shape = value.real.dims();
+        output_shape.remove(axis);
+        if extent == 0 {
+            let real = self
+                .typed_scalar(1.0, value.real.dtype)
+                .expand_rhs(output_shape.clone());
+            let imag = self
+                .typed_scalar(0.0, value.real.dtype)
+                .expand_rhs(output_shape);
+            return Ok(ComplexTensor::new(real, imag, value.torch_dtype));
+        }
+        let select = |component: GraphTensor, index: usize| {
+            component.slice_along(index..index + 1, axis).squeeze(axis)
+        };
+        let mut product = ComplexTensor::new(
+            select(value.real, 0),
+            select(value.imag, 0),
+            value.torch_dtype,
+        );
+        for index in 1..extent {
+            let next = ComplexTensor::new(
+                select(value.real, index),
+                select(value.imag, index),
+                value.torch_dtype,
+            );
+            product = self.complex_mul(product, next);
+        }
+        Ok(product)
     }
 
     fn translate_complex_matmul(
@@ -1928,12 +2273,14 @@ mod tests {
     fn complex_core_ops_record() {
         let parsed = program();
         let t = translate(&parsed).expect("complex graph must translate");
-        // Five outputs: packed complex add/mul result, view_as_real,
-        // view_as_complex, real, imag.
+        // Complex outputs and view_as_real expose their physical trailing
+        // component axis to runtimes; real/imag component outputs do not.
         assert_eq!(t.outputs.len(), 5);
         for output in &t.outputs {
             match output.graph_name.as_str() {
-                "zr" => assert_eq!(output.shape, vec![2, 3, 2], "{}", output.graph_name),
+                "z" | "zr" | "zc" => {
+                    assert_eq!(output.shape, vec![2, 3, 2], "{}", output.graph_name)
+                }
                 _ => assert_eq!(output.shape, vec![2, 3], "{}", output.graph_name),
             }
             assert_eq!(output.dtype, luminal::prelude::DType::F32);

@@ -404,10 +404,12 @@ pub fn translate_with_cpu_gelu_semantics(
             Some(component_dtype) => component_dtype,
             None => dtype_of(meta.dtype)?,
         };
-        let shape = t.boundary_shape(&meta, &name)?;
+        let mut shape = t.boundary_shape(&meta, &name)?;
         // A complex output is repacked into interleaved `[..., 2]` storage
-        // for the boundary; its logical shape stays the unpacked one.
+        // for the runtime boundary. Python removes that storage-only axis
+        // when it presents the authored complex tensor to the caller.
         let value = if let Some(value) = t.complex_tensors.get(&name).copied() {
+            shape.push(2usize.into());
             value.pack(&mut t.cx)
         } else {
             *t.values

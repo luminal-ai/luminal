@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn a_complex_input_is_not_declared() {
+    fn view_as_real_declares_the_interleaved_complex_backing_as_real() {
         const COMPLEX_FLOAT: u32 = 10;
         let translation = translate_one(
             node(
@@ -356,7 +356,10 @@ mod tests {
         let backing = translation.inputs[0].tensor;
         let facts = declared_dtype_program(&translation).facts;
         assert!(
-            !facts.contains(&format!("(pytorch-declared-dtype v{} ", backing.index())),
+            facts.contains(&format!(
+                "(pytorch-declared-dtype v{} (F32))",
+                backing.index()
+            )),
             "{facts}"
         );
         if let Err(err) = saturate(&translation, &bindings(&translation, Beginning)) {
