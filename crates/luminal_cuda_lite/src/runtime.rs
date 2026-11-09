@@ -91,6 +91,11 @@ pub struct CudaRuntime {
     /// assembly tripwire checks each saturated program against them. A
     /// `Default` runtime carries an empty registry, like `matchers`.
     decoders: std::rc::Rc<luminal::egglog_utils::eclass::ConstructorRegistry>,
+    /// Deserializers for the executable DPS op types in this instance's
+    /// registry. Rank zero uses the same runtime interfaces to encode a
+    /// bufferized plan; profiling workers use these callbacks to reconstruct
+    /// that exact plan without running any compiler pass.
+    wire_decoders: std::rc::Rc<crate::collective_search::WireDecoders>,
     plan: Option<BufferIrGraph<DecodedLayout>>,
     storage: Option<crate::arena::ArenaPlan>,
     /// Boundaries supplied as caller-owned device pointers.
@@ -145,6 +150,7 @@ impl CudaRuntime {
             matchers: self.matchers.clone(),
             allow: self.allow.clone(),
             decoders: self.decoders.clone(),
+            wire_decoders: self.wire_decoders.clone(),
             plan: Some(plan.clone()),
             storage: self.storage.clone(),
             bounds: self.bounds.clone(),
@@ -254,6 +260,7 @@ impl CudaRuntime {
         // Derive the claim set BEFORE the rows are consumed: the allow
         // list reads the prototypes, the search reads the matchers.
         let allow = Self::allow_list_over(&registry);
+        let wire_decoders = Self::wire_decoders_over(&registry)?;
         let matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>> =
             registry.into_iter().map(|entry| entry.matcher).collect();
         // The decoders for that same vocabulary. Refused here if two
@@ -283,6 +290,7 @@ impl CudaRuntime {
             matchers: std::rc::Rc::new(matchers),
             allow,
             decoders: std::rc::Rc::new(decoders),
+            wire_decoders: std::rc::Rc::new(wire_decoders),
             input_buffers,
             output_slots,
             output_buffers,
@@ -376,6 +384,32 @@ impl CudaRuntime {
             })
             .map(|entry| entry.matcher.egglog_constructor())
             .collect()
+    }
+
+    fn wire_decoders_over(
+        registry: &[crate::ops::RegisteredOp],
+    ) -> Result<crate::collective_search::WireDecoders> {
+        let mut decoders = crate::collective_search::WireDecoders::new();
+        for entry in registry {
+            let dps = entry.prototype.to_dps();
+            let executable = dps.as_deref().unwrap_or(entry.prototype.as_ref());
+            let Some(interface) = executable
+                .runtime_interface()
+                .and_then(|interface| interface.downcast_ref::<crate::CudaOpInterface>())
+            else {
+                continue;
+            };
+            let Some((name, _, decode)) = interface.wire_parts() else {
+                continue;
+            };
+            if let Some(previous) = decoders.insert(name.into(), decode) {
+                ensure!(
+                    std::ptr::fn_addr_eq(previous, decode),
+                    "CUDA wire op name {name} has two decoders"
+                );
+            }
+        }
+        Ok(decoders)
     }
 
     /// The SATURATED, SERIALIZED e-graph this runtime's search reads —
@@ -489,9 +523,10 @@ impl CudaRuntime {
     }
 
     /// Search a collective-containing graph with rank zero as the sole
-    /// compiler. Every rank calls this concurrently with the same model,
-    /// bounds and options. Rank zero returns the search outcome; worker ranks
-    /// return `None` after installing the coordinator-selected finalist.
+    /// compiler through bufferization. Every rank calls this concurrently with
+    /// the same model, bounds and options. Rank zero returns the search outcome;
+    /// worker ranks only instantiate/profile received physical plans and return
+    /// `None` after installing the coordinator-selected finalist.
     ///
     /// Model collectives must also be bound with [`crate::collective::with_group`]
     /// for the duration of this call. `control` may be that same communicator
@@ -724,7 +759,7 @@ impl CudaRuntime {
         if let Some(coordinator) = collective_coordinator.as_mut() {
             coordinator.finish(
                 self.device.as_ref().expect("device initialized").stream(),
-                &outcome.best_genome,
+                &outcome.best_plan,
             )?;
         }
         Ok(outcome)
@@ -767,11 +802,7 @@ impl CudaRuntime {
             .expect("device initialized")
             .stream()
             .clone();
-        let mut worker = crate::collective_search::Worker::receive(control, &stream)?;
-        ensure!(
-            self.requires_coordinated_profiling(&worker.begin.graph),
-            "collective search coordinator sent a graph with no collective"
-        );
+        let worker = crate::collective_search::Worker::receive(control, &stream)?;
         let device = self.device.as_mut().expect("device initialized");
         let capacity_bounds = crate::symbolic::initial_capacity_bounds(bounds, profile_dims)?;
         let shapes = crate::symbolic::ShapeEnv {
@@ -802,50 +833,17 @@ impl CudaRuntime {
                 )
             })
             .collect();
-        let index = crate::extractor::ExtractionSession::new_with_matcher_set(
-            &worker.begin.graph,
-            Some(&self.allow),
-            &self.matchers,
-        )
-        .producer_index();
-        worker.install_index(&index);
-        let mut session = crate::extractor::ExtractionSession::new_with_matcher_set(
-            &worker.begin.graph,
-            Some(&self.allow),
-            &self.matchers,
-        );
-        let view =
-            luminal::egglog_utils::eclass::EGraphView::new(&worker.begin.graph, &self.decoders);
-        let mut layout_cache = luminal::layouts::LayoutDecodeCache::new();
-        let mut build = |genome: &crate::extractor::Genome| -> Result<_> {
-            let extracted = session
-                .extract_with_genome(genome)?
-                .context("collective candidate reaches no output")?;
-            let dps = luminal::dps::dps_rewrite(&extracted);
-            let table = luminal::layouts::decode_layout_table(
-                &view,
-                &dps,
-                "collective profiling worker",
-                &mut layout_cache,
-            )?;
-            luminal::bufferize::bufferize(&dps, &table)
-        };
-
         loop {
-            match worker.next(&stream)? {
-                crate::collective_search::WorkerCommand::Candidate(genome) => {
-                    let plan = build(&genome);
-                    let candidate = match plan.as_ref() {
-                        Ok(plan) => crate::profile::PreparedCandidate::new(
-                            device,
-                            plan,
-                            &staged,
-                            &external_ptrs,
-                            &shapes,
-                            Some(worker.begin.arena_budget_bytes),
-                        ),
-                        Err(error) => Err(anyhow!("{error:#}")),
-                    };
+            match worker.next(&stream, &self.wire_decoders)? {
+                crate::collective_search::WorkerCommand::Candidate(plan) => {
+                    let candidate = crate::profile::PreparedCandidate::new(
+                        device,
+                        &plan,
+                        &staged,
+                        &external_ptrs,
+                        &shapes,
+                        Some(worker.begin.arena_budget_bytes),
+                    );
                     let local_ready = candidate.is_ok();
                     if !worker.all_ready(&stream, local_ready)? {
                         continue;
@@ -864,10 +862,8 @@ impl CudaRuntime {
                         }
                     }
                 }
-                crate::collective_search::WorkerCommand::Finish(genome) => {
+                crate::collective_search::WorkerCommand::Finish(plan) => {
                     let installed = (|| -> Result<_> {
-                        let mut plan = build(&genome)?;
-                        Self::retarget_external_outputs(&mut plan, &native.bound.outputs)?;
                         let storage =
                             crate::storage::plan_storage(&plan, &capacity_bounds, &self.externals)?;
                         ensure!(

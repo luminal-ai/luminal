@@ -10,7 +10,7 @@ pub struct AllGather {
     pub spec: AllGatherSpec,
     pub dtype: luminal::dtype::PlanDtype,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AllGatherDps {
     pub spec: AllGatherSpec,
     pub dtype: luminal::dtype::PlanDtype,
@@ -30,7 +30,7 @@ impl BufferTensorIrOp for AllGatherDps {
         operand == 0
     }
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::host::<Self>())
+        Some(crate::CudaOpInterface::host_wire::<Self>())
     }
 }
 impl Bufferizable for AllGather {}

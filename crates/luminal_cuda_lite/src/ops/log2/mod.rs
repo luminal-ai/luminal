@@ -43,7 +43,7 @@ impl ToDps for Log2Functional {
 impl LayoutIrOp for Log2Functional {}
 
 /// Destination-passing form: `Log2(input: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Log2FunctionalDps;
 
 impl OpSlotNames for Log2FunctionalDps {
@@ -58,7 +58,7 @@ impl OpSlotNames for Log2FunctionalDps {
 
 impl BufferTensorIrOp for Log2FunctionalDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

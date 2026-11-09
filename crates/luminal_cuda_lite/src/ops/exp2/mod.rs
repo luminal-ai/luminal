@@ -43,7 +43,7 @@ impl ToDps for Exp2Functional {
 impl LayoutIrOp for Exp2Functional {}
 
 /// Destination-passing form: `Exp2(input: read, dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Exp2FunctionalDps;
 
 impl OpSlotNames for Exp2FunctionalDps {
@@ -58,7 +58,7 @@ impl OpSlotNames for Exp2FunctionalDps {
 
 impl BufferTensorIrOp for Exp2FunctionalDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

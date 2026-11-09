@@ -40,7 +40,7 @@ impl ToDps for Constant {
 impl LayoutIrOp for Constant {}
 
 /// Destination-passing form: `Constant(dest0: write ↔ out0)`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConstantDps {
     /// The literal value (the term's f64 metadata).
     pub value: f64,
@@ -57,7 +57,7 @@ impl OpSlotNames for ConstantDps {
 
 impl BufferTensorIrOp for ConstantDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

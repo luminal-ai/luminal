@@ -25,12 +25,14 @@ shapes are used for timing, without freezing the installed plan's geometry.
 
 Collective graphs use the same implementation search. Rank zero alone runs
 saturation, memory pruning, genome sampling, extraction, ranking, and finalist
-selection. It broadcasts the pruned snapshot and each admitted genome to the
-other ranks, which only materialize that exact candidate for profiling. Every
-candidate has an all-rank preparation barrier followed by a fixed warmup/trial
-sequence; no rank can early-stop independently. Final installation also uses an
-all-rank barrier. The authored collective topology, order, dtype, and shape are
-therefore identical across candidates and ranks.
+selection, including DPS rewriting, layout decoding, and bufferization. It
+broadcasts each already-bufferized physical candidate to the other ranks.
+Nonzero ranks do no e-graph or compiler work: they only instantiate that exact
+plan in their local CUDA context and join profiling. Every candidate has an
+all-rank preparation barrier followed by a fixed warmup/trial sequence; no rank
+can early-stop independently. Final installation also uses an all-rank barrier.
+The authored collective topology, order, dtype, and shape are therefore
+identical across candidates and ranks.
 
 The storage planner evaluates conservative interval capacities for each buffer.
 It respects the bufferizer's allocation/free events and data/anti-dependencies.

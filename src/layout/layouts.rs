@@ -1129,6 +1129,94 @@ pub struct DecodedLayout {
     pub spellings: Spellings<Layout>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+enum EncodedLayoutSpelling {
+    RightMajor(RightMajorContiguousElementLayout),
+    LeftMajor(LeftMajorContiguousElementLayout),
+    Strided(StridedElementLayout),
+    ElementOffset(ElementOffsetExpressionLayout),
+    BitOffset(BitOffsetExpressionLayout),
+    ElementStrided(crate::element_stride::ElementStridedLayout),
+}
+
+impl serde::Serialize for DecodedLayout {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let spellings = self
+            .spellings
+            .iter()
+            .map(|spelling| {
+                let spelling = Layout::upcast_any(spelling);
+                let encoded = if let Some(value) =
+                    spelling.downcast_ref::<RightMajorContiguousElementLayout>()
+                {
+                    EncodedLayoutSpelling::RightMajor(value.clone())
+                } else if let Some(value) =
+                    spelling.downcast_ref::<LeftMajorContiguousElementLayout>()
+                {
+                    EncodedLayoutSpelling::LeftMajor(value.clone())
+                } else if let Some(value) = spelling.downcast_ref::<StridedElementLayout>() {
+                    EncodedLayoutSpelling::Strided(value.clone())
+                } else if let Some(value) = spelling.downcast_ref::<ElementOffsetExpressionLayout>()
+                {
+                    EncodedLayoutSpelling::ElementOffset(value.clone())
+                } else if let Some(value) = spelling.downcast_ref::<BitOffsetExpressionLayout>() {
+                    EncodedLayoutSpelling::BitOffset(value.clone())
+                } else if let Some(value) =
+                    spelling.downcast_ref::<crate::element_stride::ElementStridedLayout>()
+                {
+                    EncodedLayoutSpelling::ElementStrided(value.clone())
+                } else {
+                    return Err(serde::ser::Error::custom(
+                        "Layout has an unregistered decoded spelling",
+                    ));
+                };
+                Ok(encoded)
+            })
+            .collect::<std::result::Result<Vec<_>, S::Error>>()?;
+        let mut state = serializer.serialize_struct("DecodedLayout", 3)?;
+        state.serialize_field("class", &self.class)?;
+        state.serialize_field("dtype", &self.dtype)?;
+        state.serialize_field("spellings", &spellings)?;
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DecodedLayout {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Encoded {
+            class: ClassId,
+            dtype: Option<crate::dtype::PlanDtype>,
+            spellings: Vec<EncodedLayoutSpelling>,
+        }
+        let encoded = Encoded::deserialize(deserializer)?;
+        let spellings = encoded
+            .spellings
+            .into_iter()
+            .map(|spelling| match spelling {
+                EncodedLayoutSpelling::RightMajor(value) => value.erase(),
+                EncodedLayoutSpelling::LeftMajor(value) => value.erase(),
+                EncodedLayoutSpelling::Strided(value) => value.erase(),
+                EncodedLayoutSpelling::ElementOffset(value) => value.erase(),
+                EncodedLayoutSpelling::BitOffset(value) => value.erase(),
+                EncodedLayoutSpelling::ElementStrided(value) => value.erase(),
+            })
+            .collect();
+        Ok(Self {
+            class: encoded.class,
+            dtype: encoded.dtype,
+            spellings: Spellings::from_decoded(spellings),
+        })
+    }
+}
+
 impl DecodedLayout {
     /// THE DECODER: every registered `Layout` spelling the class holds.
     ///

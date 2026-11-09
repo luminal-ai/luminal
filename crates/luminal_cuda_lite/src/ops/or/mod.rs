@@ -24,12 +24,12 @@ impl ToDps for Or {
 }
 impl LayoutIrOp for Or {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OrDps;
 impl OpSlotNames for OrDps {}
 impl BufferTensorIrOp for OrDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
     fn label(&self) -> &str {
         "OrGeneric"

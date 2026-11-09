@@ -47,7 +47,7 @@ impl ToDps for Iota {
 impl LayoutIrOp for Iota {}
 
 /// Destination-passing form: `Iota(dest0: write ↔ out0)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IotaDps {
     /// See [`Iota::expr`].
     pub expr: Option<IotaExpr>,
@@ -64,7 +64,7 @@ impl OpSlotNames for IotaDps {
 
 impl BufferTensorIrOp for IotaDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
 
     fn label(&self) -> &str {

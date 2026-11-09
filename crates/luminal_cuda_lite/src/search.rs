@@ -158,8 +158,9 @@ pub enum Evaluator<'a> {
         external_ptrs: &'a FxHashMap<i64, crate::device::ExternalPtr>,
     },
     /// Rank-zero evaluator for a collective program. The coordinator alone
-    /// samples and ranks genomes; admitted candidates are sent to workers and
-    /// every rank enters the fixed profiling sequence together.
+    /// samples, extracts, bufferizes, and ranks genomes. Already-bufferized
+    /// plans are sent to workers and every rank enters the fixed profiling
+    /// sequence together.
     #[cfg(feature = "device")]
     CollectiveCoordinator {
         device: &'a mut crate::device::CudaExecutable,
@@ -178,8 +179,8 @@ pub enum Evaluator<'a> {
 impl Evaluator<'_> {
     fn begin_collective(
         &mut self,
-        graph: &egraph_serialize::EGraph,
-        index: &ProducerIndex,
+        _graph: &egraph_serialize::EGraph,
+        _index: &ProducerIndex,
         options: &CompileOptions,
         arena_budget_bytes: usize,
     ) -> Result<()> {
@@ -190,15 +191,9 @@ impl Evaluator<'_> {
             ..
         } = self
         {
-            coordinator.begin(
-                device.stream(),
-                graph,
-                index,
-                options.trials,
-                arena_budget_bytes,
-            )?;
+            coordinator.begin(device.stream(), options.trials, arena_budget_bytes)?;
         }
-        let _ = (graph, index, options, arena_budget_bytes);
+        let _ = (options, arena_budget_bytes);
         Ok(())
     }
 
@@ -221,7 +216,7 @@ impl Evaluator<'_> {
     fn measure(
         &mut self,
         plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
-        genome: &Genome,
+        _genome: &Genome,
         options: &CompileOptions,
         shapes: &crate::symbolic::ShapeEnv,
         best_nanos: Option<u128>,
@@ -236,7 +231,7 @@ impl Evaluator<'_> {
             } = self
             {
                 let stream = device.stream().clone();
-                if let Err(error) = coordinator.candidate(&stream, genome) {
+                if let Err(error) = coordinator.candidate(&stream, plan) {
                     return Priced::PrepareFailed(format!("send collective candidate: {error:#}"));
                 }
                 let prepared = crate::profile::PreparedCandidate::new(
@@ -354,7 +349,7 @@ impl Evaluator<'_> {
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = (plan, genome, options, shapes, best_nanos);
+            let _ = (plan, _genome, options, shapes, best_nanos);
             Priced::PrepareFailed(
                 "candidate search requires the `device` feature and a CUDA GPU".into(),
             )

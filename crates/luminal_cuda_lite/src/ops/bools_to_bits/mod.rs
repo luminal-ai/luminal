@@ -29,14 +29,14 @@ impl ToDps for BoolsToBits {
 }
 impl LayoutIrOp for BoolsToBits {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoolsToBitsDps {
     pub width: i64,
 }
 impl OpSlotNames for BoolsToBitsDps {}
 impl BufferTensorIrOp for BoolsToBitsDps {
     fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(crate::CudaOpInterface::kernel::<Self>())
+        Some(crate::CudaOpInterface::kernel_wire::<Self>())
     }
     fn label(&self) -> &str {
         "BoolsToBitsGeneric"

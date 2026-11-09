@@ -1,23 +1,16 @@
 //! Coordinator-owned implementation search for collective programs.
 //!
-//! Rank zero owns the compiler and sends admitted genomes to profiling
-//! workers. Workers never sample, rank, or select implementations. They only
-//! materialize the coordinator's exact candidate and enter the same fixed
-//! warmup/trial sequence, so every authored collective is launched in the
-//! same order on every rank.
+//! Rank zero owns the entire compiler and sends already-bufferized physical
+//! plans to profiling workers. Workers never assemble, saturate, extract,
+//! DPS-rewrite, bufferize, sample, rank, or select implementations. They only
+//! instantiate the coordinator's exact plan in their local CUDA context and
+//! enter the same fixed warmup/trial sequence, so every authored collective
+//! is launched in the same order on every rank.
 
+#[cfg(any(feature = "device", test))]
+use anyhow::{Context, Result};
 #[cfg(feature = "device")]
-use anyhow::anyhow;
-#[cfg(any(feature = "device", test))]
-use anyhow::{Context, Result, ensure};
-#[cfg(any(feature = "device", test))]
-use luminal::extraction::{Genome, ProducerChoice};
-#[cfg(any(feature = "device", test))]
-use luminal::prelude::egraph_serialize::ClassId;
-#[cfg(any(feature = "device", test))]
-use luminal::prelude::egraph_serialize::EGraph;
-#[cfg(any(feature = "device", test))]
-use luminal::search_support::ProducerIndex;
+use anyhow::{anyhow, ensure};
 #[cfg(any(feature = "device", test))]
 use serde::{Deserialize, Serialize};
 
@@ -34,75 +27,9 @@ pub(crate) fn fixed_profile_runs(trials: usize) -> impl Iterator<Item = ProfileR
     std::iter::once(ProfileRun::Warmup).chain(std::iter::repeat_n(ProfileRun::Trial, trials.max(1)))
 }
 
-/// Stable dense representation of a genome relative to one producer index.
-/// The index is sorted by class and every candidate list is deterministically
-/// sorted by extraction, so the same pruned snapshot gives every rank the same
-/// wire vocabulary.
-#[derive(Debug, Clone)]
-#[cfg(any(feature = "device", test))]
-pub(crate) struct GenomeCodec {
-    rows: Vec<(ClassId, Vec<ProducerChoice>)>,
-}
-
-#[cfg(any(feature = "device", test))]
-impl GenomeCodec {
-    pub(crate) fn new(index: &ProducerIndex) -> Self {
-        Self {
-            rows: index
-                .iter()
-                .map(|(class, choices)| {
-                    (
-                        class.clone(),
-                        choices.iter().map(|(_, choice)| choice.clone()).collect(),
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    pub(crate) fn encode(&self, genome: &Genome) -> Result<Vec<u32>> {
-        self.rows
-            .iter()
-            .map(|(class, choices)| {
-                let chosen = genome.choices.get(class).with_context(|| {
-                    format!("collective candidate omits producer class {class}")
-                })?;
-                let position = choices
-                    .iter()
-                    .position(|candidate| candidate == chosen)
-                    .with_context(|| {
-                        format!("collective candidate names an unknown producer for class {class}")
-                    })?;
-                u32::try_from(position).context("collective producer index exceeds u32")
-            })
-            .collect()
-    }
-
-    pub(crate) fn decode(&self, encoded: &[u32]) -> Result<Genome> {
-        ensure!(
-            encoded.len() == self.rows.len(),
-            "collective candidate has {} producer rows, expected {}",
-            encoded.len(),
-            self.rows.len()
-        );
-        let mut genome = Genome::default();
-        for ((class, choices), &position) in self.rows.iter().zip(encoded) {
-            let choice = choices
-                .get(usize::try_from(position)?)
-                .with_context(|| {
-                    format!("collective producer {position} is out of range for class {class}")
-                })?
-                .clone();
-            genome.choices.insert(class.clone(), choice);
-        }
-        Ok(genome)
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 #[cfg(any(feature = "device", test))]
 pub(crate) struct Begin {
-    pub(crate) graph: EGraph,
     pub(crate) trials: usize,
     pub(crate) arena_budget_bytes: usize,
 }
@@ -117,9 +44,239 @@ enum Handshake {
 #[derive(Serialize, Deserialize)]
 #[cfg(any(feature = "device", test))]
 pub(crate) enum Command {
-    Candidate(Vec<u32>),
-    Finish(Vec<u32>),
+    Candidate(Vec<u8>),
+    Finish(Vec<u8>),
     Abort(String),
+}
+
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+#[derive(Serialize, Deserialize)]
+enum WireOp {
+    Registered { name: String, payload: Vec<u8> },
+    BufferAlloc,
+    BufferFree,
+}
+
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+#[derive(Serialize, Deserialize)]
+enum WireNode {
+    BufferInput {
+        slots: Vec<luminal::bufferize::InputBinding>,
+    },
+    Compute {
+        op: WireOp,
+        reads: Vec<luminal::bufferize::BufferId>,
+        writes: Vec<luminal::bufferize::BufferId>,
+        ties: Vec<(usize, usize)>,
+        operand_info: Vec<luminal::bufferize::SlotDescriptor<luminal::layouts::DecodedLayout>>,
+        result_info: Vec<luminal::bufferize::SlotDescriptor<luminal::layouts::DecodedLayout>>,
+    },
+    BufferCopy {
+        src: luminal::bufferize::BufferId,
+        dst: luminal::bufferize::BufferId,
+    },
+    BufferCopyValue {
+        src: luminal::bufferize::BufferId,
+        dst: luminal::bufferize::BufferId,
+        layout: luminal::layouts::DecodedLayout,
+    },
+    BufferOutput {
+        slots: Vec<luminal::bufferize::OutputBinding<luminal::layouts::DecodedLayout>>,
+    },
+}
+
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+#[derive(Serialize, Deserialize)]
+struct WirePlan {
+    nodes: Vec<WireNode>,
+    edges: Vec<(u32, u32, luminal::bufferize::BufferEdge)>,
+    buffers: Vec<(
+        luminal::bufferize::BufferId,
+        luminal::bufferize::Buffer<luminal::layouts::DecodedLayout>,
+    )>,
+    value_buffer: Vec<(
+        luminal::prelude::egraph_serialize::ClassId,
+        luminal::bufferize::BufferId,
+    )>,
+    outputs: Vec<u32>,
+}
+
+pub(crate) type WireDecoders = std::collections::HashMap<String, crate::op::DecodeWireOp>;
+
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+fn encode_op(op: &dyn luminal::buffer_tensor_ir::BufferTensorIrOp) -> Result<WireOp> {
+    match op.label() {
+        "BufferAlloc" => return Ok(WireOp::BufferAlloc),
+        "BufferFree" => return Ok(WireOp::BufferFree),
+        _ => {}
+    }
+    let interface = op
+        .runtime_interface()
+        .and_then(|interface| interface.downcast_ref::<crate::CudaOpInterface>())
+        .with_context(|| format!("{} has no CUDA wire interface", op.label()))?;
+    let (name, encode, _) = interface.wire_parts().with_context(|| {
+        format!(
+            "{} is not registered for collective plan transport",
+            op.label()
+        )
+    })?;
+    Ok(WireOp::Registered {
+        name: name.into(),
+        payload: encode(op)?,
+    })
+}
+
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+fn decode_op(
+    op: WireOp,
+    decoders: &WireDecoders,
+) -> Result<Box<dyn luminal::buffer_tensor_ir::BufferTensorIrOp>> {
+    Ok(match op {
+        WireOp::Registered { name, payload } => decoders.get(&name).with_context(|| {
+            format!("collective worker registry has no wire decoder for {name}")
+        })?(&payload)?,
+        WireOp::BufferAlloc => Box::new(luminal::buffer_tensor_ir::BufferAlloc),
+        WireOp::BufferFree => Box::new(luminal::buffer_tensor_ir::BufferFree),
+    })
+}
+
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+pub(crate) fn encode_plan(plan: &crate::layouts::CudaPlan) -> Result<Vec<u8>> {
+    use petgraph::visit::EdgeRef;
+    let mut ids = std::collections::HashMap::new();
+    let mut nodes = Vec::with_capacity(plan.dag.node_count());
+    for node in plan.dag.node_indices() {
+        let dense = u32::try_from(nodes.len()).context("collective plan has too many nodes")?;
+        ids.insert(node, dense);
+        nodes.push(match &plan.dag[node] {
+            luminal::bufferize::BufferNode::BufferInput { slots } => WireNode::BufferInput {
+                slots: slots.clone(),
+            },
+            luminal::bufferize::BufferNode::Compute {
+                op,
+                reads,
+                writes,
+                ties,
+                operand_info,
+                result_info,
+            } => WireNode::Compute {
+                op: encode_op(op.as_ref())?,
+                reads: reads.clone(),
+                writes: writes.clone(),
+                ties: ties.clone(),
+                operand_info: operand_info.clone(),
+                result_info: result_info.clone(),
+            },
+            luminal::bufferize::BufferNode::BufferCopy { src, dst } => WireNode::BufferCopy {
+                src: src.clone(),
+                dst: dst.clone(),
+            },
+            luminal::bufferize::BufferNode::BufferCopyValue { src, dst, layout } => {
+                WireNode::BufferCopyValue {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                    layout: layout.clone(),
+                }
+            }
+            luminal::bufferize::BufferNode::BufferOutput { slots } => WireNode::BufferOutput {
+                slots: slots.clone(),
+            },
+        });
+    }
+    let edges = plan
+        .dag
+        .edge_references()
+        .map(|edge| {
+            Ok((
+                ids[&edge.source()],
+                ids[&edge.target()],
+                edge.weight().clone(),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let wire = WirePlan {
+        nodes,
+        edges,
+        buffers: plan
+            .buffers
+            .iter()
+            .map(|(id, buffer)| (id.clone(), buffer.clone()))
+            .collect(),
+        value_buffer: plan
+            .value_buffer
+            .iter()
+            .map(|(value, buffer)| (value.clone(), buffer.clone()))
+            .collect(),
+        outputs: plan.outputs.iter().map(|node| ids[node]).collect(),
+    };
+    Ok(serde_json::to_vec(&wire)?)
+}
+
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+pub(crate) fn decode_plan(
+    bytes: &[u8],
+    decoders: &WireDecoders,
+) -> Result<crate::layouts::CudaPlan> {
+    let wire: WirePlan =
+        serde_json::from_slice(bytes).context("decode collective physical plan")?;
+    let mut dag = petgraph::graph::DiGraph::new();
+    let mut nodes = Vec::with_capacity(wire.nodes.len());
+    for node in wire.nodes {
+        let node = match node {
+            WireNode::BufferInput { slots } => {
+                luminal::bufferize::BufferNode::BufferInput { slots }
+            }
+            WireNode::Compute {
+                op,
+                reads,
+                writes,
+                ties,
+                operand_info,
+                result_info,
+            } => luminal::bufferize::BufferNode::Compute {
+                op: decode_op(op, decoders)?,
+                reads,
+                writes,
+                ties,
+                operand_info,
+                result_info,
+            },
+            WireNode::BufferCopy { src, dst } => {
+                luminal::bufferize::BufferNode::BufferCopy { src, dst }
+            }
+            WireNode::BufferCopyValue { src, dst, layout } => {
+                luminal::bufferize::BufferNode::BufferCopyValue { src, dst, layout }
+            }
+            WireNode::BufferOutput { slots } => {
+                luminal::bufferize::BufferNode::BufferOutput { slots }
+            }
+        };
+        nodes.push(dag.add_node(node));
+    }
+    for (source, target, edge) in wire.edges {
+        let source = *nodes
+            .get(usize::try_from(source)?)
+            .context("wire edge source out of range")?;
+        let target = *nodes
+            .get(usize::try_from(target)?)
+            .context("wire edge target out of range")?;
+        dag.add_edge(source, target, edge);
+    }
+    Ok(luminal::bufferize::BufferIrGraph {
+        dag,
+        buffers: wire.buffers.into_iter().collect(),
+        value_buffer: wire.value_buffer.into_iter().collect(),
+        outputs: wire
+            .outputs
+            .into_iter()
+            .map(|node| {
+                nodes
+                    .get(usize::try_from(node)?)
+                    .copied()
+                    .context("wire output node out of range")
+            })
+            .collect::<Result<_>>()?,
+    })
 }
 
 #[cfg(feature = "device")]
@@ -127,7 +284,7 @@ pub(crate) enum Command {
 pub struct Coordinator {
     group: std::rc::Rc<crate::collective::NcclCommunicator>,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
-    codec: Option<GenomeCodec>,
+    begun: bool,
     finished: bool,
 }
 
@@ -144,7 +301,7 @@ impl Coordinator {
         Ok(Self {
             group,
             stream,
-            codec: None,
+            begun: false,
             finished: false,
         })
     }
@@ -152,46 +309,35 @@ impl Coordinator {
     pub(crate) fn begin(
         &mut self,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-        graph: &EGraph,
-        index: &ProducerIndex,
         trials: usize,
         arena_budget_bytes: usize,
     ) -> Result<()> {
-        ensure!(self.codec.is_none(), "collective search began twice");
+        ensure!(!self.begun, "collective search began twice");
         let payload = bincode::serialize(&Handshake::Begin(Box::new(Begin {
-            graph: graph.clone(),
             trials: trials.max(1),
             arena_budget_bytes,
         })))?;
         self.group.broadcast_bytes(stream, Some(&payload))?;
-        self.codec = Some(GenomeCodec::new(index));
+        self.begun = true;
         Ok(())
     }
 
     pub(crate) fn candidate(
         &self,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-        genome: &Genome,
+        plan: &crate::layouts::CudaPlan,
     ) -> Result<()> {
-        let encoded = self
-            .codec
-            .as_ref()
-            .context("collective search has not begun")?
-            .encode(genome)?;
-        self.send(stream, &Command::Candidate(encoded))
+        ensure!(self.begun, "collective search has not begun");
+        self.send(stream, &Command::Candidate(encode_plan(plan)?))
     }
 
     pub(crate) fn finish(
         &mut self,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-        genome: &Genome,
+        plan: &crate::layouts::CudaPlan,
     ) -> Result<()> {
-        let encoded = self
-            .codec
-            .as_ref()
-            .context("collective search has not begun")?
-            .encode(genome)?;
-        self.send(stream, &Command::Finish(encoded))?;
+        ensure!(self.begun, "collective search has not begun");
+        self.send(stream, &Command::Finish(encode_plan(plan)?))?;
         self.finished = true;
         ensure!(
             self.group.all_true(stream, true)?,
@@ -234,7 +380,7 @@ impl Drop for Coordinator {
             return;
         }
         let message = "collective search coordinator exited before selecting a finalist";
-        let payload = if self.codec.is_some() {
+        let payload = if self.begun {
             bincode::serialize(&Command::Abort(message.into()))
         } else {
             bincode::serialize(&Handshake::Abort(message.into()))
@@ -250,7 +396,6 @@ impl Drop for Coordinator {
 pub(crate) struct Worker {
     group: std::rc::Rc<crate::collective::NcclCommunicator>,
     pub(crate) begin: Begin,
-    codec: Option<GenomeCodec>,
 }
 
 #[cfg(feature = "device")]
@@ -271,31 +416,22 @@ impl Worker {
                     return Err(anyhow!("collective search coordinator aborted: {error}"));
                 }
             };
-        Ok(Self {
-            group,
-            begin,
-            codec: None,
-        })
-    }
-
-    pub(crate) fn install_index(&mut self, index: &ProducerIndex) {
-        self.codec = Some(GenomeCodec::new(index));
+        Ok(Self { group, begin })
     }
 
     pub(crate) fn next(
         &self,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        decoders: &WireDecoders,
     ) -> Result<WorkerCommand> {
         let payload = self.group.broadcast_bytes(stream, None)?;
         let command: Command =
             bincode::deserialize(&payload).context("decode collective search command")?;
-        let codec = self
-            .codec
-            .as_ref()
-            .context("collective profiling worker has no producer index")?;
         match command {
-            Command::Candidate(encoded) => Ok(WorkerCommand::Candidate(codec.decode(&encoded)?)),
-            Command::Finish(encoded) => Ok(WorkerCommand::Finish(codec.decode(&encoded)?)),
+            Command::Candidate(encoded) => {
+                Ok(WorkerCommand::Candidate(decode_plan(&encoded, decoders)?))
+            }
+            Command::Finish(encoded) => Ok(WorkerCommand::Finish(decode_plan(&encoded, decoders)?)),
             Command::Abort(error) => Err(anyhow!("collective search coordinator aborted: {error}")),
         }
     }
@@ -319,74 +455,67 @@ impl Worker {
 
 #[cfg(feature = "device")]
 pub(crate) enum WorkerCommand {
-    Candidate(Genome),
-    Finish(Genome),
+    Candidate(crate::layouts::CudaPlan),
+    Finish(crate::layouts::CudaPlan),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use luminal::prelude::egraph_serialize::{ClassId, NodeId};
-
-    fn fixture() -> (ProducerIndex, Genome) {
-        let c0 = ClassId::dense(3);
-        let c1 = ClassId::dense(7);
-        let a = ProducerChoice {
-            enode: NodeId::dense(11),
-            output_index: 0,
-        };
-        let b = ProducerChoice {
-            enode: NodeId::dense(12),
-            output_index: 1,
-        };
-        let c = ProducerChoice {
-            enode: NodeId::dense(19),
-            output_index: 0,
-        };
-        let index = [
-            (
-                c0.clone(),
-                vec![("A".into(), a.clone()), ("B".into(), b.clone())],
-            ),
-            (c1.clone(), vec![("C".into(), c.clone())]),
-        ]
-        .into_iter()
-        .collect();
-        let mut genome = Genome::default();
-        genome.choices.insert(c0, b);
-        genome.choices.insert(c1, c);
-        (index, genome)
-    }
 
     #[test]
-    fn dense_genome_wire_round_trips_against_the_shared_index() {
-        let (index, genome) = fixture();
-        let codec = GenomeCodec::new(&index);
-        let encoded = codec.encode(&genome).unwrap();
-        assert_eq!(encoded, [1, 0]);
-        assert_eq!(codec.decode(&encoded).unwrap().choices, genome.choices);
-    }
+    fn physical_plan_wire_round_trips_ops_and_decoded_layouts() {
+        use luminal::bufferize::{BufferId, BufferNode, SlotDescriptor};
+        use luminal::dtype::PlanDtype;
+        use luminal::layouts::{
+            BitWidthTerm, DecodedLayout, IntExprTerm, RightMajorContiguousElementLayout, ShapeTerm,
+        };
 
-    #[test]
-    fn dense_genome_wire_refuses_different_candidate_vocabularies() {
-        let (index, genome) = fixture();
-        let codec = GenomeCodec::new(&index);
-        let mut encoded = codec.encode(&genome).unwrap();
-        encoded[1] = 4;
-        assert!(
-            codec
-                .decode(&encoded)
-                .unwrap_err()
-                .to_string()
-                .contains("out of range")
+        let layout = DecodedLayout::of(
+            RightMajorContiguousElementLayout {
+                shape: ShapeTerm(vec![IntExprTerm::Lit(2), IntExprTerm::Lit(3)]),
+                width: BitWidthTerm(32),
+            },
+            Some(PlanDtype::F32),
         );
-        assert!(
-            codec
-                .decode(&encoded[..1])
-                .unwrap_err()
-                .to_string()
-                .contains("expected 2")
-        );
+        let buffer = BufferId::Allocated(0);
+        let slot = SlotDescriptor {
+            value: "value".into(),
+            buffer: buffer.clone(),
+            layout,
+        };
+        let mut dag = petgraph::graph::DiGraph::new();
+        dag.add_node(BufferNode::Compute {
+            op: Box::new(crate::ops::add::AddFunctionalDps),
+            reads: vec![buffer.clone()],
+            writes: vec![buffer],
+            ties: vec![(0, 0)],
+            operand_info: vec![slot.clone()],
+            result_info: vec![slot],
+        });
+        let plan = luminal::bufferize::BufferIrGraph {
+            dag,
+            buffers: Default::default(),
+            value_buffer: Default::default(),
+            outputs: vec![],
+        };
+        let interface = crate::CudaOpInterface::kernel_wire::<crate::ops::add::AddFunctionalDps>();
+        let (name, _, decode) = interface.wire_parts().unwrap();
+        let decoders = [(name.into(), decode)].into_iter().collect();
+        let decoded = decode_plan(&encode_plan(&plan).unwrap(), &decoders).unwrap();
+        let BufferNode::Compute {
+            op,
+            operand_info,
+            result_info,
+            ..
+        } = &decoded.dag[petgraph::graph::NodeIndex::new(0)]
+        else {
+            panic!("wire changed the compute node")
+        };
+        assert_eq!(op.label(), "AddFunctionalGeneric");
+        assert_eq!(operand_info[0].layout, result_info[0].layout);
+        assert_eq!(operand_info[0].layout.dtype, Some(PlanDtype::F32));
+        assert_eq!(operand_info[0].layout.literal_extents(), Some(vec![2, 3]));
     }
 
     #[test]
@@ -409,7 +538,6 @@ mod tests {
     #[test]
     fn snapshot_handshake_and_candidate_commands_round_trip() {
         let payload = bincode::serialize(&Handshake::Begin(Box::new(Begin {
-            graph: EGraph::default(),
             trials: 3,
             arena_budget_bytes: 4096,
         })))
@@ -419,7 +547,6 @@ mod tests {
         };
         assert_eq!(begin.trials, 3);
         assert_eq!(begin.arena_budget_bytes, 4096);
-        assert!(begin.graph.nodes.is_empty());
 
         let payload = bincode::serialize(&Command::Candidate(vec![2, 0, 4])).unwrap();
         let Command::Candidate(candidate) = bincode::deserialize(&payload).unwrap() else {
