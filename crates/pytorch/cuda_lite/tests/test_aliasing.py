@@ -234,6 +234,27 @@ def test_returned_view_at_a_storage_offset_is_refused_by_name():
         torch.compile(fn, backend=luminal_cuda_lite.Compiler())(_x())
 
 
+@cuda
+def test_computed_output_views_share_storage_and_write_every_offset():
+    """Two returned views of a computed tensor are both output obligations.
+    Sharing the owner's buffer must not turn the later offset view into
+    metadata while leaving its cells unwritten."""
+
+    def fn(real, imag):
+        value = torch.complex(real + 1, imag - 2)
+        return value.real, value.imag
+
+    real = torch.arange(6, dtype=torch.float64, device="cuda")
+    imag = torch.arange(6, dtype=torch.float64, device="cuda") * -3
+    expected = fn(real, imag)
+    actual = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(real, imag)
+
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
+    assert actual[0].untyped_storage().data_ptr() == actual[1].untyped_storage().data_ptr()
+    assert actual[1].data_ptr() == actual[0].data_ptr() + actual[0].element_size()
+
+
 def test_functionalising_without_decomposing_keeps_linear():
     """The backend relies on ``run_decompositions({})`` functionalising the
     export while leaving composites such as ``aten.linear`` in place; a torch

@@ -9,9 +9,10 @@
 //! id per boundary tensor, the layout the caller declared for it, and
 //! `Placement::External` — the storage is the caller's own live device
 //! allocation, never host-staged and never given an arena range. A writeback
-//! binds on the buffer of the input it mutates. Python returns every read-only
-//! output alias as a view of its owner; aliases are not runtime outputs because
-//! a buffer cannot hold several distinct final logical views at once.
+//! binds on the buffer of the input it mutates. Every computed read-only output
+//! alias remains a distinct runtime output obligation on its owner's buffer at
+//! its exact byte offset; Python reconstructs that same authored view after
+//! execution.
 //! Python addresses buffers, not tensors: `set_device_ptr(buffer, ptr, bytes)`
 //! before each execution.
 //!
@@ -766,10 +767,11 @@ fn bind(
                     )
                 })?;
                 match aliases.get(&output.graph_name) {
-                    // Python reconstructs an authored output alias as a view
-                    // of `owner` after execution. It is deliberately not a
-                    // runtime output: even at byte offset zero, different
-                    // logical views cannot all be final values of one buffer.
+                    // Python reconstructs the authored view of `owner` after
+                    // execution. It is also a real runtime output obligation:
+                    // sharing a buffer never permits the compiler to omit the
+                    // aliased logical value's write. Its exact byte offset and
+                    // own element strides state the disjoint/interleaved view.
                     Some((owner, offset)) => {
                         let buffer = if let Some(index) = translation
                             .inputs
@@ -791,12 +793,14 @@ fn bind(
                                 output.graph_name
                             )
                         };
-                        // A read-only alias is a distinct logical view even at
-                        // byte offset zero. Keep it in the declaration cone,
-                        // but never demand that the owner buffer hold several
-                        // distinct final values. Python reconstructs the view.
-                        let _ = offset;
-                        bindings.root(output.tensor);
+                        bindings.output_on_with_offset_bytes(
+                            output.tensor,
+                            buffer,
+                            layout.layout.clone(),
+                            *offset,
+                        );
+                        output_slots
+                            .insert(output.graph_name.clone(), bindings.outputs().len() - 1);
                         (buffer, layout.clone())
                     }
                     // Otherwise the caller's own fresh device allocation,
