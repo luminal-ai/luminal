@@ -237,13 +237,6 @@ def test_compile_region_uses_current_cuda_stream() -> None:
 @pytest.mark.skipif(
     _CUDA_SKIP_REASON is not None, reason=_CUDA_SKIP_REASON or "CUDA is unavailable"
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "external CUDA graph capture cannot record Luminal's nested cuGraphLaunch; "
-        "the external_cuda_graph execution path is not implemented yet"
-    ),
-)
 def test_compile_region_can_be_captured_by_pytorch() -> None:
     from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -282,6 +275,40 @@ def test_compile_region_can_be_captured_by_pytorch() -> None:
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, torch.full_like(actual, 11))
+
+
+@pytest.mark.skipif(
+    _CUDA_SKIP_REASON is not None, reason=_CUDA_SKIP_REASON or "CUDA is unavailable"
+)
+def test_captured_dynamic_region_keeps_its_parameter_staging():
+    from torch._dynamo.source import LocalSource
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    env = ShapeEnv()
+    size = env.create_symintnode(env.create_symbol(3, LocalSource("tokens")), hint=3)
+    with FakeTensorMode(shape_env=env):
+        examples = [torch.empty((size, 4), device="cuda") for _ in range(2)]
+    module = _add_graph()
+    for node, value in zip(module.graph.nodes, examples):
+        node.meta["example_value"] = value
+    region = export_region(module, examples, dynamic_range=(2, 8))
+    compiled = compile_region(
+        region, device_type="cuda", static_outputs=True, external_cuda_graph=True
+    )
+    inputs = [torch.ones((3, 4), device="cuda") for _ in range(2)]
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        compiled(*inputs)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        (output,) = compiled(*inputs)
+    with pytest.raises(ValueError, match="capture shape changed"):
+        compiled(*(torch.ones((5, 4), device="cuda") for _ in range(2)))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 2))
 
 
 @pytest.mark.skipif(

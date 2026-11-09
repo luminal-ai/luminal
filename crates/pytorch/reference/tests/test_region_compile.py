@@ -172,11 +172,18 @@ def test_compiled_artifact_serializes_structural_identity():
     )
 
 
-def test_compiled_artifact_round_trip_cpu() -> None:
+@pytest.mark.parametrize("fake_examples", [False, True])
+def test_compiled_artifact_round_trip_cpu(fake_examples) -> None:
     from luminal_reference.frontend import compile_exported
 
     inputs = [torch.randn(2, 4), torch.randn(2, 4)]
-    compiled = compile_exported(torch.export.export(_add_graph(), tuple(inputs)))
+    examples = inputs
+    if fake_examples:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with FakeTensorMode():
+            examples = [torch.empty((2, 4)) for _ in inputs]
+    compiled = compile_exported(torch.export.export(_add_graph(), tuple(examples)))
     loaded = CompiledArtifact.deserialize(
         compiled.serialize_artifact(),
     ).bind()
