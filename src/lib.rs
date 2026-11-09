@@ -5,6 +5,7 @@
 
 // Application composition utilities; compilation still handles one program.
 pub mod bucketing;
+pub mod collective;
 pub mod dtype;
 #[path = "egglog_core/egglog_utils/mod.rs"]
 pub mod egglog_utils;

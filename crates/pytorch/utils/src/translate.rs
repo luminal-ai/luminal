@@ -18,12 +18,14 @@
 use std::collections::HashMap;
 use std::mem::{Discriminant, discriminant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::prelude::*;
 use rustc_hash::FxHashMap;
 
 #[cfg(test)]
 mod add_sub_tests;
+#[cfg(test)]
+mod all_gather_tests;
 mod array_extra;
 mod attention;
 mod cat;
@@ -1103,6 +1105,23 @@ impl Translator<'_> {
         let n = &node.inputs;
 
         let value = match target {
+            "luminal_collective.all_gather.default" => {
+                let input = self.operand(&n[0])?;
+                let crate::pt2_schema::Argument::Other(ref encoded) = n[1].arg else {
+                    bail!("AllGather group must be a string")
+                };
+                let group = encoded
+                    .get("as_string")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("AllGather group must be a string"))?;
+                let width = usize::try_from(self.get_int_arg(node, 2)?)?;
+                let sequence = usize::try_from(self.get_int_arg(node, 3)?)?;
+                ensure!(
+                    !group.is_empty() && width > 0,
+                    "AllGather needs a named, nonempty group"
+                );
+                input.all_gather(group, width, sequence)
+            }
             "mvlgamma.default" => self.translate_mvlgamma(node)?,
             "lu_unpack.default" => {
                 self.translate_lu_unpack(node)?;

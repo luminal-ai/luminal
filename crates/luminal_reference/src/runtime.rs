@@ -67,6 +67,7 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
                 .and_then(|v| v.checked_add(out))
         }
         "CastGeneric" => n.checked_mul(8),
+        "AllGather" => Some(ctx.dests.iter().map(TypedBuffer::byte_len).sum()),
         "BitsToBoolsGeneric" | "BoolsToBitsGeneric" | "AndGeneric" | "OrGeneric" | "NotGeneric"
         | "BitsToBoolsView" | "BoolsToBitsView" => Some(0),
 
@@ -453,6 +454,52 @@ impl ReferenceRuntime {
         Ok(())
     }
 
+    /// The currently selected plan, including collective operation metadata.
+    pub fn plan(&self) -> Option<&BufferIrGraph<DecodedLayout>> {
+        self.plan.as_ref()
+    }
+
+    /// Compile without executing the program. Use this for collective graphs:
+    /// rank-local autotuning cannot safely run distributed operations.
+    pub fn compile(
+        &mut self,
+        bounds: &luminal::shape::SymbolBounds,
+        dims: &luminal::shape::DynMap,
+    ) -> Result<()> {
+        bounds.validate_values(dims)?;
+        let spec = self
+            .native
+            .as_ref()
+            .ok_or_else(|| anyhow!("load before compile"))?
+            .clone();
+        bounds.validate_symbols(&luminal::shape::program_dimensions(&format!(
+            "{}{}",
+            spec.bound.prefix, spec.bound.post_checks
+        ))?)?;
+        let seeds = format!("{}{}", spec.binding_seeds, bounds.egglog_seeds());
+        let text = format!(
+            "{}\n{}",
+            crate::assembled_program(),
+            spec.bound.text_with_seeds(&seeds)
+        );
+        let mut egraph = luminal::egglog_snippet::new_egraph();
+        egraph.parse_and_run_program(None, &text)?;
+        crate::decoder_registry().check(&egraph)?;
+        let snapshot = egraph.serialize_compact_filtered(|_| true);
+        let allow = spec
+            .ops
+            .unwrap_or_else(crate::runtime::reference_allow_list);
+        let plan = luminal::collective::compile_first(
+            &snapshot,
+            crate::decoder_registry(),
+            &crate::ops::built_in_matchers(),
+            &allow,
+        )?;
+        self.load_plan(plan, bounds.clone());
+        self.dims = dims.clone();
+        Ok(())
+    }
+
     /// SEARCH: one saturation to fixpoint discovers the implementations;
     /// selection then prices every candidate by EXECUTING its bufferized
     /// plan on this runtime with the given data; the winner loads.
@@ -520,6 +567,13 @@ impl ReferenceRuntime {
         let serialize_start = std::time::Instant::now();
         let mut serialized = egraph.serialize_compact_filtered(|_| true);
         let serialize_nanos = serialize_start.elapsed().as_nanos();
+        ensure!(
+            !serialized
+                .nodes
+                .values()
+                .any(|n| n.op == "LogicalAllGather"),
+            "AllGather graphs require compile(), not rank-local autotuning"
+        );
         let mut outcome = crate::search::search_implementations_with_ops(
             &mut serialized,
             &program,
@@ -1194,6 +1248,7 @@ mod tests {
         let mut allow = crate::reference_allow_list();
         allow.sort_unstable();
         let mut expected = vec![
+            "LayoutTensorOpAllGather",
             "LayoutTensorOpAndGeneric",
             "LayoutTensorOpBitsToBoolsGeneric",
             "LayoutTensorOpBitsToBoolsView",

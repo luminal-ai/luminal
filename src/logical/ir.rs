@@ -121,6 +121,12 @@ pub enum LogicalOp {
     Iota {
         value_expr: String,
     },
+    /// A rank-local input gathered and stacked in communicator order.
+    AllGather {
+        group: String,
+        width: usize,
+        sequence: usize,
+    },
     Cast(DType),
     TruncCast(DType),
     /// The explicit rounding integer -> float conversion (nearest, ties to
@@ -205,6 +211,7 @@ impl LogicalOp {
             Self::Constant(_) => "LogicalConstant",
             Self::ConstantF64(_) => "LogicalConstantF64",
             Self::Iota { .. } => "LogicalIota",
+            Self::AllGather { .. } => "LogicalAllGather",
             Self::Cast(_) => "LogicalCast",
             Self::TruncCast(_) => "LogicalTruncCast",
             Self::RoundingCast(_) => "LogicalRoundingCast",
@@ -304,14 +311,16 @@ impl LogicalOp {
             | Self::Gather
             | Self::Scatter
             | Self::Select
-            | Self::IndexMapApply { .. } => false,
+            | Self::IndexMapApply { .. }
+            | Self::AllGather { .. } => false,
         }
     }
 
     fn fixed_arity(&self) -> Option<usize> {
         Some(match self {
             Self::Input { .. } | Self::Constant(_) | Self::ConstantF64(_) | Self::Iota { .. } => 0,
-            Self::Cast(_)
+            Self::AllGather { .. }
+            | Self::Cast(_)
             | Self::TruncCast(_)
             | Self::RoundingCast(_)
             | Self::BitsToBools
@@ -685,6 +694,31 @@ impl LogicalGraph {
                 Err(reason) => {
                     self.refuse(reason);
                 }
+            }
+        }
+        if let LogicalOp::AllGather {
+            group,
+            width,
+            sequence,
+        } = &op
+        {
+            if group.is_empty()
+                || *width == 0
+                || i64::try_from(*width).is_err()
+                || i64::try_from(*sequence).is_err()
+            {
+                self.refuse("AllGather requires a named, nonempty group and an i64 sequence");
+            }
+            if self.graph.node_weights().any(|node| matches!(&node.op,
+                LogicalOp::AllGather { group: old, sequence: seq, .. } if old == group && seq == sequence)) {
+                self.refuse("AllGather sequence must be unique within its group");
+            }
+            let source = &self.graph[ids[0]];
+            let expected: Vec<_> = std::iter::once(IntExpr::from(*width))
+                .chain(source.dims.iter().copied())
+                .collect();
+            if expected != out_dims || source.dtype != out_dtype {
+                self.refuse("AllGather must prepend group size and preserve dtype");
             }
         }
         self.push(op, &ids, out_dims, out_dtype)
@@ -1250,6 +1284,15 @@ impl LogicalGraph {
                     LogicalOp::Iota { value_expr } => {
                         parts.push(value_expr.clone());
                         parts.push(shape);
+                    }
+                    LogicalOp::AllGather {
+                        group,
+                        width,
+                        sequence,
+                    } => {
+                        parts.push(serde_json::to_string(group).expect("group string"));
+                        parts.push(width.to_string());
+                        parts.push(sequence.to_string());
                     }
                     LogicalOp::Cast(dtype)
                     | LogicalOp::TruncCast(dtype)

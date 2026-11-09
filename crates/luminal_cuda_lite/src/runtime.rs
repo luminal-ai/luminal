@@ -378,6 +378,38 @@ impl CudaRuntime {
             .collect()
     }
 
+    /// Select a deterministic viable plan without running rank-local timing
+    /// loops. Collective graphs must use this entry point instead of search.
+    pub fn compile(&mut self, bounds: &shape::SymbolBounds, dims: &shape::DynMap) -> Result<()> {
+        bounds.validate_values(dims)?;
+        let (snapshot, _) = self.assemble_and_saturate(bounds)?;
+        let mut plan = luminal::collective::compile_first(
+            &snapshot,
+            &self.decoders,
+            &self.matchers,
+            &self.allow,
+        )?;
+        Self::retarget_external_outputs(&mut plan, &self.native.as_ref().unwrap().bound.outputs)?;
+        self.storage = Some(crate::storage::plan_storage(
+            &plan,
+            &bounds.ranges(),
+            &self.externals,
+        )?);
+        self.plan = Some(plan);
+        // Collective compilation installs the full authored domain as its
+        // physical allocation domain. Keep the replanning source in sync with
+        // the storage plan above: staging/arena queries deliberately rebuild
+        // from `capacity_bounds`, just like searched programs do.
+        self.capacity_bounds = bounds.clone();
+        self.bounds = bounds.clone();
+        self.dims = dims.clone();
+        #[cfg(feature = "device")]
+        if self.device.is_none() {
+            self.device = Some(crate::device::CudaDevice::new(0)?.executable());
+        }
+        Ok(())
+    }
+
     /// The SATURATED, SERIALIZED e-graph this runtime's search reads —
     /// exactly the assembly [`CudaRuntime::search`] performs (this
     /// backend's matcher vocabulary + the bound program + the schedule),
@@ -488,6 +520,13 @@ impl CudaRuntime {
         );
         let (mut serialized, program) = self.assemble_and_saturate(bounds)?;
         let capacity_bounds = crate::symbolic::initial_capacity_bounds(bounds, profile_dims)?;
+        ensure!(
+            !serialized
+                .nodes
+                .values()
+                .any(|n| n.op == "LogicalAllGather"),
+            "AllGather graphs require compile(), not rank-local autotuning"
+        );
         let shapes = crate::symbolic::ShapeEnv {
             bounds: capacity_bounds.clone(),
             values: profile_dims.clone(),
