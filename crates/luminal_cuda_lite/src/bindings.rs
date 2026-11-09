@@ -90,6 +90,51 @@ impl BoundaryLayout {
             "(union {layout} (ElementStridedLayoutLit {shape} {list} {width}))\n"
         ))
     }
+
+    /// Prove that literal strided boundary coordinates never overlap. Sorting
+    /// by stride makes the sufficient nested-span test independent of axis
+    /// order, so transposed contiguous layouts are certified too. Symbolic
+    /// cases remain unproven rather than being guessed.
+    fn is_provably_injective(&self, dims: &[IntExpr]) -> bool {
+        let Self::Strided { strides } = self else {
+            return false;
+        };
+        let Some(extents) = dims
+            .iter()
+            .map(IntExpr::to_usize)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        if extents.contains(&0) {
+            return true;
+        }
+        let mut axes = Vec::new();
+        for (&extent, stride) in extents.iter().zip(strides) {
+            if extent <= 1 {
+                continue;
+            }
+            let Some(stride) = literal_stride(stride).and_then(|v| u128::try_from(v).ok()) else {
+                return false;
+            };
+            axes.push((stride, extent as u128));
+        }
+        axes.sort_unstable_by_key(|&(stride, _)| stride);
+        let mut span = 1u128;
+        for (stride, extent) in axes {
+            if stride < span {
+                return false;
+            }
+            let Some(next) = (extent - 1)
+                .checked_mul(stride)
+                .and_then(|tail| span.checked_add(tail))
+            else {
+                return false;
+            };
+            span = next;
+        }
+        true
+    }
 }
 
 /// A stride's value where the caller stated a literal one; `None` for a
@@ -592,6 +637,14 @@ impl CudaBindings {
                 &shape,
                 &width,
             )?);
+            if bound
+                .layout
+                .is_provably_injective(graph.value_dims(bound.value))
+            {
+                prefix.push_str(&format!(
+                    "(set (injectivity-of {stem}_layout_tensor) (Injective))\n"
+                ));
+            }
             output_tensors.push(format!("{stem}_buffer_tensor"));
             let_names.entry(bound.value).or_insert(value_name);
         }
@@ -729,6 +782,38 @@ mod tests {
              (IntAffineExprNil))) (bits-of (F32)))"
         );
         assert!(prefix.contains(&expected), "{prefix}");
+    }
+
+    #[test]
+    fn a_permuted_dense_output_is_certified_injective() {
+        let mut cx = luminal::graph::Graph::new();
+        let input = cx.tensor([2, 3, 4, 2], DType::F32);
+        let output = input + 1.;
+        let mut bindings = CudaBindings::new();
+        bindings.input(input.id);
+        bindings.output_with(output.id, BoundaryLayout::strided_literal([8, 16, 2, 1]));
+        let prefix = bindings.bind(&cx.logical).unwrap().prefix;
+        let certificate = format!(
+            "(set (injectivity-of natout{}_layout_tensor) (Injective))",
+            output.id.index()
+        );
+        assert!(prefix.contains(&certificate), "{prefix}");
+    }
+
+    #[test]
+    fn an_overlapping_output_is_not_certified_injective() {
+        let mut cx = luminal::graph::Graph::new();
+        let input = cx.tensor([2, 3], DType::F32);
+        let output = input + 1.;
+        let mut bindings = CudaBindings::new();
+        bindings.input(input.id);
+        bindings.output_with(output.id, BoundaryLayout::strided_literal([1, 1]));
+        let prefix = bindings.bind(&cx.logical).unwrap().prefix;
+        let certificate = format!(
+            "(set (injectivity-of natout{}_layout_tensor) (Injective))",
+            output.id.index()
+        );
+        assert!(!prefix.contains(&certificate), "{prefix}");
     }
 
     /// TWO PLACEMENTS ON ONE BUFFER ARE REFUSED. The constructors cannot
