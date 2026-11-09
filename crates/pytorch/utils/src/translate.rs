@@ -729,6 +729,13 @@ impl Translator<'_> {
     /// than wrapping. A `SymFloat` or `SymBool` has no dimension expression
     /// and stays refused.
     fn scalar_operand(&mut self, input: &NodeInput, dtype: DType) -> Result<GraphTensor> {
+        if input
+            .arg
+            .as_value_name()
+            .is_some_and(|name| self.values.contains_key(name))
+        {
+            return self.scalar(input, dtype);
+        }
         if !matches!(input.arg, Argument::SymInt(_) | Argument::Expr(_)) {
             return self.scalar(input, dtype);
         }
