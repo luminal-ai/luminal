@@ -48,7 +48,6 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 from luminal_reference.dimensions import export_specs, profile_value
 from luminal_reference.export_utils import (
     _box_scalar_graph_outputs,
@@ -60,6 +59,7 @@ from luminal_reference.export_utils import (
     _run_decompositions_without_guards,
     private_graph_copy,
 )
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.export import export
 
 from . import _luminal
@@ -1040,9 +1040,17 @@ def compile_exported(
     # declared read/write inputs private, so trying candidates cannot mutate
     # an authored input. Per-call addresses must not survive compilation;
     # CompiledModel installs the current call's pointers later.
+    profiled_input_bindings: list[Binding] = []
     for binding in input_bindings:
         value = tensors[binding.name]
+        # Region compilation can provide metadata-only FakeTensors. They have
+        # no storage to expose, so keep their buffers private during search.
+        # This is conservative for memory accounting and the compiled model
+        # will still bind the real per-call tensor before execution.
+        if isinstance(value, FakeTensor):
+            continue
         graph.set_device_ptr(binding.buffer, value.data_ptr(), buffer_nbytes(value))
+        profiled_input_bindings.append(binding)
     try:
         graph.search(
             search_iterations,
@@ -1051,7 +1059,7 @@ def compile_exported(
             max_intermediate_bytes=max_intermediate_bytes,
         )
     finally:
-        for binding in input_bindings:
+        for binding in profiled_input_bindings:
             graph.clear_device_ptr(binding.buffer)
 
     # WHICH OUTPUTS THE PROGRAM HAS IS THE TRANSLATION'S TO SAY, not the
