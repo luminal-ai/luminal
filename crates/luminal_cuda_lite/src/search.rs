@@ -157,6 +157,16 @@ pub enum Evaluator<'a> {
         staged: &'a FxHashMap<i64, &'a crate::host_buffer::HostBuffer>,
         external_ptrs: &'a FxHashMap<i64, crate::device::ExternalPtr>,
     },
+    /// Rank-zero evaluator for a collective program. The coordinator alone
+    /// samples and ranks genomes; admitted candidates are sent to workers and
+    /// every rank enters the fixed profiling sequence together.
+    #[cfg(feature = "device")]
+    CollectiveCoordinator {
+        device: &'a mut crate::device::CudaExecutable,
+        staged: &'a FxHashMap<i64, &'a crate::host_buffer::HostBuffer>,
+        external_ptrs: &'a FxHashMap<i64, crate::device::ExternalPtr>,
+        coordinator: &'a mut crate::collective_search::Coordinator,
+    },
     /// The lifetime placeholder for builds WITHOUT the `device` feature,
     /// so [`search_implementations`]'s signature is the same in both.
     /// Searching with this placeholder always returns an error.
@@ -166,10 +176,38 @@ pub enum Evaluator<'a> {
 }
 
 impl Evaluator<'_> {
+    fn begin_collective(
+        &mut self,
+        graph: &egraph_serialize::EGraph,
+        index: &ProducerIndex,
+        options: &CompileOptions,
+        arena_budget_bytes: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "device")]
+        if let Self::CollectiveCoordinator {
+            device,
+            coordinator,
+            ..
+        } = self
+        {
+            coordinator.begin(
+                device.stream(),
+                graph,
+                index,
+                options.trials,
+                arena_budget_bytes,
+            )?;
+        }
+        let _ = (graph, index, options, arena_budget_bytes);
+        Ok(())
+    }
+
     fn arena_budget(&self, requested: Option<usize>) -> Result<usize> {
         #[cfg(feature = "device")]
         {
-            let Self::Device { device, .. } = self;
+            let device = match self {
+                Self::Device { device, .. } | Self::CollectiveCoordinator { device, .. } => device,
+            };
             let available = device.available_arena_bytes()?;
             Ok(requested.map_or(available, |limit| limit.min(available)))
         }
@@ -183,17 +221,105 @@ impl Evaluator<'_> {
     fn measure(
         &mut self,
         plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
+        genome: &Genome,
         options: &CompileOptions,
         shapes: &crate::symbolic::ShapeEnv,
         best_nanos: Option<u128>,
     ) -> Priced {
         #[cfg(feature = "device")]
         {
+            if let Self::CollectiveCoordinator {
+                device,
+                staged,
+                external_ptrs,
+                coordinator,
+            } = self
+            {
+                let stream = device.stream().clone();
+                if let Err(error) = coordinator.candidate(&stream, genome) {
+                    return Priced::PrepareFailed(format!("send collective candidate: {error:#}"));
+                }
+                let prepared = crate::profile::PreparedCandidate::new(
+                    device,
+                    plan,
+                    staged,
+                    external_ptrs,
+                    shapes,
+                    options.device_budget_bytes,
+                );
+                let local_ready = prepared.is_ok();
+                let ready = match coordinator.all_ready(&stream, local_ready) {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        return Priced::PrepareFailed(format!(
+                            "collective candidate readiness: {error:#}"
+                        ));
+                    }
+                };
+                if !ready {
+                    return Priced::PrepareFailed(match prepared {
+                        Ok(_) => "another rank could not prepare the candidate".into(),
+                        Err(error) => format!("{error:#}"),
+                    });
+                }
+                let mut prepared = prepared.expect("all ranks reported ready");
+                let mut sum = 0u128;
+                for run in crate::collective_search::fixed_profile_runs(options.trials) {
+                    let trial = Instant::now();
+                    let ran = prepared.run();
+                    let elapsed = trial.elapsed().as_nanos();
+                    let all_ran = match coordinator.all_ready(&stream, ran.is_ok()) {
+                        Ok(ready) => ready,
+                        Err(error) => {
+                            return Priced::ExecuteFailed(format!(
+                                "collective trial consensus: {error:#}"
+                            ));
+                        }
+                    };
+                    if !all_ran {
+                        return Priced::ExecuteFailed(match ran {
+                            Ok(_) => format!("another rank failed the candidate {run:?}"),
+                            Err(error) => format!("{error:#}"),
+                        });
+                    }
+                    if run == crate::collective_search::ProfileRun::Trial {
+                        let local = u64::try_from(elapsed).unwrap_or(u64::MAX);
+                        let distributed = match coordinator.max_nanos(&stream, local) {
+                            Ok(nanos) => nanos,
+                            Err(error) => {
+                                return Priced::ExecuteFailed(format!(
+                                    "collective trial timing consensus: {error:#}"
+                                ));
+                            }
+                        };
+                        sum += u128::from(distributed);
+                    }
+                }
+                if options
+                    .candidate_timeout
+                    .is_some_and(|budget| sum > budget.as_nanos())
+                {
+                    drop(prepared);
+                    device.uninstall();
+                    return Priced::TimedOut(format!(
+                        "collective candidate exceeded the timed-run budget after {} fixed trial(s), {:.3} ms elapsed",
+                        options.trials.max(1),
+                        sum as f64 / 1e6
+                    ));
+                }
+                let cost = sum / options.trials.max(1) as u128;
+                drop(prepared);
+                device.uninstall();
+                return Priced::Cost(cost);
+            }
             let Self::Device {
                 device,
                 staged,
                 external_ptrs,
-            } = self;
+            } = self
+            else {
+                unreachable!()
+            };
             let measured = crate::profile::profile_candidate_external_at(
                 device,
                 plan,
@@ -228,7 +354,7 @@ impl Evaluator<'_> {
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = (plan, options, shapes, best_nanos);
+            let _ = (plan, genome, options, shapes, best_nanos);
             Priced::PrepareFailed(
                 "candidate search requires the `device` feature and a CUDA GPU".into(),
             )
@@ -250,6 +376,18 @@ impl Evaluator<'_> {
                 staged,
                 external_ptrs,
             },
+            #[cfg(feature = "device")]
+            Evaluator::CollectiveCoordinator {
+                device,
+                staged,
+                external_ptrs,
+                coordinator,
+            } => Evaluator::CollectiveCoordinator {
+                device,
+                staged,
+                external_ptrs,
+                coordinator,
+            },
             #[cfg(not(feature = "device"))]
             Evaluator::NoDevice(marker) => Evaluator::NoDevice(*marker),
         }
@@ -258,8 +396,12 @@ impl Evaluator<'_> {
     fn external_bindings(&self) -> std::collections::BTreeSet<i64> {
         #[cfg(feature = "device")]
         {
-            let Self::Device { external_ptrs, .. } = self;
-            external_ptrs.keys().copied().collect()
+            match self {
+                Self::Device { external_ptrs, .. }
+                | Self::CollectiveCoordinator { external_ptrs, .. } => {
+                    external_ptrs.keys().copied().collect()
+                }
+            }
         }
         #[cfg(not(feature = "device"))]
         {
@@ -271,7 +413,10 @@ impl Evaluator<'_> {
     fn is_device(&self) -> bool {
         #[cfg(feature = "device")]
         {
-            matches!(self, Evaluator::Device { .. })
+            matches!(
+                self,
+                Evaluator::Device { .. } | Evaluator::CollectiveCoordinator { .. }
+            )
         }
         #[cfg(not(feature = "device"))]
         {
@@ -535,6 +680,7 @@ pub fn search_implementations(
     let mut session =
         extractor::ExtractionSession::new_with_matcher_set(egraph, allow.as_deref(), matchers);
     let index = session.producer_index();
+    evaluator.begin_collective(egraph, &index, options, arena_budget_bytes)?;
     timings.analysis_nanos = analysis_start.elapsed().as_nanos();
     // An empty index is NOT an error: a graph with no searchable producer
     // classes (pure identity — every output is an input value) has a
@@ -773,6 +919,7 @@ pub fn search_implementations(
             let profile_start = Instant::now();
             let priced = evaluator.measure(
                 &plan,
+                &genome,
                 options,
                 shapes,
                 best.as_ref().map(|incumbent| incumbent.nanos),
@@ -869,11 +1016,31 @@ pub fn finalist_validate(
 ) -> Result<(), String> {
     #[cfg(feature = "device")]
     {
+        if matches!(evaluator, Evaluator::CollectiveCoordinator { .. }) {
+            return match evaluator.measure(
+                &pending.plan,
+                &pending.genome,
+                _options,
+                &pending.shapes,
+                None,
+            ) {
+                Priced::Cost(_) => Ok(()),
+                Priced::TimedOut(error)
+                | Priced::PrepareFailed(error)
+                | Priced::ExecuteFailed(error) => Err(format!(
+                    "collective validation of ranked #{}: {error}",
+                    pending.rank
+                )),
+            };
+        }
         let Evaluator::Device {
             device,
             staged,
             external_ptrs,
-        } = evaluator;
+        } = evaluator
+        else {
+            unreachable!()
+        };
         let ran = crate::profile::warmup_candidate(
             device,
             &pending.plan,

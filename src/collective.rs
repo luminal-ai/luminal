@@ -354,15 +354,16 @@ pub fn compile_first(
     )
 }
 
-/// Refuse asynchronous rank-local profiling of collective work. Use each
-/// runtime's `compile` entry point, then execute the same program on all ranks.
+/// Refuse uncoordinated rank-local profiling of collective work. Backends may
+/// profile only through a coordinator that makes every rank enter the same
+/// candidate and fixed trial sequence.
 pub fn ensure_local_profile(
     plan: &crate::bufferize::BufferIrGraph<crate::layouts::DecodedLayout>,
 ) -> Result<()> {
     ensure!(
         !plan.dag.node_weights().any(|node| matches!(node,
         crate::bufferize::BufferNode::Compute { op, .. } if op.label() == "AllGather")),
-        "AllGather plans require compile(), not rank-local profiling"
+        "AllGather plans require coordinated profiling, not rank-local profiling"
     );
     Ok(())
 }

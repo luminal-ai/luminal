@@ -23,6 +23,15 @@ Egglog selects all operations. Bucket searches extract from range-seeded e-graph
 so implementation guards must hold throughout the interval. Representative
 shapes are used for timing, without freezing the installed plan's geometry.
 
+Collective graphs use the same implementation search. Rank zero alone runs
+saturation, memory pruning, genome sampling, extraction, ranking, and finalist
+selection. It broadcasts the pruned snapshot and each admitted genome to the
+other ranks, which only materialize that exact candidate for profiling. Every
+candidate has an all-rank preparation barrier followed by a fixed warmup/trial
+sequence; no rank can early-stop independently. Final installation also uses an
+all-rank barrier. The authored collective topology, order, dtype, and shape are
+therefore identical across candidates and ranks.
+
 The storage planner evaluates conservative interval capacities for each buffer.
 It respects the bufferizer's allocation/free events and data/anti-dependencies.
 One schedule places input uploads immediately before their first device use,

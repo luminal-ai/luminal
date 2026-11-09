@@ -85,6 +85,9 @@ impl OpMatcher for AllGatherMatcher {
             },
         ]
     }
+    fn requires_coordinated_profiling(&self) -> bool {
+        true
+    }
     fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
         let input = site.child_class(0);
         let input = site

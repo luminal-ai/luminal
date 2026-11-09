@@ -598,6 +598,14 @@ pub trait OpMatcher: std::fmt::Debug {
         Vec::new()
     }
 
+    /// Whether selecting this implementation requires every distributed rank
+    /// to enter candidate profiling in lockstep. Runtimes use this declaration
+    /// to choose a coordinated evaluator before extraction; the answer is an
+    /// implementation effect, never an operation-name convention.
+    fn requires_coordinated_profiling(&self) -> bool {
+        false
+    }
+
     /// Build the concrete instance for a matched enode. Infallible by the
     /// validity contract above.
     fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp>;

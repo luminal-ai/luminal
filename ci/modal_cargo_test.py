@@ -84,7 +84,7 @@ def run_nccl_all_gather():
         [
             "cargo", "test", "--release", "-p", "luminal_cuda_lite",
             "--features", "device", "--test", "all_gather",
-            "nccl_all_gather_replays_with_new_shapes_and_arenas",
+            "nccl_all_gather_searches_once_and_replays_on_every_rank",
             "--", "--ignored", "--nocapture",
         ],
         cwd=WORKDIR,
