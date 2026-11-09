@@ -99,6 +99,36 @@ impl BoundaryLayout {
         let Self::Strided { strides } = self else {
             return false;
         };
+        if dims.iter().any(|dim| dim.to_usize() == Some(0)) {
+            return true;
+        }
+
+        // First recognize a dense permutation symbolically: starting at
+        // stride one, repeatedly consume the axis whose stride is the product
+        // of all previously consumed extents. This proves transposes and
+        // arbitrary permutes whose strides are expressions of dynamic dims.
+        let mut remaining: Vec<_> = (0..dims.len())
+            .filter(|&axis| dims[axis].to_usize() != Some(1))
+            .collect();
+        let mut dense_span = IntExpr::from(1usize);
+        while !remaining.is_empty() {
+            let Some(position) = remaining.iter().position(|&axis| {
+                strides[axis] == dense_span
+                    || strides[axis]
+                        .simplify()
+                        .egglog_equal(dense_span.simplify())
+            }) else {
+                break;
+            };
+            let axis = remaining.remove(position);
+            dense_span *= dims[axis].clone();
+        }
+        if remaining.is_empty() {
+            return true;
+        }
+
+        // Literal layouts may be injective while containing padding. Prove
+        // those with the more general sorted-span test.
         let Some(extents) = dims
             .iter()
             .map(IntExpr::to_usize)
@@ -106,9 +136,6 @@ impl BoundaryLayout {
         else {
             return false;
         };
-        if extents.contains(&0) {
-            return true;
-        }
         let mut axes = Vec::new();
         for (&extent, stride) in extents.iter().zip(strides) {
             if extent <= 1 {
@@ -772,7 +799,12 @@ mod tests {
                 strides: vec![IntExpr::from(1i64), IntExpr::from('n')],
             },
         );
-        bindings.output(out.id);
+        bindings.output_with(
+            out.id,
+            BoundaryLayout::Strided {
+                strides: vec![IntExpr::from(1i64), IntExpr::from('n')],
+            },
+        );
         let prefix = bindings.bind(&cx.logical).unwrap().prefix;
         let shape = cx.logical.value_shape_term(x.id).unwrap();
         let expected = format!(
@@ -782,6 +814,13 @@ mod tests {
              (IntAffineExprNil))) (bits-of (F32)))"
         );
         assert!(prefix.contains(&expected), "{prefix}");
+        assert!(
+            prefix.contains(&format!(
+                "(set (injectivity-of natout{}_layout_tensor) (Injective))",
+                out.id.index()
+            )),
+            "the symbolic dense permutation must be certified: {prefix}"
+        );
     }
 
     #[test]
