@@ -10,8 +10,9 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, cuda_type, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, cuda_type, elementwise, unary};
 use anyhow::Result;
+use luminal::dtype::PlanDtype;
 
 /// `CastGeneric(input) -> out` — pure dataflow form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +95,49 @@ impl LayoutIrOp for CastDps {}
 impl KernelOp for CastDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
         let to = cuda_type(ctx.dest_dtypes[0])?;
+        // FP8 is byte storage, never integer arithmetic. Decode explicitly
+        // when widening; formats with unsigned zero have a different bias
+        // and NaN encoding from their similarly named FN counterparts.
+        let format = match ctx.operand_dtypes[0] {
+            PlanDtype::F8E4M3FN => Some((3, 7, false, true)),
+            PlanDtype::F8E5M2 => Some((2, 15, false, false)),
+            PlanDtype::F8E4M3FNUZ => Some((3, 8, true, false)),
+            PlanDtype::F8E5M2FNUZ => Some((2, 16, true, false)),
+            _ => None,
+        };
+        if let Some((mantissa, bias, unsigned_zero, finite)) = format {
+            let mut kernels = elementwise(
+                ctx,
+                &format!("({to})decode_fp8(a[i])"),
+                &["a"],
+                "const unsigned char* a",
+                to,
+            )?;
+            let helper = format!(
+                r#"__device__ float decode_fp8(unsigned char bits) {{
+    const int m = {mantissa};
+    const int fraction = bits & ((1 << m) - 1);
+    const int exponent = (bits & 127) >> m;
+    if ({unsigned_zero} && bits == 128) return nanf("");
+    if (!{unsigned_zero} && exponent == (127 >> m)) {{
+        if ({finite}) {{
+            if (fraction == (1 << m) - 1) return nanf("");
+        }} else {{
+            float infinity = __uint_as_float(0x7f800000u);
+            return fraction ? nanf("") : (bits & 128 ? -infinity : infinity);
+        }}
+    }}
+    float value = ldexpf((float)(fraction + (exponent ? 1 << m : 0)),
+                        (exponent ? exponent : 1) - {bias} - m);
+    return bits & 128 ? -value : value;
+}}
+"#
+            );
+            for kernel in &mut kernels {
+                kernel.source.insert_str(0, &helper);
+            }
+            return Ok(kernels);
+        }
         unary(ctx, &format!("({to})a[i]"))
     }
 }

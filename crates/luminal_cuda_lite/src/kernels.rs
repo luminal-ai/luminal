@@ -710,7 +710,7 @@ pub(crate) fn ternary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>>
 ///
 /// Inputs must match the output shape. Egglog rules require contiguous
 /// row-major destinations.
-fn elementwise(
+pub(crate) fn elementwise(
     ctx: &CodegenCtx,
     expr: &str,
     names: &[&str],
