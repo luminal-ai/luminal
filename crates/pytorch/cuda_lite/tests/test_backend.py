@@ -260,8 +260,8 @@ def test_dynamic_batch_output_is_returned_at_eagers_strides():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_transposed_output_keeps_eagers_strides():
     """Eager lays this output out the way its operands are laid out, so it
-    is column-major, and the output is bound at those exact strides. No
-    generic copy writes that exact injective destination layout."""
+    is column-major, and the output is bound at those exact strides. Generic
+    copy writes through that exact injective destination layout."""
 
     def fn(a, b):
         return a.t() + b.t()
@@ -276,12 +276,10 @@ def test_transposed_output_keeps_eagers_strides():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_writeback_into_transposed_input_finds_no_plan_naming_the_output():
+def test_writeback_into_transposed_input_uses_its_exact_layout():
     """A writeback is bound at its target's chain — here the transposed
-    strides — and whether any kernel writes that layout is the SEARCH's
-    question, never a prior taken at bind. Today none does, so the search
-    plans nothing and says which output, at which layout, it found no plan
-    for."""
+    strides. Generic copy writes through that injective destination, preserving
+    both mutation semantics and the caller's physical layout."""
 
     def fn(x):
         x.add_(1)
@@ -289,10 +287,13 @@ def test_writeback_into_transposed_input_finds_no_plan_naming_the_output():
 
     torch.manual_seed(0)
     x = torch.randn(8, 4, device="cuda").t()
-    with pytest.raises(
-        Exception, match=r"no plan writes the bound outputs: v\d+ at Strided"
-    ):
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+    strides = x.stride()
+    expected_x = x + 1
+    expected = expected_x * 2
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+    assert x.stride() == strides
+    torch.testing.assert_close(x, expected_x)
+    torch.testing.assert_close(got, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
