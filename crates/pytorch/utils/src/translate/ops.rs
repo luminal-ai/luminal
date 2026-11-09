@@ -279,35 +279,32 @@ impl Translator<'_> {
 
     pub(super) fn translate_expand(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let target = match self.resolve_shape_arg(node, 1) {
-            Some(target) => target,
-            None => self
-                .get_ints_arg(node, 1)?
-                .into_iter()
-                .map(IntExpr::from)
-                .collect(),
-        };
-        let dims = x.dims();
+        // The result metadata has already applied expand's `-1` keep-axis
+        // spelling and retains compound dynamic extents such as `s + 1`.
+        // Reading the raw size list can mistake an unbacked SymInt hint for
+        // the literal extent (the growing-cache path used to turn `s + 1`
+        // into `1`), which attempts to shrink a non-unit axis.
+        let name = Self::tensor_output_names(node)
+            .into_iter()
+            .next()
+            .context("expand has no output metadata")?;
+        let mut target = self.tensor_meta_to_shape(self.tensor_meta(&name)?)?;
         let rank = target.len();
-        let neg1 = IntExpr::from(-1i32);
-        let mut aligned = vec![IntExpr::from(1); rank];
-        for (i, size) in target.iter().enumerate() {
-            let from_end = rank - i;
-            aligned[i] = if *size == neg1 {
-                if from_end <= dims.len() {
-                    dims[dims.len() - from_end]
-                } else {
-                    IntExpr::from(1)
-                }
-            } else {
-                *size
-            };
-        }
         let mut out = x;
         while out.rank() < rank {
             out = out.expand_dim(0, 1usize);
         }
-        Ok(out.expand(aligned))
+        for (axis, source) in out.dims().into_iter().enumerate() {
+            if source.simplify().as_num() != Some(1) {
+                // Dynamo can leave the first decode's literal sequence hint
+                // in repeat_kv's expand list even after the cache extent is
+                // promoted to `s + 1`. Expand can only change a proven unit
+                // axis; every non-unit (including symbolic) source axis is
+                // necessarily a keep-axis on every valid invocation.
+                target[axis] = source;
+            }
+        }
+        Ok(out.expand(target))
     }
 
     pub(super) fn translate_repeat(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -497,52 +494,58 @@ impl Translator<'_> {
     // ---------------------------------------------------------------
 
     pub(super) fn translate_full(&mut self, node: &Node, like: bool) -> Result<GraphTensor> {
-        let (shape, dtype, value) = if like {
+        let (shape, dtype, value_index) = if like {
             let x = self.operand(&node.inputs[0])?;
             let meta = self.output_meta_dtype(node).unwrap_or(x.dtype);
-            (x.dims(), meta, self.get_number_arg(node, 1)?)
+            (x.dims(), meta, 1)
         } else {
             let shape = self.get_int_exprs_arg(node, 0)?;
-            (
-                shape,
-                self.output_meta_dtype(node)?,
-                self.get_number_arg(node, 1)?,
-            )
+            (shape, self.output_meta_dtype(node)?, 1)
         };
-        Ok(self.full_tensor(shape, dtype, value))
+        let input = &node.inputs[value_index];
+        let value = if let Some(name) = input.arg.as_value_name() {
+            let value = self
+                .values
+                .get(name)
+                .copied()
+                .with_context(|| format!("{} names unknown scalar {name}", node.target))?;
+            super::convert(value, dtype)
+        } else {
+            self.typed_scalar(self.get_number_arg(node, value_index)?, dtype)
+        };
+        Ok(value.expand_rhs(shape))
     }
 
     pub(super) fn translate_arange(&mut self, node: &Node, _kind: u8) -> Result<GraphTensor> {
         let dtype = self.output_meta_dtype(node)?;
         // PT2 omits default arguments. Read by schema name, and preserve
         // symbolic scalar operands rather than interpreting them as literals.
-        let argument = |name: &str, default: i64| -> Result<IntExpr> {
+        // A Python float remains F64 through the progression and is converted
+        // only at the declared output boundary; integer/symbolic progressions
+        // stay in exact IntExpr arithmetic.
+        enum ArangeArg {
+            Integer(IntExpr),
+            Float(f64),
+        }
+        let argument = |name: &str, default: i64| -> Result<ArangeArg> {
             let Some(input) = node.inputs.iter().find(|input| input.name == name) else {
-                return Ok(IntExpr::from(default));
+                return Ok(ArangeArg::Integer(IntExpr::from(default)));
             };
+            if let Some(value) = input.arg.as_float() {
+                return Ok(ArangeArg::Float(value));
+            }
+            if let Some(value) = input.arg.as_bool() {
+                return Ok(ArangeArg::Integer(IntExpr::from(i64::from(value))));
+            }
             self.resolve_arg_as_expression(&input.arg)
-                .or_else(|| {
-                    input
-                        .arg
-                        .as_float()
-                        .filter(|v| {
-                            v.is_finite()
-                                && v.fract() == 0.0
-                                && *v >= i64::MIN as f64
-                                && *v < -(i64::MIN as f64)
-                        })
-                        .map(|v| IntExpr::from(v as i64))
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{}: {name} must be an integer or supported symbolic integer",
-                        node.target
-                    )
-                })
+                .map(ArangeArg::Integer)
+                .ok_or_else(|| anyhow::anyhow!("{}: unsupported {name} argument", node.target))
         };
         let start = argument("start", 0)?;
         let step = argument("step", 1)?;
-        if step.as_num() == Some(0) {
+        if matches!(&step, ArangeArg::Integer(value) if value.as_num() == Some(0))
+            || matches!(&step, ArangeArg::Float(value) if *value == 0.0)
+        {
             bail!("arange step must be nonzero");
         }
         // Export provides the exact extent, including ceil division for
@@ -553,10 +556,47 @@ impl Translator<'_> {
             .ok_or_else(|| anyhow::anyhow!("arange has no output metadata"))?;
         let meta = self.tensor_meta(&name)?.clone();
         let shape = self.boundary_shape(&meta, &name)?;
-        let arange = self
-            .cx
-            .iota(shape, move |coordinates| coordinates[0] * step + start);
-        Ok(arange.cast(dtype))
+        match (start, step) {
+            (ArangeArg::Integer(start), ArangeArg::Integer(step)) => Ok(self
+                .cx
+                .iota(shape, move |coordinates| coordinates[0] * step + start)
+                .cast(dtype)),
+            (start, step) => {
+                let coordinate = self
+                    .cx
+                    .iota(shape, |coordinates| coordinates[0])
+                    .cast(DType::F64);
+                let mut materialize = |value| match value {
+                    ArangeArg::Integer(expr) => self.cx.constant_i32(expr).cast(DType::F64),
+                    ArangeArg::Float(value) => self.cx.constant_f64(value),
+                };
+                let start = materialize(start);
+                let step = materialize(step);
+                let shape = coordinate.dims();
+                let integer_output = matches!(
+                    dtype,
+                    DType::Int
+                        | DType::I64
+                        | DType::U64
+                        | DType::I8
+                        | DType::U8
+                        | DType::I16
+                        | DType::U16
+                );
+                if integer_output {
+                    // ATen converts float start/step scalars to the declared
+                    // integer dtype before forming the progression.
+                    let coordinate = coordinate.trunc_cast(dtype);
+                    let start = start.trunc_cast(dtype).expand_rhs(shape.clone());
+                    let step = step.trunc_cast(dtype).expand_rhs(shape);
+                    Ok(coordinate * step + start)
+                } else {
+                    let start = start.expand_rhs(shape.clone());
+                    let step = step.expand_rhs(shape);
+                    Ok((coordinate * step + start).cast(dtype))
+                }
+            }
+        }
     }
 
     /// `zeros_like`/`ones_like`: a full tensor at the operand's own dims.
@@ -633,12 +673,18 @@ impl Translator<'_> {
 
     pub(super) fn translate_softmax(&mut self, node: &Node, log: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
+        // ATen treats a scalar's dim 0/-1 as a singleton axis. Lower that
+        // axis explicitly so max/sum stay in range and infinities retain
+        // the same IEEE behavior as a length-one softmax.
+        let scalar = x.rank() == 0;
+        let x = if scalar { x.expand_dim(0, 1usize) } else { x };
         let dim = normalize_dim(self.get_int_arg(node, 1)?, x.rank());
-        Ok(if log {
+        let result = if log {
             x.log_softmax(vec![dim])
         } else {
             x.softmax(vec![dim])
-        })
+        };
+        Ok(if scalar { result.squeeze(0) } else { result })
     }
 
     /// `embedding(weight, indices)`: coordinate gather over `[rows, cols]`.
@@ -659,11 +705,12 @@ impl Translator<'_> {
     pub(super) fn translate_item(&mut self, node: &Node) -> Result<()> {
         let x = self.operand(&node.inputs[0])?;
         let scalar = util::reshape_tensor(x, &[]);
-        let names = Self::tensor_output_names(node);
-        let name = names
+        let name = node
+            .outputs
             .first()
+            .and_then(|output| output.value_name())
             .context("item is missing its scalar output name")?
-            .clone();
+            .to_string();
         self.values.insert(name, scalar);
         Ok(())
     }

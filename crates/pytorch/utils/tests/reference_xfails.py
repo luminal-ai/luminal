@@ -179,8 +179,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         reason=("PT2 translator does not port this ATen variant yet"),
         tests=(
             "test_constructors.py::test_full_supports_symbolic_shapes",
-            "test_dtype_boundary.py::test_arange_uses_exported_shape_and_declared_dtype[bool-scalars]",
-            "test_dtype_boundary.py::test_arange_uses_exported_shape_and_declared_dtype[empty]",
             "test_dtype_boundary.py::test_arange_uses_exported_shape_and_declared_dtype[fractional-to-int]",
             "test_fft.py::test_stft_decomposition_uses_composed_r2c_lowering",
             "test_hlir_ops.py::test_onehot",

@@ -105,15 +105,19 @@ def test_composed_real_reductions_match_eager():
 
 class ScalarLogSoftmax(torch.nn.Module):
     def forward(self, value):
-        return torch.ops.aten._log_softmax.default(value, 0, False)
+        return (
+            torch.ops.aten._log_softmax.default(value, 0, False),
+            torch.ops.aten._softmax.default(value, -1, False),
+        )
 
 
 def test_scalar_log_softmax_preserves_ieee_behavior():
     module = ScalarLogSoftmax()
-    for value in (torch.tensor(2.0), torch.tensor(float("inf"))):
+    for value in map(torch.tensor, (2.0, float("inf"), float("-inf"), float("nan"))):
         expected = module(value)
-        (actual,) = _compile_and_run(module, value)
-        torch.testing.assert_close(actual, expected, equal_nan=True)
+        actual = _compile_and_run(module, value)
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(result, reference, equal_nan=True)
 
 
 class ComplexComposedReductions(torch.nn.Module):
