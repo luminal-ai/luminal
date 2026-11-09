@@ -46,7 +46,7 @@
 ; adding unrestricted scalar reassociation to the global e-graph.
 (rule
   (
-    (index-map-bound-output ?out-logical)
+    (index-map-bound-read-only-alias-output ?out-logical)
     (= ?out-layout-tensor (LayoutTensorLit ?out-logical ?out-layout))
   )
   ((element-stride-discovery-demand ?out-layout))

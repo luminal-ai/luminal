@@ -6,8 +6,36 @@
 (relation index-map-entry-subst-demand (IntExprList IndexMap))
 (relation index-map-entry-subst-complete (IntExprList IndexMap))
 (relation index-map-entry-subst-result (IntExprList IndexMap IntExprList))
+(relation index-map-input-list (BufferTensorList))
+(relation index-map-read-only-input-buffer (BufferId))
 (relation index-map-bound-output-list (BufferTensorList))
 (relation index-map-bound-output (LogicalTensor))
+(relation index-map-bound-read-only-alias-output (LogicalTensor))
+
+(rule
+  ((= ?boundary (BufferInputLit ?inputs)))
+  ((index-map-input-list ?inputs))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: mark the input list"
+)
+
+(rule
+  ((index-map-input-list (BufferTensorCons ?head ?tail)))
+  ((index-map-input-list ?tail))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: walk the input suffix"
+)
+
+(rule
+  (
+    (index-map-input-list (BufferTensorCons ?head ?tail))
+    (= ?head (BufferTensorLit ?layout-tensor ?buffer))
+    (= (buffer-access-of ?buffer) (ReadOnly))
+  )
+  ((index-map-read-only-input-buffer ?buffer))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: mark a read-only input buffer"
+)
 
 (rule
   ((= ?boundary (BufferOutputLit ?outputs)))
@@ -28,6 +56,22 @@
   )
   :ruleset main_ruleset
   :name "index_map_apply/compose: mark one bound output and walk the suffix"
+)
+
+; A logical output bound onto the same read-only buffer as an input must be a
+; zero-write alias.  This marker scopes the optional affine-layout proof to the
+; physical boundary case that needs it; unrelated ordinary outputs must not
+; enter that proof stratum.
+(rule
+  (
+    (index-map-bound-output-list (BufferTensorCons ?head ?tail))
+    (= ?head (BufferTensorLit ?layout-tensor ?buffer))
+    (= ?layout-tensor (LayoutTensorLit ?logical ?layout))
+    (index-map-read-only-input-buffer ?buffer)
+  )
+  ((index-map-bound-read-only-alias-output ?logical))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: mark a bound read-only alias output"
 )
 
 (rule
