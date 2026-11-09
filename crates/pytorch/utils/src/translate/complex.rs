@@ -8,8 +8,8 @@
 //! This is the recorder-frontend port of the parked HLIR translator's
 //! `translator/complex.rs`. The structural `ComplexTensor`, the target
 //! routing, and the arithmetic / elementary / movement / reduction surface
-//! are ported here; the remaining target families (FFT/DFT, index/scatter,
-//! cumulative scan, variance, and `linalg_vector_norm`/`dist` still bail
+//! are ported here; the remaining target families (index/scatter, cumulative
+//! scan, variance, and `linalg_vector_norm`/`dist`) still bail
 //! explicitly with the ATen target name.
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -212,6 +212,15 @@ impl Translator<'_> {
             .unwrap_or(&node.target);
 
         match target {
+            "_fft_c2c.default" | "_fft_r2c.default" | "_fft_c2r.default" => {
+                self.translate_fourier(node, output_name, target)?
+            }
+            "index_select.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let value = value
+                    .try_map(|component| self.translate_index_select_value(component, node))?;
+                self.store_complex(output_name, value);
+            }
             // ---- arithmetic ----
             "add.Tensor" | "sub.Tensor" | "mul.Tensor" | "div.Tensor" => {
                 let op = match target {
@@ -901,7 +910,7 @@ impl Translator<'_> {
                 let fill = if node.inputs.len() > 2 {
                     self.complex_constructor_scalar_arg(node, 2, value.torch_dtype)?
                 } else {
-                    self.complex_constant_like(value.real, 0.0, 0.0, value.torch_dtype)
+                    self.complex_constant_scalars(0.0, 0.0, value.torch_dtype)?
                 };
                 self.store_complex(
                     output_name,
@@ -1754,6 +1763,145 @@ impl Translator<'_> {
     // ---------------------------------------------------------------
     // Movement / reductions / matmul helpers
     // ---------------------------------------------------------------
+
+    /// Apply one exact complex DFT axis using the logical real-component
+    /// representation. The source axis is expanded into separate output- and
+    /// input-frequency axes, then the input axis is reduced. Keeping the
+    /// authored axis order avoids making a computed result depend on a
+    /// transposed-output materialization while still exposing ordinary
+    /// elementwise and reduction operations to backend matching.
+    fn complex_dft_axis(
+        &mut self,
+        value: ComplexTensor,
+        axis: usize,
+        forward: bool,
+    ) -> ComplexTensor {
+        let original = value.real.dims();
+        let length = original[axis];
+        let mut expanded_shape = original.clone();
+        expanded_shape.insert(axis, length);
+        let input_axis = axis + 1;
+        let matrix =
+            value.map(|component| component.unsqueeze(axis).expand(expanded_shape.clone()));
+        let phases = self
+            .cx
+            .iota(expanded_shape, |coords| coords[axis] * coords[input_axis])
+            .cast(value.real.dtype);
+        let tau = self
+            .floating_scalar(
+                if forward {
+                    -std::f64::consts::TAU
+                } else {
+                    std::f64::consts::TAU
+                },
+                value.real.dtype,
+            )
+            .expand_rhs(phases.dims());
+        let phase = phases * tau / length;
+        let quarter = self.constant_like(phase, std::f64::consts::FRAC_PI_2);
+        let cosine = (quarter - phase).sin();
+        let sine = phase.sin();
+        let real = (matrix.real * cosine - matrix.imag * sine).sum(&[input_axis]);
+        let imag = (matrix.real * sine + matrix.imag * cosine).sum(&[input_axis]);
+        ComplexTensor::new(real, imag, value.torch_dtype)
+    }
+
+    /// Lower ATen's three primitive FFT spellings to real arithmetic before
+    /// HLIR. This preserves the authored direction, normalization, Hermitian
+    /// endpoint behavior, axes, dtypes, and symbolic transform lengths.
+    fn translate_fourier(&mut self, node: &Node, output_name: &str, target: &str) -> Result<()> {
+        let axes_raw = self.get_ints_arg(node, 1)?;
+        let input_name = self.input_value_name(node, 0)?.to_string();
+        let mut value = if target == "_fft_r2c.default" {
+            let dtype = self.output_complex_dtype(output_name)?;
+            self.value_as_complex(&input_name, dtype)?
+        } else {
+            self.get_complex(&input_name)?
+        };
+        let axes: Vec<_> = axes_raw
+            .iter()
+            .map(|&axis| normalize_dim(axis, value.real.rank()))
+            .collect();
+        let last = *axes
+            .last()
+            .context("FFT needs at least one transform axis")?;
+        let normalization = self.get_int_arg(node, 2)?;
+        let c2r = target == "_fft_c2r.default";
+        let forward = target == "_fft_r2c.default"
+            || (target == "_fft_c2c.default" && self.get_bool_arg(node, 3)?);
+        let mut full_shape = value.real.dims();
+        if c2r {
+            full_shape[last] = self.output_meta_shape(node)?[last];
+        }
+        let count = super::dim_arith::product_of_dims(axes.iter().map(|&axis| full_shape[axis]));
+        if c2r {
+            // Undo every outer transform before restoring Hermitian pairs on
+            // the final axis; conjugation then applies independently per row.
+            for &axis in &axes[..axes.len() - 1] {
+                value = self.complex_dft_axis(value, axis, false);
+            }
+            let length = full_shape[last];
+            let coords: Vec<_> = (0..full_shape.len())
+                .map(|axis| {
+                    self.cx.iota(full_shape.clone(), |coord| {
+                        if axis == last {
+                            coord[axis].min(length - coord[axis])
+                        } else {
+                            coord[axis]
+                        }
+                    })
+                })
+                .collect();
+            let positions = self.cx.iota(full_shape.clone(), |coord| coord[last]);
+            let real = value.real.gather(&coords);
+            let imag = value.imag.gather(&coords);
+            let half = self
+                .cx
+                .constant_i32(length / 2)
+                .expand_rhs(full_shape.clone());
+            let reflected = positions.gt(half);
+            let imag = self.select(reflected, -imag, imag);
+            let zero_index = self.cx.constant_i32(0).expand_rhs(full_shape.clone());
+            let dc = positions.eq(zero_index);
+            let n = self.cx.constant_i32(length).expand_rhs(full_shape.clone());
+            let nyquist = (positions * 2).eq(n);
+            let endpoint = self.bool_or(dc, nyquist);
+            let zero = self.full_tensor(full_shape, imag.dtype, 0.0);
+            let imag = self.select(endpoint, zero, imag);
+            value = self.complex_dft_axis(
+                ComplexTensor::new(real, imag, value.torch_dtype),
+                last,
+                false,
+            );
+        } else {
+            for &axis in &axes {
+                value = self.complex_dft_axis(value, axis, forward);
+            }
+            if target == "_fft_r2c.default" && self.get_bool_arg(node, 3)? {
+                let end = value.real.dims()[last] / 2 + 1;
+                value = value.map(|component| component.slice_along(IntExpr::from(0)..end, last));
+            }
+        }
+        if normalization != 0 {
+            anyhow::ensure!(
+                normalization == 1 || normalization == 2,
+                "invalid FFT normalization"
+            );
+            let divisor = self.cx.constant_i32(count).cast(value.real.dtype);
+            let divisor = if normalization == 1 {
+                divisor.sqrt()
+            } else {
+                divisor
+            };
+            value = value.map(|component| component / divisor.expand_rhs(component.dims()));
+        }
+        if c2r {
+            self.values.insert(output_name.to_string(), value.real);
+        } else {
+            self.store_complex(output_name, value);
+        }
+        Ok(())
+    }
 
     fn expand_complex_component(&self, mut value: GraphTensor, node: &Node) -> Result<GraphTensor> {
         let raw: Vec<IntExpr> = match self.resolve_shape_arg(node, 1) {

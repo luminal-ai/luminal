@@ -746,6 +746,17 @@ impl Translator<'_> {
     /// is rank 0 or 1; the output replaces `dim` with the index extent.
     pub(super) fn translate_index_select(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
+        self.translate_index_select_value(x, node)
+    }
+
+    /// The dtype-agnostic `index_select` geometry. Complex lowering invokes
+    /// this once for each real component so both components use exactly the
+    /// same authored index tensor and axis semantics.
+    pub(super) fn translate_index_select_value(
+        &mut self,
+        x: GraphTensor,
+        node: &Node,
+    ) -> Result<GraphTensor> {
         if x.rank() == 0 {
             if !self.output_meta_shape(node)?.is_empty() {
                 bail!("index_select on a scalar must produce a scalar");

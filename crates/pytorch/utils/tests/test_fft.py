@@ -225,7 +225,7 @@ class InverseShortTimeFourierTransform(torch.nn.Module):
 
 
 def test_istft_decomposition_accumulates_overlapping_inverse_fft_frames():
-    generator = torch.Generator().manual_seed(7)
+    generator = torch.Generator(device=torch.get_default_device()).manual_seed(7)
     value = torch.complex(
         torch.randn((5, 7), generator=generator),
         torch.randn((5, 7), generator=generator),
