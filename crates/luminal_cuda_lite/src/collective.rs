@@ -29,7 +29,8 @@ mod native {
         pub fn unique_id() -> Result<[u8; 128]> {
             Ok(result::get_uniqueid()
                 .map_err(|e| anyhow!("NCCL unique id: {e:?}"))?
-                .internal)
+                .internal
+                .map(|byte| byte.to_ne_bytes()[0]))
         }
         /// Collective initialization: all ranks must enter concurrently. Rank
         /// order determines the leading output axis. No tensor data uses TCP.
