@@ -223,15 +223,19 @@ def test_writes_through_storage_sharing_inputs_are_refused_by_name():
 
 
 @cuda
-def test_returned_view_at_a_storage_offset_is_refused_by_name():
-    """Until the boundary can state a base offset (LUM-852) this is a named
-    refusal, never a tensor holding the wrong row."""
+def test_returned_view_at_a_storage_offset_aliases_the_input():
+    """An offset boundary view keeps eager's value, layout, and storage."""
 
     def fn(x):
         return x[1]
 
-    with pytest.raises(Exception, match="storage offset"):
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(_x())
+    (out,), (x,) = _same_as_eager(fn, _x)
+    assert out.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+    assert out.data_ptr() == x.data_ptr() + x.stride(0) * x.element_size()
+    before = x.clone()
+    out.add_(10)
+    torch.testing.assert_close(x[0], before[0])
+    torch.testing.assert_close(x[1], before[1] + 10)
 
 
 @cuda
@@ -251,7 +255,9 @@ def test_computed_output_views_share_storage_and_write_every_offset():
 
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1])
-    assert actual[0].untyped_storage().data_ptr() == actual[1].untyped_storage().data_ptr()
+    assert (
+        actual[0].untyped_storage().data_ptr() == actual[1].untyped_storage().data_ptr()
+    )
     assert actual[1].data_ptr() == actual[0].data_ptr() + actual[0].element_size()
 
 
