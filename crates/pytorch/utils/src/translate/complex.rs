@@ -1670,6 +1670,28 @@ impl Translator<'_> {
         let mut acos_real = acos_beta;
         let mut acos_imag = signed_acosh * -1.0;
 
+        // PyTorch's x86-64 CPU complex128 kernel canonicalizes the imaginary
+        // result to +0 on the interior real-axis branch. Its complex64 kernel
+        // and the AArch64 kernels retain the C99 sign selected above. This is
+        // observable model behavior, so match the authored CPU kernel instead
+        // of treating the two zero encodings as interchangeable.
+        if cfg!(target_arch = "x86_64")
+            && self
+                .device
+                .as_ref()
+                .is_some_and(|device| device.kind == "cpu")
+            && value.real.dtype == DType::F64
+        {
+            let on_real_axis = self.is_zero(value.imag);
+            let inside_branch_cut = cx_bool_and(value.real.gt(one * -1.0), value.real.lt(one));
+            let canonical_zero = self.constant_like(acos_imag, 0.0);
+            acos_imag = self.cx_select(
+                cx_bool_and(on_real_axis, inside_branch_cut),
+                canonical_zero,
+                acos_imag,
+            );
+        }
+
         let real_zero = self.is_zero(value.real);
         let zero_with_nan_imag = cx_bool_and(real_zero, imag_nan);
         let half_pi = self.constant_like(acos_real, std::f64::consts::FRAC_PI_2);
