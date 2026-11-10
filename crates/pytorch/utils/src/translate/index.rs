@@ -1283,6 +1283,70 @@ impl Translator<'_> {
         })
     }
 
+    /// Complex `index_put` over the two real component tensors. The index
+    /// geometry is authored once and applied identically to both components;
+    /// accumulating duplicate destinations is complex addition, so the two
+    /// ordered real sums are exactly the componentwise lowering.
+    pub(super) fn translate_complex_index_put_components(
+        &mut self,
+        node: &Node,
+        real: GraphTensor,
+        imag: GraphTensor,
+        update_real: GraphTensor,
+        update_imag: GraphTensor,
+    ) -> Result<(GraphTensor, GraphTensor)> {
+        let accumulate = node
+            .inputs
+            .get(3)
+            .and_then(|input| input.arg.as_bool())
+            .unwrap_or(false);
+        let entries = Self::idx_entries(node)?;
+        let present: Vec<&String> = entries.iter().flatten().collect();
+        if present.is_empty() {
+            bail!("complex index_put: no index tensors");
+        }
+
+        let mut index_for_dim: Vec<Option<GraphTensor>> = vec![None; real.rank()];
+        let mut indexed = Vec::new();
+        for (dim, name) in entries.iter().enumerate() {
+            let Some(name) = name else { continue };
+            if dim >= real.rank() {
+                bail!(
+                    "complex index_put: index dim {dim} out of range for rank {}",
+                    real.rank()
+                );
+            }
+            let index = self
+                .values
+                .get(name)
+                .copied()
+                .with_context(|| format!("complex index_put: unknown index tensor {name}"))?;
+            if index.dtype == DType::Bool {
+                bail!("complex index_put with a boolean mask is not ported");
+            }
+            index_for_dim[dim] = Some(self.idx_normalize(index.cast(DType::Int), real.dims()[dim]));
+            indexed.push(dim);
+        }
+
+        let bshape = self.idx_broadcast_indices(&mut index_for_dim);
+        let (out_dims, block_start, basic) = idx_advanced_layout(&real.dims(), &indexed, &bshape);
+        let plan = self.idx_advanced_plan(&out_dims, block_start, &basic, &index_for_dim);
+        let update_real = self.idx_broadcast_to(update_real.cast(real.dtype), &out_dims);
+        let update_imag = self.idx_broadcast_to(update_imag.cast(imag.dtype), &out_dims);
+        if accumulate {
+            Ok((
+                self.idx_scatter_reduce(real, plan.clone(), update_real, IdxReduce::Sum, true)?,
+                self.idx_scatter_reduce(imag, plan, update_imag, IdxReduce::Sum, true)?,
+            ))
+        } else {
+            let coords = self.idx_coordinate_tensors(&plan, &out_dims);
+            Ok((
+                real.scatter(&coords, update_real),
+                imag.scatter(&coords, update_imag),
+            ))
+        }
+    }
+
     /// `index_reduce.default`: reduce `source` into `data` along `dim`
     /// using the 1-D `index` (no duplicates ordering issues beyond
     /// scatter-reduce's sequential semantics).
