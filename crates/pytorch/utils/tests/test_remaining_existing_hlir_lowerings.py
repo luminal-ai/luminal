@@ -148,7 +148,7 @@ def _wide_hypot_operands(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor
     info = torch.finfo(dtype)
     low = math.floor(math.log2(info.smallest_normal * info.eps))
     high = math.floor(math.log2(info.max))
-    generator = torch.Generator().manual_seed(0)
+    generator = torch.Generator(device=torch.get_default_device()).manual_seed(0)
 
     def draw() -> torch.Tensor:
         mantissa = torch.rand(64, generator=generator, dtype=torch.float64) * 2 - 1
@@ -690,19 +690,29 @@ def _uniform_edge_range(generator, dtype, *, tiny):
     """
 
     def uniform(low, high):
-        unit = torch.rand((), generator=generator, dtype=torch.float64).item()
+        unit = torch.rand(
+            (), generator=generator, dtype=torch.float64, device="cpu"
+        ).item()
         return low + (high - low) * unit
 
-    scale = 10.0 ** torch.randint(-6, 7, (), generator=generator).item()
-    lower = torch.tensor(uniform(-10.0, 10.0) * scale, dtype=dtype)
+    scale = 10.0 ** torch.randint(-6, 7, (), generator=generator, device="cpu").item()
+    lower = torch.tensor(uniform(-10.0, 10.0) * scale, dtype=dtype, device="cpu")
     if tiny:
         upper = lower
-        for _ in range(torch.randint(1, 5, (), generator=generator).item()):
-            upper = torch.nextafter(upper, torch.tensor(float("inf"), dtype=dtype))
+        for _ in range(
+            torch.randint(1, 5, (), generator=generator, device="cpu").item()
+        ):
+            upper = torch.nextafter(
+                upper, torch.tensor(float("inf"), dtype=dtype, device="cpu")
+            )
     else:
-        width = 10.0 ** torch.randint(-3, 2, (), generator=generator).item()
+        width = (
+            10.0 ** torch.randint(-3, 2, (), generator=generator, device="cpu").item()
+        )
         upper = torch.tensor(
-            lower.item() + uniform(0.0, 20.0) * width * scale, dtype=dtype
+            lower.item() + uniform(0.0, 20.0) * width * scale,
+            dtype=dtype,
+            device="cpu",
         )
     return lower.item(), upper.item()
 
@@ -715,17 +725,24 @@ def _uniform_edge_samples(generator, dtype, lower, upper, count, edges):
     ``edges`` is a sample too. The rest are random in between, and the order
     is shuffled.
     """
-    fixed = torch.cat((torch.tensor([lower, upper], dtype=dtype), edges.to(dtype)))
-    unit = torch.rand(count - fixed.numel(), generator=generator, dtype=torch.float64)
+    fixed = torch.cat(
+        (torch.tensor([lower, upper], dtype=dtype, device="cpu"), edges.to(dtype))
+    )
+    unit = torch.rand(
+        count - fixed.numel(),
+        generator=generator,
+        dtype=torch.float64,
+        device="cpu",
+    )
     # Rounding a value inside [lower, upper] to the dtype keeps it inside.
     random = (lower + (upper - lower) * unit).to(dtype)
     samples = torch.cat((fixed, random))
-    return samples[torch.randperm(count, generator=generator)]
+    return samples[torch.randperm(count, generator=generator, device="cpu")]
 
 
 def _linspace_interior(lower, upper, bins, dtype):
     # ``torch.linspace`` is the kernel eager histogram builds its edges with.
-    return torch.linspace(lower, upper, bins + 1, dtype=dtype)[1:-1]
+    return torch.linspace(lower, upper, bins + 1, dtype=dtype, device="cpu")[1:-1]
 
 
 _UNIFORM_EDGE_CASES = 48
@@ -794,7 +811,12 @@ def test_histogram_uniform_edges_match_eager_f64(device, bins, density) -> None:
     for case in range(_UNIFORM_EDGE_CASES):
         lower, upper = _uniform_edge_range(generator, dtype, tiny=False)
         values = _uniform_edge_samples(
-            generator, dtype, lower, upper, _UNIFORM_EDGE_SAMPLES, torch.empty(0)
+            generator,
+            dtype,
+            lower,
+            upper,
+            _UNIFORM_EDGE_SAMPLES,
+            torch.empty(0, device="cpu"),
         )
         expected = function(values)
         actual = compiled(device, values)
