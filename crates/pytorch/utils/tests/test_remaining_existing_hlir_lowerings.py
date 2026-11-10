@@ -2020,14 +2020,13 @@ class PairwiseOrderZero(torch.nn.Module):
 
 
 @_FLOAT_DTYPES
-def test_cdist_pdist_order_zero_follow_the_cpu_kernel_on_nan(
+def test_cdist_pdist_order_zero_preserve_authored_eager_semantics(
     dtype, monkeypatch
 ) -> None:
-    # Unlike dist and vector_norm, ATen's CPU cdist/pdist kernels map each
+    # Unlike dist and vector_norm, ATen's cdist/pdist kernels map each
     # |difference| d to min(ceil(d), 1). A NaN difference therefore makes
-    # that pair's count NaN, and an infinite one still counts 1. The CUDA
-    # kernel counts `d != 0` instead. The lowering follows the CPU kernel,
-    # so the reference is computed on CPU whatever the backend.
+    # that pair's count NaN, and an infinite one still counts 1. Compare with
+    # the authored eager program on its selected device.
     x1 = torch.tensor(
         [[_NAN, 1.0, 0.0], [1.0, 2.0, 3.0], [_INF, 0.0, -0.0]], dtype=dtype
     )
@@ -2035,11 +2034,10 @@ def test_cdist_pdist_order_zero_follow_the_cpu_kernel_on_nan(
     module = PairwiseOrderZero()
     compiled, attempts = _backend_path(module, monkeypatch)
     actual = compiled(x1, x2)
-    _assert_stage_one(
-        attempts, "aten._cdist_forward.default", "aten._pdist_forward.default"
-    )
-    expected = module(x1.cpu(), x2.cpu())
-    _assert_close(tuple(value.cpu() for value in actual), expected, rtol=0, atol=0)
+    _assert_stage_one(attempts)
+    assert attempts[0] & {"aten.cdist.default", "aten._cdist_forward.default"}
+    assert attempts[0] & {"aten.pdist.default", "aten._pdist_forward.default"}
+    _assert_close(actual, module(x1, x2), rtol=0, atol=0)
 
 
 class ZeroTestedFunctions(torch.nn.Module):
