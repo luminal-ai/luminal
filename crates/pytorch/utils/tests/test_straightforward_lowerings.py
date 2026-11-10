@@ -287,7 +287,7 @@ def test_zero_coefficients_structurally_ignore_nan_inputs() -> None:
     _assert_outputs(_compile(module, *inputs)(*inputs), module(*inputs))
 
 
-def test_bool_coefficients_are_literal_zero_and_one() -> None:
+def test_false_coefficients_structurally_ignore_nan_inputs() -> None:
     # A Python-bool beta/alpha is the literal 0 or 1 (False == 0, True == 1),
     # so False drops its term exactly like the integer 0 above and the NaN
     # inputs never reach the result.
@@ -295,17 +295,25 @@ def test_bool_coefficients_are_literal_zero_and_one() -> None:
     nan_inputs = tuple(torch.full(shape, float("nan")) for shape in shapes)
     module = LinearComposites(alpha=False, beta=False)
     _assert_outputs(_compile(module, *nan_inputs)(*nan_inputs), module(*nan_inputs))
-    # Integer tensors take bool coefficients too.
+
+
+@pytest.mark.parametrize(
+    ("beta", "alpha"), ((False, True), (True, False), (True, True))
+)
+def test_integer_bool_coefficients_are_literal_zero_and_one(
+    beta: bool, alpha: bool
+) -> None:
+    # PyTorch CUDA does not implement integer addmv/addbmm, so the shared
+    # parity suite skips these cases there instead of failing while computing
+    # an eager reference. The reference runtime still exercises all three.
+    shapes = ((2,), (2, 3), (3,), (2, 4), (3, 2, 5), (3, 5, 4))
     integer_inputs = tuple(
         torch.arange(math.prod(shape), dtype=torch.int16).reshape(shape)
         for shape in shapes
     )
-    for beta, alpha in ((False, True), (True, False), (True, True)):
-        module = LinearComposites(alpha=alpha, beta=beta)
-        _assert_outputs(
-            _compile(module, *integer_inputs)(*integer_inputs),
-            module(*integer_inputs),
-        )
+    module = LinearComposites(alpha=alpha, beta=beta)
+    expected = eager_or_skip_unsupported(module, *integer_inputs)
+    _assert_outputs(_compile(module, *integer_inputs)(*integer_inputs), expected)
 
 
 def test_movement_lowerings_support_noncontiguous_real_and_complex_values() -> None:
