@@ -182,6 +182,19 @@ impl GraphTensor {
         self.round_logical(LogicalOp::RoundDecimals(decimals))
     }
 
+    /// The `order`th derivative of digamma, evaluated by the authored
+    /// runtime's direct implementation.
+    pub fn polygamma(self, order: i64) -> GraphTensor {
+        assert!(order >= 0, "polygamma order must be nonnegative");
+        let new_id = self.graph().logical.op(
+            LogicalOp::Polygamma(order),
+            &[(self.id, self.dims())],
+            self.dims(),
+            self.dtype,
+        );
+        GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
+    }
+
     /// Shared recorder path for the dtype-preserving rounding ops.
     fn round_logical(self, op: LogicalOp) -> GraphTensor {
         let new_id =

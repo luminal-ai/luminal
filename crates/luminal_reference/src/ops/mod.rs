@@ -48,6 +48,7 @@ pub(crate) mod modulo;
 pub(crate) mod mul;
 mod not;
 mod or;
+pub(crate) mod polygamma;
 pub(crate) mod trunc_div;
 pub(crate) mod trunc_rem;
 pub(crate) mod wrapping_add;
@@ -108,6 +109,7 @@ pub use modulo::ModFunctional;
 pub use mul::MulFunctional;
 pub use not::NotDps;
 pub use or::OrDps;
+pub use polygamma::PolygammaFunctional;
 pub use recip::RecipFunctional;
 pub use reduce_max::ReduceMax;
 pub use reduce_sum::ReduceSum;
@@ -146,6 +148,7 @@ pub use less_than::LessThanDps;
 pub use log2::Log2FunctionalDps;
 pub use modulo::ModFunctionalDps;
 pub use mul::MulFunctionalDps;
+pub use polygamma::PolygammaFunctionalDps;
 pub use recip::RecipFunctionalDps;
 pub use reduce_max::ReduceMaxDps;
 pub use reduce_sum::ReduceSumDps;
@@ -183,6 +186,7 @@ pub use less_than::LessThanMatcher;
 pub use log2::Log2FunctionalMatcher;
 pub use modulo::ModFunctionalMatcher;
 pub use mul::MulFunctionalMatcher;
+pub use polygamma::PolygammaFunctionalMatcher;
 pub use recip::RecipFunctionalMatcher;
 pub use reduce_max::ReduceMaxMatcher;
 pub use reduce_sum::ReduceSumMatcher;
@@ -303,6 +307,13 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(MulFunctionalMatcher),
                 kernel: entry::<MulFunctionalDps>("MulFunctionalGeneric", mul::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(PolygammaFunctionalMatcher),
+                kernel: entry::<PolygammaFunctionalDps>(
+                    "PolygammaFunctionalGeneric",
+                    polygamma::kernel,
+                ),
             },
             ReferenceOp {
                 matcher: || Box::new(WrappingAddFunctionalMatcher),

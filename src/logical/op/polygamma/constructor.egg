@@ -1,0 +1,1 @@
+(constructor LogicalPolygamma (LogicalTensor i64) LogicalTensor)

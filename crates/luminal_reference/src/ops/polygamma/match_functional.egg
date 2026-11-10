@@ -1,0 +1,18 @@
+(rule
+  (
+    (= ?in-layout-tensor (LayoutTensorLit ?in ?in-layout))
+    (= ?out-layout-tensor (LayoutTensorLit ?out ?out-layout))
+    (= ?out (LogicalPolygamma ?in ?order))
+    (= ?out-layout (RightMajorContiguousElementLayoutLit ?shape ?bits))
+    (= (injectivity-of ?out-layout-tensor) (Injective))
+  )
+  (
+    (let ?layout-tensor-op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in-layout-tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out-layout-tensor (LayoutTensorNil))))
+    (union ?layout-tensor-op
+      (LayoutTensorOpPolygammaFunctionalGeneric ?in-layout-tensor ?order ?out-layout))
+  )
+  :ruleset backend
+  :name "reference/polygamma/match_functional: direct polygamma")

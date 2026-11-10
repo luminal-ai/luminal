@@ -163,6 +163,7 @@ mod modulo;
 mod mul;
 mod not;
 mod or;
+mod polygamma;
 mod recip;
 mod reduce_max;
 mod reduce_sum;
@@ -211,6 +212,7 @@ pub use modulo::LogicalMod;
 pub use mul::LogicalMul;
 pub use not::LogicalNot;
 pub use or::LogicalOr;
+pub use polygamma::LogicalPolygamma;
 pub use recip::LogicalRecip;
 pub use reduce_max::LogicalReduceMax;
 pub use reduce_sum::LogicalReduceSum;
@@ -260,6 +262,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalRound),
             Box::new(LogicalHypot),
             Box::new(LogicalRoundDecimals),
+            Box::new(LogicalPolygamma),
             Box::new(LogicalAdd),
             Box::new(LogicalMul),
             Box::new(LogicalWrappingAdd),
