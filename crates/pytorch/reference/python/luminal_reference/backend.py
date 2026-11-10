@@ -14,7 +14,7 @@ import torch
 from torch.export import export
 
 from . import _luminal
-from .dimensions import export_specs, profile_value
+from .dimensions import prepare_dynamic_inputs, profile_value
 from .export_utils import (
     _box_scalar_graph_outputs,
     _canonicalize_tensor_scale_sdpa,
@@ -88,6 +88,7 @@ class CompiledModel:
         ep: Any,
         scalar_output_positions: Sequence[int] = (),
         held: dict | None = None,
+        shape_carrier_indices: Sequence[int] = (),
     ):
         self._graph = graph
         self._ep = ep
@@ -95,6 +96,7 @@ class CompiledModel:
         # Graph input name -> the exported parameter/buffer tensor staged for
         # it, so a buffer mutation has somewhere to write back.
         self._held = dict(held or {})
+        self._shape_carrier_indices = frozenset(shape_carrier_indices)
         names = graph.input_names
         kinds = graph.input_kinds
         self._user_input_names = [
@@ -116,7 +118,11 @@ class CompiledModel:
 
     def __copy__(self):
         model = type(self)(
-            self._graph.fork(), self._ep, self._scalar_output_positions, self._held
+            self._graph.fork(),
+            self._ep,
+            self._scalar_output_positions,
+            self._held,
+            self._shape_carrier_indices,
         )
         for name, value in self._held.items():
             model._graph.set_input(name, _tensor_bytes(value), _storage_shape(value))
@@ -137,7 +143,13 @@ class CompiledModel:
         # shape values alongside the tensor inputs (as SymInt or int). The
         # compiled program folds those symbols into `sym_size`, so it has no
         # scalar inputs: keep tensors, drop the scalars.
-        inputs = [arg for arg in args if isinstance(arg, torch.Tensor)]
+        inputs = [
+            torch.empty(1, dtype=torch.uint8).expand(int(arg))
+            if index in self._shape_carrier_indices
+            else arg
+            for index, arg in enumerate(args)
+            if index in self._shape_carrier_indices or isinstance(arg, torch.Tensor)
+        ]
         if len(inputs) != len(self._user_input_names):
             raise RuntimeError(
                 f"luminal_reference expected {len(self._user_input_names)} inputs, "
@@ -201,15 +213,6 @@ class CompiledModel:
         return tuple(results)
 
 
-def _is_dynamic(size: Any) -> bool:
-    """A dim is dynamic only if it is a SymInt that is not a literal.
-
-    Static dims can also surface as ``SymInt('8')``; those are numbers and
-    must NOT be marked dynamic.
-    """
-    return isinstance(size, torch.SymInt) and not size.node.expr.is_number
-
-
 def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> Any:
     """Export a Dynamo GraphModule, preserving its symbolic dimensions.
 
@@ -231,74 +234,17 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
     # trips "Guard failed on the same frame it was created". Only the GRAPH is
     # private; the module's weights are shared (see private_graph_copy).
     gm = private_graph_copy(gm)
-    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
-
-    all_shapes = [
-        getattr(n.meta.get("example_value", v), "shape", ())
-        for n, v in zip(placeholders, example_inputs)
-    ]
-    axis_specs = export_specs(all_shapes)
-    records: list[tuple[str, torch.fx.Node, Any]] = []
-    tensor_dims: dict[Any, tuple[torch.fx.Node, int]] = {}
-    for node, value, dim_spec in zip(placeholders, example_inputs, axis_specs):
-        if isinstance(value, torch.SymInt):
-            records.append(("sym", node, value))
-            continue
-        shape = getattr(node.meta.get("example_value"), "shape", None)
-        if shape is None:
-            shape = getattr(value, "shape", ())
-        dims = dim_spec
-        for dim, size in enumerate(shape):
-            if _is_dynamic(size):
-                tensor_dims.setdefault(size.node.expr, (node, dim))
-        records.append(("tensor", node, dims))
-
-    # Pass 2: rewrite used SymInts to `sym_size`, drop unused ones.
-    erased: set[int] = set()
-    for kind, node, value in records:
-        if kind != "sym":
-            continue
-        if not node.users:
-            gm.graph.erase_node(node)
-            erased.add(id(node))
-            continue
-        source = tensor_dims.get(value.node.expr)
-        if source is None:
-            raise RuntimeError(
-                f"cannot locate the tensor dimension for symbolic input {value}"
-            )
-        tensor_node, dim = source
-        with gm.graph.inserting_after(tensor_node):
-            size = gm.graph.call_function(
-                torch.ops.aten.sym_size.int, args=(tensor_node, dim)
-            )
-        node.replace_all_uses_with(size)
-        gm.graph.erase_node(node)
-        erased.add(id(node))
-    if erased:
-        gm.graph.lint()
-        gm.recompile()
-
-    inputs: list[Any] = []
-    specs: list[Any] = []
-    any_dynamic = False
-    for (kind, node, info), value in zip(records, example_inputs):
-        if id(node) in erased:
-            continue
-        inputs.append(value)
-        if kind == "tensor" and info:
-            specs.append(info)
-            any_dynamic = True
-        else:
-            specs.append(None)
-
-    dynamic_shapes = {"args": tuple(specs)} if any_dynamic else None
+    inputs, dynamic_shapes, carrier_indices = prepare_dynamic_inputs(
+        gm,
+        example_inputs,
+        lambda value: torch.empty(1, dtype=torch.uint8).expand(profile_value(value)),
+    )
 
     # The AOT local compiler isolates FakeTensor and TracingContext before
     # entering here. Keep export on the owning thread: native reference graphs
     # are unsendable, and cyclic GC in an export worker could destroy them.
     ep = export(gm, tuple(inputs), dynamic_shapes=dynamic_shapes, strict=False)
-    return ep, inputs
+    return ep, inputs, carrier_indices
 
 
 def _prepare_local_graph(
@@ -323,7 +269,7 @@ def _prepare_local_graph(
     # The graph-module preprocessing above runs first; `_dynamic_export` then
     # rewrites the SymInt placeholders onto `sym_size` and runs the nested
     # `torch.export`, so the exported program keeps its symbolic dims.
-    ep, export_inputs = _dynamic_export(gm, example_inputs)
+    ep, export_inputs, shape_carrier_indices = _dynamic_export(gm, example_inputs)
     # LUM-499: drop dynamo-emitted input guards before run_decompositions calls
     # ep.module(), which would otherwise emit a `_guards_fn` containing
     # data-dependent .item() calls and unresolved `L[...]` references.
@@ -352,7 +298,7 @@ def _prepare_local_graph(
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
 
-    return ep, export_inputs, scalar_output_positions
+    return ep, export_inputs, scalar_output_positions, shape_carrier_indices
 
 
 def _compile_local_graph(
@@ -372,8 +318,8 @@ def _compile_local_graph(
             "max_intermediate_bytes", max_intermediate_bytes
         )
         memory_budget_bytes = options.get("memory_budget_bytes", memory_budget_bytes)
-    ep, export_inputs, scalar_output_positions = _prepare_local_graph(
-        gm, example_inputs
+    ep, export_inputs, scalar_output_positions, shape_carrier_indices = (
+        _prepare_local_graph(gm, example_inputs)
     )
     return compile_exported(
         ep,
@@ -383,6 +329,7 @@ def _compile_local_graph(
         search_log=search_log,
         max_intermediate_bytes=max_intermediate_bytes,
         memory_budget_bytes=memory_budget_bytes,
+        shape_carrier_indices=shape_carrier_indices,
     )
 
 
@@ -396,6 +343,7 @@ def compile_exported(
     max_intermediate_bytes=None,
     memory_budget_bytes=None,
     artifact=None,
+    shape_carrier_indices=(),
 ):
     """Compile a functional ExportedProgram with the native runtime."""
 
@@ -468,4 +416,6 @@ def compile_exported(
         )
     else:
         graph.load_compiled(artifact, memory_budget_bytes=memory_budget_bytes)
-    return CompiledModel(graph, ep, scalar_output_positions, held)
+    return CompiledModel(
+        graph, ep, scalar_output_positions, held, shape_carrier_indices
+    )

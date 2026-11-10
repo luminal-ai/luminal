@@ -19,7 +19,7 @@ def test_export_preserves_shapespec_bounds_and_shared_symbols(upper):
     exported = []
 
     def backend(gm, inputs):
-        ep, tensors = _dynamic_export(gm, inputs)
+        ep, tensors, _ = _dynamic_export(gm, inputs)
         exported.append(ep)
         # The CUDA bridge needs concrete profiling shapes without pinning the
         # unbacked ShapesSpec symbols to their optimization hints.
@@ -59,7 +59,7 @@ def test_export_preserves_mark_dynamic_bounds():
     exported = []
 
     def backend(gm, inputs):
-        ep, _ = _dynamic_export(gm, inputs)
+        ep, _, _ = _dynamic_export(gm, inputs)
         exported.append(ep)
         return gm.forward
 

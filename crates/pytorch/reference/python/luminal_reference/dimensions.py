@@ -82,3 +82,92 @@ def export_specs(shapes):
         }
         for shape in shapes
     ]
+
+
+def prepare_dynamic_inputs(gm, example_inputs, make_carrier):
+    """Rewrite Dynamo's free SymInts onto tensor dimensions for export.
+
+    A symbol normally rides on a surviving tensor input. If Dynamo pruned that
+    tensor because only its shape is used, retain the scalar placeholder as a
+    one-dimensional tensor placeholder and let ``make_carrier`` provide a
+    storage-constant view whose extent is the authored SymInt. The returned
+    positional indices tell the runtime wrapper which Dynamo scalar arguments
+    to adapt back into carriers on every call.
+    """
+    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
+    shapes = [
+        getattr(node.meta.get("example_value", value), "shape", ())
+        for node, value in zip(placeholders, example_inputs)
+    ]
+    tensor_dims = {}
+    for node, value in zip(placeholders, example_inputs):
+        if isinstance(value, torch.SymInt):
+            continue
+        shape = getattr(node.meta.get("example_value"), "shape", None)
+        if shape is None:
+            shape = getattr(value, "shape", ())
+        for dim, size in enumerate(shape):
+            if isinstance(size, torch.SymInt) and not size.node.expr.is_number:
+                tensor_dims.setdefault(size.node.expr, (node, dim))
+
+    carriers = [
+        (index, node, value)
+        for index, (node, value) in enumerate(zip(placeholders, example_inputs))
+        if isinstance(value, torch.SymInt)
+        and node.users
+        and value.node.expr not in tensor_dims
+    ]
+    all_specs = export_specs([*shapes, *((value,) for _, _, value in carriers)])
+    axis_specs = all_specs[: len(shapes)]
+    carrier_specs = {
+        id(node): spec for (_, node, _), spec in zip(carriers, all_specs[len(shapes) :])
+    }
+    carrier_indices = frozenset(index for index, _, _ in carriers)
+    records = [
+        ("sym", node, value)
+        if isinstance(value, torch.SymInt)
+        else ("tensor", node, dim_spec)
+        for node, value, dim_spec in zip(placeholders, example_inputs, axis_specs)
+    ]
+
+    erased = set()
+    rewrote = False
+    for kind, node, value in records:
+        if kind != "sym":
+            continue
+        if not node.users:
+            gm.graph.erase_node(node)
+            erased.add(id(node))
+            continue
+        users = tuple(node.users)
+        source = tensor_dims.get(value.node.expr)
+        tensor_node, dim = source if source is not None else (node, 0)
+        with gm.graph.inserting_after(tensor_node):
+            size = gm.graph.call_function(
+                torch.ops.aten.sym_size.int, args=(tensor_node, dim)
+            )
+        for user in users:
+            user.replace_input_with(node, size)
+        rewrote = True
+        if source is not None:
+            gm.graph.erase_node(node)
+            erased.add(id(node))
+    if erased or rewrote:
+        gm.graph.lint()
+        gm.recompile()
+
+    inputs = []
+    specs = []
+    for (kind, node, info), value in zip(records, example_inputs):
+        if id(node) in erased:
+            continue
+        if id(node) in carrier_specs:
+            inputs.append(make_carrier(value))
+            specs.append(carrier_specs[id(node)])
+        else:
+            inputs.append(value)
+            specs.append(info if kind == "tensor" and info else None)
+    dynamic_shapes = (
+        {"args": tuple(specs)} if any(spec is not None for spec in specs) else None
+    )
+    return inputs, dynamic_shapes, carrier_indices
