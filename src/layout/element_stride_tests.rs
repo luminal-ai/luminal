@@ -384,6 +384,55 @@ fn broadcasting_a_singleton_creates_zero_stride_on_the_live_output_axis() {
 }
 
 #[test]
+fn symbolic_affine_unfold_map_composes_exact_element_strides() {
+    let mut g = graph();
+    run(
+        &mut g,
+        &layout(
+            "dynamic",
+            &["(IntLit 2)", "(IntVar \"n\")"],
+            &["(IntVar \"n\")", "(IntLit 1)"],
+        ),
+    );
+    run(
+        &mut g,
+        r#"
+(set (lower-bound-of (IntVar "n")) (bigint 2))
+(set (upper-bound-of (IntVar "n")) (bigint 10))
+(let windows (IntTruncDiv (IntVar "n") (IntLit 2)))
+(let unfold_shape (ShapeLit (IntExprCons (IntLit 2)
+ (IntExprCons windows (IntExprCons (IntLit 2) (IntExprNil))))))
+(let unfold_map (IndexMapLit
+ (IntExprCons (CoordVar unfold_shape 2)
+  (IntExprCons
+   (IntAdd (IntMul (CoordVar unfold_shape 1) (IntLit 2))
+           (CoordVar unfold_shape 0))
+   (IntExprNil)))
+ dynamic_shape))
+(let unfolded (LogicalIndexMapApply dynamic_logical unfold_map unfold_shape))
+"#,
+    );
+    run(
+        &mut g,
+        "(run-schedule
+          (saturate (run main_ruleset) (run prop))
+          (saturate (run element-stride-discovery))
+          (saturate (run main_ruleset) (run prop)))",
+    );
+    run(
+        &mut g,
+        r#"
+(check (= ?lt (LayoutTensorLit unfolded
+ (ElementStridedLayoutLit unfold_shape
+  (ElementStrideCons (ElementStrideExact (IntVar "n"))
+   (ElementStrideCons (ElementStrideExact (IntLit 2))
+    (ElementStrideCons (ElementStrideExact (IntLit 1)) (ElementStrideNil))))
+  (BitWidthLit 32)))))
+"#,
+    );
+}
+
+#[test]
 fn literal_expression_recovery_preserves_origin_and_singleton_freedom() {
     let mut g = graph();
     run(
