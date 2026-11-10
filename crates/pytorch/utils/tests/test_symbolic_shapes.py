@@ -62,4 +62,7 @@ def test_unknown_symbolic_expression_does_not_freeze_hint(tmp_path):
     assert changed
     native = importlib.import_module(f"luminal_{selected_backend()}._luminal")
     with pytest.raises(RuntimeError, match="cannot resolve"):
-        native.compile(str(altered))
+        if selected_backend() == "cuda_lite":
+            native.compile(str(altered), [], [], [])
+        else:
+            native.compile(str(altered))
