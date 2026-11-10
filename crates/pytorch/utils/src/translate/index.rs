@@ -722,7 +722,7 @@ impl Translator<'_> {
     }
 
     /// `data[mask] = source` with `source` a flat list of the true slots.
-    fn idx_masked_scatter(
+    pub(super) fn idx_masked_scatter(
         &mut self,
         destination: GraphTensor,
         mask: GraphTensor,
@@ -765,6 +765,16 @@ impl Translator<'_> {
     /// so no flat-index arithmetic is needed.
     pub(super) fn translate_index_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
         let source = self.operand(&node.inputs[0])?;
+        self.translate_index_tensor_value(source, node)
+    }
+
+    /// Dtype-agnostic advanced-indexing geometry shared with complex
+    /// component lowering.
+    pub(super) fn translate_index_tensor_value(
+        &mut self,
+        source: GraphTensor,
+        node: &Node,
+    ) -> Result<GraphTensor> {
         if source.rank() == 0 {
             bail!("index.Tensor on a scalar is not ported");
         }
@@ -862,6 +872,16 @@ impl Translator<'_> {
     /// the index shaping the output.
     pub(super) fn translate_gather(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
+        self.translate_gather_value(x, node)
+    }
+
+    /// Dtype-agnostic gather geometry shared with complex component
+    /// lowering.
+    pub(super) fn translate_gather_value(
+        &mut self,
+        x: GraphTensor,
+        node: &Node,
+    ) -> Result<GraphTensor> {
         if x.rank() == 0 {
             bail!("gather on a scalar is not ported");
         }
@@ -1480,7 +1500,7 @@ impl Translator<'_> {
         self.idx_put(data, indices, source, accumulate)
     }
 
-    fn idx_put(
+    pub(super) fn idx_put(
         &mut self,
         data: GraphTensor,
         indices: GraphTensor,
