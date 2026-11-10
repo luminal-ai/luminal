@@ -132,6 +132,7 @@ class ComplexComposedReductions(torch.nn.Module):
             ),
             torch.ops.aten.linalg_vector_norm.default(value, 1.5, [], False),
             torch.ops.aten.var.correction(value, [1], correction=1, keepdim=False),
+            torch.ops.aten.std.correction(value, [0], correction=0.5, keepdim=True),
             variance,
             mean,
         )

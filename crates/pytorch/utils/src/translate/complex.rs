@@ -8,8 +8,8 @@
 //! This is the recorder-frontend port of the parked HLIR translator's
 //! `translator/complex.rs`. The structural `ComplexTensor`, the target
 //! routing, and the arithmetic / elementary / movement / reduction surface
-//! are ported here; the remaining target families (index/scatter, variance,
-//! and `linalg_vector_norm`/`dist`) still bail
+//! are ported here; the remaining target families (index/scatter and `dist`)
+//! still bail
 //! explicitly with the ATen target name.
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -171,6 +171,17 @@ fn cx_bool_and(lhs: GraphTensor, rhs: GraphTensor) -> GraphTensor {
 
 fn cx_bool_not(value: GraphTensor) -> GraphTensor {
     (1.0f32 - value.cast(DType::F32)).cast(DType::Bool)
+}
+
+fn restore_reduced_dims(mut value: GraphTensor, axes: &[usize], keepdim: bool) -> GraphTensor {
+    if keepdim {
+        let mut sorted = axes.to_vec();
+        sorted.sort_unstable();
+        for axis in sorted {
+            value = value.expand_dim(axis, 1usize);
+        }
+    }
+    value
 }
 
 impl Translator<'_> {
@@ -663,6 +674,43 @@ impl Translator<'_> {
                     let dim = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank());
                     self.store_complex(output_name, value.map(|c| c.cumsum(vec![dim])));
                 }
+            }
+            "var.default" | "var.dim" | "var.correction" => {
+                let (axes, variance, _) = self.translate_complex_variance(node)?;
+                let variance = restore_reduced_dims(variance, &axes, self.keepdim_flag(node, 3));
+                self.values.insert(output_name.to_string(), variance);
+            }
+            "std.default" | "std.dim" | "std.correction" => {
+                let (axes, variance, _) = self.translate_complex_variance(node)?;
+                let deviation =
+                    restore_reduced_dims(variance.sqrt(), &axes, self.keepdim_flag(node, 3));
+                self.values.insert(output_name.to_string(), deviation);
+            }
+            "var_mean.default" | "var_mean.dim" | "var_mean.correction" => {
+                let names = Self::tensor_output_names(node);
+                anyhow::ensure!(
+                    names.len() == 2,
+                    "{} expected variance and mean outputs, got {}",
+                    node.target,
+                    names.len()
+                );
+                let (axes, variance, mean) = self.translate_complex_variance(node)?;
+                let keepdim = self.keepdim_flag(node, 3);
+                self.values.insert(
+                    names[0].clone(),
+                    restore_reduced_dims(variance, &axes, keepdim),
+                );
+                self.store_complex(
+                    &names[1],
+                    mean.map(|component| restore_reduced_dims(component, &axes, keepdim)),
+                );
+            }
+            "linalg_vector_norm.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let compute = self.output_meta_dtype(node)?;
+                let magnitude = self.complex_abs(value.map(|component| component.cast(compute)));
+                let norm = self.vector_norm_from_magnitude(node, magnitude)?;
+                self.values.insert(output_name.to_string(), norm);
             }
             "cumprod.default" => {
                 let value = self.translate_complex_cumprod(node)?;
@@ -2209,6 +2257,35 @@ impl Translator<'_> {
             product = self.complex_mul(product, next);
         }
         Ok(product)
+    }
+
+    fn translate_complex_variance(
+        &mut self,
+        node: &Node,
+    ) -> Result<(Vec<usize>, GraphTensor, ComplexTensor)> {
+        let value = self.get_complex_input(node, 0)?;
+        let axes = self.reduction_axes(node, 1, value.real.rank())?;
+        let correction = self.variance_correction(node)?;
+        let storage = value.real.dtype;
+        let compute = if storage.is_narrow_float() {
+            DType::F32
+        } else {
+            storage
+        };
+        let real = value.real.cast(compute);
+        let imag = value.imag.cast(compute);
+
+        // |z - mean(z)|² is the sum of the independently centered real and
+        // imaginary squares. Both component variances use the same authored
+        // correction, so their sum has exactly the complex variance divisor.
+        let variance =
+            real.var_correction(&axes, correction) + imag.var_correction(&axes, correction);
+        let mean = ComplexTensor::new(
+            super::util::round_to_storage(real.mean(&axes), storage),
+            super::util::round_to_storage(imag.mean(&axes), storage),
+            value.torch_dtype,
+        );
+        Ok((axes, variance, mean))
     }
 
     fn translate_complex_cumprod(&mut self, node: &Node) -> Result<ComplexTensor> {
