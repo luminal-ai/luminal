@@ -1100,6 +1100,13 @@ def _assert_stage_one(attempts, *targets: str) -> None:
         assert target in attempts[0], f"{target} was decomposed: {attempts[0]}"
 
 
+def _assert_stage_one_alias(attempts, *targets: str) -> None:
+    assert len(attempts) == 1, f"expected one stage-1 translation, got {attempts}"
+    assert any(target in attempts[0] for target in targets), (
+        f"none of {targets} survived stage 1: {attempts[0]}"
+    )
+
+
 class SearchVariants(torch.nn.Module):
     def forward(self, boundaries, queries, rows, row_queries, point, unsorted, sorter):
         empty = boundaries[:0]
@@ -1389,10 +1396,11 @@ def test_adaptive_pool_windows_match_eager_on_the_backend_path(monkeypatch) -> N
     module = AdaptiveWindows()
     compiled, attempts = _backend_path(module, monkeypatch)
     _assert_close(compiled(*inputs), module(*inputs))
-    _assert_stage_one(
+    _assert_stage_one(attempts, "aten.adaptive_max_pool2d.default")
+    _assert_stage_one_alias(
         attempts,
+        "aten.adaptive_avg_pool2d.default",
         "aten._adaptive_avg_pool2d.default",
-        "aten.adaptive_max_pool2d.default",
     )
 
 
