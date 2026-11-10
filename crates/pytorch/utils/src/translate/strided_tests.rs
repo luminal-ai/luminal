@@ -292,6 +292,22 @@ fn isfinite_integer_inputs_are_true_without_lossy_conversion() {
     let rt = run(&t, &[TypedBuffer::I64(vec![i64::MIN, i64::MAX, 0, -1])]);
     assert_eq!(rt.get_bool8(t.outputs[0].tensor).unwrap(), &[1, 1, 1, 1]);
 }
+
+#[test]
+fn isinf_integer_inputs_are_false_without_adding_axes() {
+    let t = translate_one(
+        node(
+            "torch.ops.aten.isinf.default",
+            vec![tensor_input("self", "a")],
+            &["y"],
+        ),
+        &[("a", 5, &[4]), ("y", BOOL, &[4])],
+        &["a"],
+        &["y"],
+    );
+    let rt = run(&t, &[TypedBuffer::I64(vec![i64::MIN, i64::MAX, 0, -1])]);
+    assert_eq!(rt.get_bool8(t.outputs[0].tensor).unwrap(), &[0, 0, 0, 0]);
+}
 #[test]
 fn non_dense_roots_and_inaccessible_storage_are_refused() {
     for (strides, offset) in [(vec![2], 0), (vec![1], 8)] {

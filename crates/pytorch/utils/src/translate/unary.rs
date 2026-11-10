@@ -292,8 +292,10 @@ impl Translator<'_> {
             Ok(self.is_inf(a))
         } else {
             let zero = self.constant_like(a, 0.0);
-            let false_ = zero.gt(zero);
-            Ok(false_.expand_rhs(a.dims()))
+            // `constant_like` already expands the scalar over `a`. Expanding
+            // that tensor again would append a second copy of every input
+            // axis and make the logical Bool result higher-rank than ATen's.
+            Ok(zero.gt(zero))
         }
     }
 
