@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
+from backend_test_utils import eager_or_skip_unsupported
 from backend_test_utils import luminal_backend
 
 
@@ -36,7 +37,8 @@ def _assert_close(actual, expected, *, rtol=5e-4, atol=5e-5) -> None:
 
 
 def _check(module, *inputs, **tolerances) -> None:
-    _assert_close(_compile(module, *inputs)(*inputs), module(*inputs), **tolerances)
+    expected = eager_or_skip_unsupported(module, *inputs)
+    _assert_close(_compile(module, *inputs)(*inputs), expected, **tolerances)
 
 
 class ElementwiseComposites(torch.nn.Module):
@@ -1618,16 +1620,16 @@ class AntialiasedBilinearResize(torch.nn.Module):
         )
 
 
-def test_antialiased_bilinear_resize_float_and_uint8() -> None:
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.uint8])
+def test_antialiased_bilinear_resize_float_and_uint8(dtype: torch.dtype) -> None:
     torch.manual_seed(7)
     module = AntialiasedBilinearResize()
-    values = (
-        torch.randn(1, 3, 4, 5, dtype=torch.float32),
-        torch.randn(1, 3, 4, 5, dtype=torch.float64),
-        torch.randint(0, 256, (1, 3, 4, 5), dtype=torch.uint8),
+    value = (
+        torch.randint(0, 256, (1, 3, 4, 5), dtype=dtype)
+        if dtype == torch.uint8
+        else torch.randn(1, 3, 4, 5, dtype=dtype)
     )
-    for value in values:
-        _check(module, value)
+    _check(module, value)
 
 
 class FunctionalBatchNorm(torch.nn.Module):
