@@ -1003,6 +1003,22 @@ impl Translator<'_> {
                     ComplexTensor::new(real, imag, value.torch_dtype),
                 );
             }
+            "index_put.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let updates =
+                    self.value_as_complex(self.input_value_name(node, 2)?, value.torch_dtype)?;
+                let (real, imag) = self.translate_complex_index_put_components(
+                    node,
+                    value.real,
+                    value.imag,
+                    updates.real,
+                    updates.imag,
+                )?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real, imag, value.torch_dtype),
+                );
+            }
             "where.self" => {
                 let condition = self.get_input_tensor(node, 0)?;
                 let dtype = self.output_complex_dtype(output_name)?;
