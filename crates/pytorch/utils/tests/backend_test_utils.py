@@ -41,7 +41,12 @@ def eager_or_skip_unsupported(model, *inputs):
         return model(*inputs)
     except (NotImplementedError, RuntimeError) as error:
         message = str(error).lower()
-        if "not implemented" not in message and "not supported" not in message:
+        capability_errors = (
+            "not implemented",
+            "not supported",
+            "does not have a deterministic implementation",
+        )
+        if not any(marker in message for marker in capability_errors):
             raise
         pytest.skip(
             f"eager PyTorch does not implement this operation on the selected device: {error}"
