@@ -490,7 +490,7 @@ impl Translator<'_> {
     }
 
     pub(super) fn real_abs(&mut self, value: GraphTensor) -> GraphTensor {
-        value.abs()
+        self.ieee_abs(value)
     }
 
     /// IEEE finiteness depends only on whether every exponent bit is one.

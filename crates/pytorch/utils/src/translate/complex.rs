@@ -1362,22 +1362,9 @@ impl Translator<'_> {
         let b_real_inf = self.is_inf(b.real);
         let b_imag_inf = self.is_inf(b.imag);
         let denominator_inf = cx_bool_or(b_real_inf, b_imag_inf);
-        let denominator_one_inf = b_real_inf.ne(b_imag_inf);
         let a_real_inf = self.is_inf(a.real);
         let a_imag_inf = self.is_inf(a.imag);
         let numerator_inf = cx_bool_or(a_real_inf, a_imag_inf);
-
-        let c = self.signed_indicator(b.real, b_real_inf);
-        let d = self.signed_indicator(b.imag, b_imag_inf);
-        let zero = self.constant_like(a.real, 0.0);
-        let inf_den_real = zero * (a.real * c + a.imag * d);
-        let inf_den_imag = zero * (a.imag * c - a.real * d);
-        let denominator_inf_only = {
-            let numerator_not_inf = cx_bool_not(numerator_inf);
-            cx_bool_and(denominator_one_inf, numerator_not_inf)
-        };
-        result.real = self.cx_select(denominator_inf_only, inf_den_real, result.real);
-        result.imag = self.cx_select(denominator_inf_only, inf_den_imag, result.imag);
 
         let ar = self.signed_indicator(a.real, a_real_inf);
         let ai = self.signed_indicator(a.imag, a_imag_inf);
@@ -1400,10 +1387,10 @@ impl Translator<'_> {
         let b_real_zero = self.is_zero(b.real);
         let b_imag_zero = self.is_zero(b.imag);
         let denominator_zero = cx_bool_and(b_real_zero, b_imag_zero);
-        let real_inf = self.signed_constant_like(b.real, f64::INFINITY);
-        let imag_inf = self.signed_constant_like(b.imag, f64::INFINITY);
-        result.real = self.cx_select(denominator_zero, real_inf * a.real, result.real);
-        result.imag = self.cx_select(denominator_zero, imag_inf * a.imag, result.imag);
+        // Eager ignores both denominator sign bits for complex zero division.
+        let infinity = self.constant_like(b.real, f64::INFINITY);
+        result.real = self.cx_select(denominator_zero, infinity * a.real, result.real);
+        result.imag = self.cx_select(denominator_zero, infinity * a.imag, result.imag);
         Ok(result)
     }
 
@@ -1424,9 +1411,15 @@ impl Translator<'_> {
         b.real = br;
         b.imag = bi;
 
-        if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
-            b = self.scale_addend(node, b)?;
-        }
+        // ATen evaluates complex add/sub as `self + signed_alpha * other`.
+        // The complex multiply is observable even for unit alpha: its zero
+        // cross terms propagate infinities and signed zeros exactly like eager.
+        let op = if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+            b = self.scale_addend(node, b, matches!(op, BinaryOp::Sub))?;
+            BinaryOp::Add
+        } else {
+            op
+        };
         self.apply_complex_binary(op, a, b)
     }
 
@@ -1440,19 +1433,33 @@ impl Translator<'_> {
         let a = self.value_as_complex(self.input_value_name(node, 0)?, dtype)?;
         let (scalar_real, scalar_imag) = self.complex_scalar_arg(node, 1)?;
         let mut scalar = self.complex_constant_like(a.real, scalar_real, scalar_imag, dtype);
-        if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
-            scalar = self.scale_addend(node, scalar)?;
-        }
+        // Preserve the same scaled-addend boundary for scalar overloads.
+        let op = if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+            scalar = self.scale_addend(node, scalar, matches!(op, BinaryOp::Sub))?;
+            BinaryOp::Add
+        } else {
+            op
+        };
         self.apply_complex_binary(op, a, scalar)
     }
 
-    fn scale_addend(&mut self, node: &Node, value: ComplexTensor) -> Result<ComplexTensor> {
-        let (real, imag) = match node.inputs.iter().position(|input| input.name == "alpha") {
+    fn scale_addend(
+        &mut self,
+        node: &Node,
+        value: ComplexTensor,
+        subtract: bool,
+    ) -> Result<ComplexTensor> {
+        let (mut real, mut imag) = match node.inputs.iter().position(|input| input.name == "alpha")
+        {
             Some(index) => self.complex_scalar_arg(node, index)?,
             None => (1.0, 0.0),
         };
-        if real == 1.0 && imag == 0.0 {
-            return Ok(value);
+        if subtract {
+            real = -real;
+            imag = -imag;
+            if imag == 0.0 {
+                imag = 0.0;
+            }
         }
         let alpha = self.complex_constant_like(value.real, real, imag, value.torch_dtype);
         Ok(self.complex_mul(value, alpha))
@@ -1637,8 +1644,8 @@ impl Translator<'_> {
         let half_pi = self.constant_like(acos_real, std::f64::consts::FRAC_PI_2);
         acos_real = self.cx_select(zero_with_nan_imag, half_pi, acos_real);
         let real_inf_with_nan_imag = cx_bool_and(real_inf, imag_nan);
-        let signed_infinity = self.signed_constant_like(value.real, f64::INFINITY);
-        acos_imag = self.cx_select(real_inf_with_nan_imag, signed_infinity, acos_imag);
+        let negative_infinity = self.constant_like(value.real, f64::NEG_INFINITY);
+        acos_imag = self.cx_select(real_inf_with_nan_imag, negative_infinity, acos_imag);
 
         let mut asin_real = self.cx_asin(beta);
         asin_real = self.cx_select(zero_with_nan_imag, value.real, asin_real);
