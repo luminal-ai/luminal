@@ -325,6 +325,63 @@ fn batch_norm_parameters_are_read_wide_without_rounding() {
 }
 
 #[test]
+fn inference_batch_norm_saved_stats_follow_the_authored_device() {
+    fn translated(device: &str, saved_shape: &[i64]) -> Translation {
+        let tensors: Vec<(&str, u32, &[i64])> = vec![
+            ("x", FLOAT, &[2, 3, 4, 4]),
+            ("w", FLOAT, &[3]),
+            ("b", FLOAT, &[3]),
+            ("rm", FLOAT, &[3]),
+            ("rv", FLOAT, &[3]),
+            ("out", FLOAT, &[2, 3, 4, 4]),
+            ("saved_mean", FLOAT, saved_shape),
+            ("saved_invstd", FLOAT, saved_shape),
+        ];
+        let mut parsed = parsed_nodes(
+            vec![node(
+                "torch.ops.aten._native_batch_norm_legit_no_training.default",
+                vec![
+                    tensor_input("input", "x"),
+                    tensor_input("weight", "w"),
+                    tensor_input("bias", "b"),
+                    tensor_input("running_mean", "rm"),
+                    tensor_input("running_var", "rv"),
+                    scalar_float("momentum", 0.1),
+                    scalar_float("eps", 1e-5),
+                ],
+                &["out", "saved_mean", "saved_invstd"],
+            )],
+            &tensors,
+            &["x", "w", "b", "rm", "rv"],
+            &["out", "saved_mean", "saved_invstd"],
+        );
+        for meta in parsed.program.graph_module.graph.tensor_values.values_mut() {
+            meta.device = Some(crate::pt2_schema::Device {
+                kind: device.into(),
+                index: (device == "cuda").then_some(0),
+            });
+        }
+        crate::translate::translate(&parsed).expect("batch norm translation failed")
+    }
+
+    fn depends_on_input(t: &Translation, id: NodeIndex, name: &str) -> bool {
+        let id = through_views(t, id);
+        is_input_named(op_of(t, id), name)
+            || operands(t, id)
+                .into_iter()
+                .any(|operand| depends_on_input(t, operand, name))
+    }
+
+    let cpu = translated("cpu", &[0]);
+    assert!(!depends_on_input(&cpu, cpu.outputs[1].tensor, "rm"));
+    assert!(!depends_on_input(&cpu, cpu.outputs[2].tensor, "rv"));
+
+    let cuda = translated("cuda", &[3]);
+    assert!(depends_on_input(&cuda, cuda.outputs[1].tensor, "rm"));
+    assert!(depends_on_input(&cuda, cuda.outputs[2].tensor, "rv"));
+}
+
+#[test]
 fn scalar_comparison_rounds_the_literal_to_the_operand_dtype() {
     let t = translate_one(
         node(
