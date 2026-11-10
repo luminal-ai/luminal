@@ -6,4 +6,6 @@ export LUMINAL_TEST_BACKEND=cuda_lite
 export LUMINAL_TEST_DEVICE=cuda
 uv run --group dev maturin develop --manifest-path ../reference/Cargo.toml
 uv run --group dev maturin develop
-uv run --group dev pytest -c pyproject.toml tests ../utils/tests ../reference/tests/models "$@"
+for suite in tests ../utils/tests ../reference/tests/models; do
+    uv run --group dev pytest -c pyproject.toml "$suite" "$@"
+done
