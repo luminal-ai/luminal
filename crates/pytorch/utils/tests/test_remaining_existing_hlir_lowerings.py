@@ -6,6 +6,16 @@ import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
 from backend_test_utils import luminal_backend
+from backend_test_utils import selected_backend
+
+
+_PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE = pytest.mark.skipif(
+    selected_backend() == "cuda_lite",
+    reason=(
+        "PyTorch registers no CUDA or fake implementation for aten.histogram; "
+        "Dynamo refuses the authored CUDA program before Luminal receives a graph"
+    ),
+)
 
 
 def _compile(module: torch.nn.Module, *inputs: torch.Tensor, dynamic_shapes=None):
@@ -484,6 +494,7 @@ class HistogramComposites(torch.nn.Module):
 
 
 @torch.no_grad()
+@_PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE
 def test_histogram_composites_have_fixed_bin_shapes() -> None:
     module = HistogramComposites()
     for dtype, tolerance in ((torch.float32, 1e-5), (torch.float64, 1e-7)):
@@ -603,6 +614,7 @@ def _histogram_density_operands(dtype):
 
 
 @torch.no_grad()
+@_PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE
 @pytest.mark.parametrize(
     "dtype, tolerance", ((torch.float32, 1e-5), (torch.float64, 1e-12))
 )
@@ -721,6 +733,7 @@ _UNIFORM_EDGE_SAMPLES = 24
 
 
 @torch.no_grad()
+@_PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE
 @pytest.mark.parametrize("density", (False, True))
 @pytest.mark.parametrize("bins", (1, 4, 7))
 def test_histogram_uniform_edges_match_eager_f32(device, bins, density) -> None:
@@ -758,6 +771,7 @@ def test_histogram_uniform_edges_match_eager_f32(device, bins, density) -> None:
 
 
 @torch.no_grad()
+@_PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE
 @pytest.mark.parametrize("density", (False, True))
 @pytest.mark.parametrize("bins", (1, 4, 7))
 def test_histogram_uniform_edges_match_eager_f64(device, bins, density) -> None:
@@ -802,6 +816,7 @@ def test_histogram_uniform_edges_match_eager_f64(device, bins, density) -> None:
 
 
 @torch.no_grad()
+@_PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE
 @pytest.mark.xfail(
     strict=True,
     reason=(
@@ -829,6 +844,7 @@ def test_histogram_f64_samples_on_interior_edges_match_eager(device) -> None:
 
 
 @torch.no_grad()
+@_PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE
 @pytest.mark.parametrize("density", (False, True))
 def test_histogramdd_uniform_edges_match_eager(device, density) -> None:
     """``_histogramdd_bin_edges`` and ``_histogramdd_from_bin_cts`` in F32.
@@ -915,6 +931,7 @@ _HISTOGRAM_UNIFORM_EDGE_REGRESSIONS = {
 
 
 @torch.no_grad()
+@_PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE
 @pytest.mark.parametrize("case", sorted(_HISTOGRAM_UNIFORM_EDGE_REGRESSIONS))
 def test_histogram_uniform_edge_regressions(device, case) -> None:
     values, bins, kwargs = _HISTOGRAM_UNIFORM_EDGE_REGRESSIONS[case]
@@ -928,6 +945,7 @@ def test_histogram_uniform_edge_regressions(device, case) -> None:
 
 
 @torch.no_grad()
+@_PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE
 def test_histogramdd_without_samples_matches_eager(device) -> None:
     points = torch.empty(0, 2, dtype=torch.float32)
 
@@ -1953,6 +1971,7 @@ class ZeroTestedFunctions(torch.nn.Module):
 
 
 @_FLOAT_DTYPES
+@_PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE
 def test_zero_tests_read_nan_as_nonzero(dtype, monkeypatch) -> None:
     # `tiny` is nonzero but below F32's range at F64: the test must not
     # narrow it to zero.
