@@ -308,8 +308,22 @@ impl Translator<'_> {
     }
 
     pub(super) fn translate_repeat(&mut self, node: &Node) -> Result<GraphTensor> {
-        let x = self.operand(&node.inputs[0])?;
+        let mut x = self.operand(&node.inputs[0])?;
         let repeats = self.get_ints_arg(node, 1)?;
+        anyhow::ensure!(
+            repeats.len() >= x.rank(),
+            "repeat count rank {} is smaller than input rank {}",
+            repeats.len(),
+            x.rank()
+        );
+        // PyTorch left-pads the input with unit dimensions when repeat carries
+        // more entries than the tensor has axes. GraphTensor::repeat states a
+        // same-rank movement, so make those authored leading axes explicit
+        // before recording it. This is the same normalization used by the
+        // complex-component path.
+        for _ in 0..(repeats.len() - x.rank()) {
+            x = x.unsqueeze(0);
+        }
         let repeats: Vec<usize> = repeats.iter().map(|r| (*r).max(0) as usize).collect();
         Ok(x.repeat(repeats.as_slice()))
     }
