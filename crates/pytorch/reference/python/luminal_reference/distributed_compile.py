@@ -141,7 +141,7 @@ class RegionBatch:
     def _request(job):
         if job.prepare_error is not None:
             return False, job.prepare_error
-        ep, inputs, _scalars = job.prepared
+        ep, inputs, _scalars, _carriers = job.prepared
         output = io.BytesIO()
         torch.export.save(ep, output)
         specs = [(tuple(int(d) for d in value.shape), value.dtype) for value in inputs]
@@ -227,7 +227,7 @@ class RegionBatch:
                     "leader returned a different number of reference regions"
                 )
             for index, (job, (_ok, artifact)) in enumerate(zip(self.jobs, result)):
-                ep, inputs, scalars = job.prepared
+                ep, inputs, scalars, carriers = job.prepared
                 job.model = compile_exported(
                     ep,
                     inputs,
@@ -237,6 +237,7 @@ class RegionBatch:
                     max_intermediate_bytes=job.options.get("max_intermediate_bytes"),
                     memory_budget_bytes=job.options.get("memory_budget_bytes"),
                     artifact=artifact,
+                    shape_carrier_indices=carriers,
                 )
                 if job.record is not None:
                     job.record.bounds = job.model._graph.dim_bounds
