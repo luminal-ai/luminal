@@ -60,6 +60,11 @@ fn idx_numel(dims: &[IntExpr]) -> Option<usize> {
         .try_fold(1usize, |acc, dim| acc.checked_mul(dim.to_usize()?))
 }
 
+/// Sequential duplicate-preserving scatter is represented by one graph step
+/// per possible update. Keep bounded symbolic exports useful without letting
+/// an adversarial shape range manufacture an impractically large graph.
+const MAX_UNROLLED_SCATTER_UPDATES: usize = 4096;
+
 /// Whether `from` broadcasts to `to` right-aligned.
 fn idx_can_broadcast_to(from: &[IntExpr], to: &[IntExpr]) -> bool {
     if from.len() > to.len() {
@@ -358,6 +363,52 @@ impl Translator<'_> {
         }
     }
 
+    fn idx_update_steps(
+        &self,
+        dims: &[IntExpr],
+        operation: &str,
+    ) -> Result<(usize, Option<IntExpr>)> {
+        if let Some(count) = idx_numel(dims) {
+            return Ok((count, None));
+        }
+        let count = dims
+            .iter()
+            .copied()
+            .fold(IntExpr::from(1), |product, extent| product * extent);
+        let maximum = super::sympy::bounds_of_expr(count, &self.symbol_ranges)
+            .max
+            .and_then(|maximum| usize::try_from(maximum).ok())
+            .with_context(|| {
+                format!("{operation} requires a concrete or bounded update element count")
+            })?;
+        anyhow::ensure!(
+            maximum <= MAX_UNROLLED_SCATTER_UPDATES,
+            "{operation} update bound {maximum} exceeds the compiler unroll limit of \
+             {MAX_UNROLLED_SCATTER_UPDATES}"
+        );
+        Ok((maximum, Some(count)))
+    }
+
+    fn idx_pad_flat_to_steps(&mut self, tensor: GraphTensor, steps: usize) -> GraphTensor {
+        let padding = self.full_tensor(vec![IntExpr::from(steps)], tensor.dtype, 0.0);
+        tensor
+            .flatten()
+            .concat_along(padding, 0)
+            .slice_along(0..steps, 0)
+    }
+
+    fn idx_step_active(
+        &mut self,
+        actual_count: Option<IntExpr>,
+        step: usize,
+    ) -> Option<GraphTensor> {
+        actual_count.map(|actual_count| {
+            let step = self.cx.iota(vec![1usize], |_| IntExpr::from(step));
+            let count = self.cx.iota(vec![1usize], |_| actual_count);
+            step.lt(count)
+        })
+    }
+
     /// Sequential read/modify/write scatter-reduce: duplicate destinations
     /// must accumulate in update order and the recorder's scatter is
     /// overwrite-only, so one static graph step per update element.
@@ -376,8 +427,7 @@ impl Translator<'_> {
                 data.rank()
             );
         }
-        let count = idx_numel(&updates.dims())
-            .context("scatter reduction requires a concrete update element count")?;
+        let (count, actual_count) = self.idx_update_steps(&updates.dims(), "scatter reduction")?;
         let bool_data = data.dtype == DType::Bool;
         if bool_data && matches!(reduction, IdxReduce::Mean) {
             bail!("scatter reduction `mean` on Bool data is not ported");
@@ -467,7 +517,17 @@ impl Translator<'_> {
         let int_data = idx_is_int(data.dtype);
         let original_work = to_working(data);
         let mut output = original_work;
-        let flat_updates = updates.flatten();
+        let flat_updates = if actual_count.is_some() {
+            self.idx_pad_flat_to_steps(updates, count)
+        } else {
+            updates.flatten()
+        };
+        if actual_count.is_some() {
+            flat_coords = flat_coords
+                .into_iter()
+                .map(|coord| self.idx_pad_flat_to_steps(coord, count))
+                .collect();
+        }
         let track_counts = !include_self || matches!(reduction, IdxReduce::Mean);
         // Torch counts in the data dtype for integer data (`count` is
         // `ones_like(self)` plus a `scatter_add_` of ones).
@@ -478,6 +538,7 @@ impl Translator<'_> {
             if include_self { 1.0 } else { 0.0 },
         );
         for step in 0..count {
+            let active = self.idx_step_active(actual_count, step);
             let dest: Vec<GraphTensor> = flat_coords
                 .iter()
                 .map(|coord| coord.slice_along(step..step + 1, 0))
@@ -520,6 +581,9 @@ impl Translator<'_> {
                     }
                 }
             };
+            if let Some(active) = active {
+                combined = self.idx_cond(active, combined, current);
+            }
             if track_counts {
                 // The per-destination update count is bounded by the
                 // number of unrolled steps, far below 2^24, so an F32 count
@@ -531,7 +595,10 @@ impl Translator<'_> {
                     combined = self.idx_cond(first_update, update, combined);
                 }
                 let one = self.constant_like(count_here, 1.0);
-                let next_count = self.torch_add(count_here, one);
+                let mut next_count = self.torch_add(count_here, one);
+                if let Some(active) = active {
+                    next_count = self.idx_cond(active, next_count, count_here);
+                }
                 counts = counts.scatter(&dest, next_count);
             }
             output = output.scatter(&dest, combined);
@@ -986,18 +1053,28 @@ impl Translator<'_> {
         update_imag: GraphTensor,
     ) -> Result<(GraphTensor, GraphTensor)> {
         let update_dims = update_real.dims();
-        let count = idx_numel(&update_dims)
-            .context("complex scatter product requires a concrete update element count")?;
+        let (count, actual_count) =
+            self.idx_update_steps(&update_dims, "complex scatter product")?;
         if count == 0 || idx_numel(&real.dims()) == Some(0) {
             return Ok((real, imag));
         }
-        let coords: Vec<GraphTensor> = self
+        let mut coords: Vec<GraphTensor> = self
             .idx_coordinate_tensors(plan, &update_dims)
             .into_iter()
             .map(GraphTensor::flatten)
             .collect();
-        let update_real = update_real.flatten();
-        let update_imag = update_imag.flatten();
+        let (update_real, update_imag) = if actual_count.is_some() {
+            coords = coords
+                .into_iter()
+                .map(|coord| self.idx_pad_flat_to_steps(coord, count))
+                .collect();
+            (
+                self.idx_pad_flat_to_steps(update_real, count),
+                self.idx_pad_flat_to_steps(update_imag, count),
+            )
+        } else {
+            (update_real.flatten(), update_imag.flatten())
+        };
         let storage_dtype = real.dtype;
         let compute_dtype = if storage_dtype.is_narrow_float() {
             DType::F32
@@ -1005,26 +1082,33 @@ impl Translator<'_> {
             storage_dtype
         };
         for step in 0..count {
+            let active = self.idx_step_active(actual_count, step);
             let dest: Vec<GraphTensor> = coords
                 .iter()
                 .map(|coord| coord.slice_along(step..step + 1, 0))
                 .collect();
-            let current_real = real.gather(&dest).cast(compute_dtype);
-            let current_imag = imag.gather(&dest).cast(compute_dtype);
+            let stored_real = real.gather(&dest);
+            let stored_imag = imag.gather(&dest);
+            let current_real = stored_real.cast(compute_dtype);
+            let current_imag = stored_imag.cast(compute_dtype);
             let incoming_real = update_real
                 .slice_along(step..step + 1, 0)
                 .cast(compute_dtype);
             let incoming_imag = update_imag
                 .slice_along(step..step + 1, 0)
                 .cast(compute_dtype);
-            let next_real = util::round_to_storage(
+            let mut next_real = util::round_to_storage(
                 current_real * incoming_real - current_imag * incoming_imag,
                 storage_dtype,
             );
-            let next_imag = util::round_to_storage(
+            let mut next_imag = util::round_to_storage(
                 current_real * incoming_imag + current_imag * incoming_real,
                 storage_dtype,
             );
+            if let Some(active) = active {
+                next_real = self.idx_cond(active, next_real, stored_real);
+                next_imag = self.idx_cond(active, next_imag, stored_imag);
+            }
             real = real.scatter(&dest, next_real);
             imag = imag.scatter(&dest, next_imag);
         }
@@ -1040,25 +1124,42 @@ impl Translator<'_> {
         update_imag: GraphTensor,
     ) -> Result<(GraphTensor, GraphTensor)> {
         let update_dims = update_real.dims();
-        let count = idx_numel(&update_dims)
-            .context("complex scatter overwrite requires a concrete update element count")?;
+        let (count, actual_count) =
+            self.idx_update_steps(&update_dims, "complex scatter overwrite")?;
         if count == 0 || idx_numel(&real.dims()) == Some(0) {
             return Ok((real, imag));
         }
-        let coords: Vec<GraphTensor> = self
+        let mut coords: Vec<GraphTensor> = self
             .idx_coordinate_tensors(plan, &update_dims)
             .into_iter()
             .map(GraphTensor::flatten)
             .collect();
-        let update_real = update_real.flatten();
-        let update_imag = update_imag.flatten();
+        let (update_real, update_imag) = if actual_count.is_some() {
+            coords = coords
+                .into_iter()
+                .map(|coord| self.idx_pad_flat_to_steps(coord, count))
+                .collect();
+            (
+                self.idx_pad_flat_to_steps(update_real, count),
+                self.idx_pad_flat_to_steps(update_imag, count),
+            )
+        } else {
+            (update_real.flatten(), update_imag.flatten())
+        };
         for step in 0..count {
+            let active = self.idx_step_active(actual_count, step);
             let dest: Vec<GraphTensor> = coords
                 .iter()
                 .map(|coord| coord.slice_along(step..step + 1, 0))
                 .collect();
-            real = real.scatter(&dest, update_real.slice_along(step..step + 1, 0));
-            imag = imag.scatter(&dest, update_imag.slice_along(step..step + 1, 0));
+            let mut incoming_real = update_real.slice_along(step..step + 1, 0);
+            let mut incoming_imag = update_imag.slice_along(step..step + 1, 0);
+            if let Some(active) = active {
+                incoming_real = self.idx_cond(active, incoming_real, real.gather(&dest));
+                incoming_imag = self.idx_cond(active, incoming_imag, imag.gather(&dest));
+            }
+            real = real.scatter(&dest, incoming_real);
+            imag = imag.scatter(&dest, incoming_imag);
         }
         Ok((real, imag))
     }
