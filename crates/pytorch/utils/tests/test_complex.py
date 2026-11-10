@@ -386,13 +386,6 @@ def test_complex_asin_asinh_avoid_cancellation():
         (torch.complex128, torch.float64, 1e-8, 1e-10),
     ),
 )
-@pytest.mark.xfail(
-    reason=(
-        "egglog's f64 value domain equates +0.0 and -0.0, so lowering "
-        "cannot preserve every complex branch-cut zero sign"
-    ),
-    strict=True,
-)
 def test_complex_acos_acosh_branch_cuts_and_special_values(
     dtype, component_dtype, rtol, atol
 ):
@@ -449,13 +442,6 @@ def test_complex_acos_acosh_branch_cuts_and_special_values(
     ("dtype", "component_dtype"),
     ((torch.complex64, torch.float32), (torch.complex128, torch.float64)),
 )
-@pytest.mark.xfail(
-    reason=(
-        "egglog's f64 value domain equates +0.0 and -0.0, so lowering "
-        "cannot preserve every complex IEEE zero sign"
-    ),
-    strict=True,
-)
 def test_complex_ieee_special_values(dtype, component_dtype):
     subnormal = torch.nextafter(
         torch.tensor(0.0, dtype=component_dtype),
@@ -484,14 +470,8 @@ def test_complex_ieee_special_values(dtype, component_dtype):
     b = values[None, :].expand(len(values), -1).clone()
     expected = ComplexSpecialValues()(a, b)
     actual = _compile_and_run(ComplexSpecialValues(), a, b)
-    for index, (result, reference) in enumerate(zip(actual, expected)):
-        # PyTorch and HLIR differ only in the sign bit of a few zero-valued
-        # subtraction/division results; their values and classifications agree.
-        _assert_ieee_equal(
-            result.resolve_conj(),
-            reference.resolve_conj(),
-            check_zero_sign=index not in (5, 7),
-        )
+    for result, reference in zip(actual, expected):
+        _assert_ieee_equal(result.resolve_conj(), reference.resolve_conj())
 
 
 class ComplexEmpty(torch.nn.Module):
@@ -529,8 +509,8 @@ def test_complex_scalar_casts_and_noncontiguous_negative_views():
         _assert_close(result, reference, rtol=0, atol=0)
 
 
-# Complex user inputs are refused upstream (LUM-1100), so these graphs build
-# their complex value in-graph from real components.
+# These cases build complex values in-graph to exercise branch-cut behavior
+# independently of the interleaved complex input boundary.
 
 
 class NegativeRealAxis(torch.nn.Module):

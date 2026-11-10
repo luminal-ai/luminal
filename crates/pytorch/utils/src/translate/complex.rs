@@ -1188,7 +1188,7 @@ impl Translator<'_> {
     // Complex algebra
     // ---------------------------------------------------------------
 
-    fn complex_mul(&self, a: ComplexTensor, b: ComplexTensor) -> ComplexTensor {
+    fn complex_mul(&mut self, a: ComplexTensor, b: ComplexTensor) -> ComplexTensor {
         let storage = a.real.dtype;
         let compute = if storage.is_narrow_float() {
             DType::F32
@@ -1201,11 +1201,43 @@ impl Translator<'_> {
             b.real.cast(compute),
             b.imag.cast(compute),
         );
-        ComplexTensor::new(
-            super::util::round_to_storage(ar * br - ai * bi, storage),
-            super::util::round_to_storage(ar * bi + ai * br, storage),
-            a.torch_dtype,
-        )
+        let real_product = ar * br;
+        let imag_product = ai * bi;
+        let mut real = super::util::round_to_storage(real_product - imag_product, storage);
+        let imag = super::util::round_to_storage(ar * bi + ai * br, storage);
+
+        // PyTorch's AArch64 CPU complex64 kernel returns -0 for the real
+        // component when two positive, nonzero products both underflow to
+        // zero before their subtraction. Its x86 kernel, complex128, and CUDA
+        // return +0. This differs from subtracting two already-rounded +0
+        // scalar products, so preserve the authored target's signed-zero
+        // boundary explicitly.
+        let cpu = self
+            .device
+            .as_ref()
+            .is_some_and(|device| device.kind == "cpu");
+        if cpu && cfg!(target_arch = "aarch64") && storage == DType::F32 {
+            let real_underflow = cx_bool_and(
+                self.is_zero(real_product),
+                cx_bool_and(cx_bool_not(self.is_zero(ar)), cx_bool_not(self.is_zero(br))),
+            );
+            let imag_underflow = cx_bool_and(
+                self.is_zero(imag_product),
+                cx_bool_and(cx_bool_not(self.is_zero(ai)), cx_bool_not(self.is_zero(bi))),
+            );
+            let real_product_positive = self.signbit(ar).eq(self.signbit(br));
+            let imag_product_positive = self.signbit(ai).eq(self.signbit(bi));
+            let force_negative_zero = cx_bool_and(
+                cx_bool_and(real_underflow, imag_underflow),
+                cx_bool_and(real_product_positive, imag_product_positive),
+            );
+            let zero = self.constant_like(real, 0.0);
+            let negative_one = self.constant_like(real, -1.0);
+            let negative_zero = self.copy_sign(zero, negative_one);
+            real = self.cx_select(force_negative_zero, negative_zero, real);
+        }
+
+        ComplexTensor::new(real, imag, a.torch_dtype)
     }
 
     fn complex_matmul(&self, a: ComplexTensor, b: ComplexTensor) -> ComplexTensor {
@@ -1378,22 +1410,9 @@ impl Translator<'_> {
         let b_real_inf = self.is_inf(b.real);
         let b_imag_inf = self.is_inf(b.imag);
         let denominator_inf = cx_bool_or(b_real_inf, b_imag_inf);
-        let denominator_one_inf = b_real_inf.ne(b_imag_inf);
         let a_real_inf = self.is_inf(a.real);
         let a_imag_inf = self.is_inf(a.imag);
         let numerator_inf = cx_bool_or(a_real_inf, a_imag_inf);
-
-        let c = self.signed_indicator(b.real, b_real_inf);
-        let d = self.signed_indicator(b.imag, b_imag_inf);
-        let zero = self.constant_like(a.real, 0.0);
-        let inf_den_real = zero * (a.real * c + a.imag * d);
-        let inf_den_imag = zero * (a.imag * c - a.real * d);
-        let denominator_inf_only = {
-            let numerator_not_inf = cx_bool_not(numerator_inf);
-            cx_bool_and(denominator_one_inf, numerator_not_inf)
-        };
-        result.real = self.cx_select(denominator_inf_only, inf_den_real, result.real);
-        result.imag = self.cx_select(denominator_inf_only, inf_den_imag, result.imag);
 
         let ar = self.signed_indicator(a.real, a_real_inf);
         let ai = self.signed_indicator(a.imag, a_imag_inf);
@@ -1416,10 +1435,10 @@ impl Translator<'_> {
         let b_real_zero = self.is_zero(b.real);
         let b_imag_zero = self.is_zero(b.imag);
         let denominator_zero = cx_bool_and(b_real_zero, b_imag_zero);
-        let real_inf = self.signed_constant_like(b.real, f64::INFINITY);
-        let imag_inf = self.signed_constant_like(b.imag, f64::INFINITY);
-        result.real = self.cx_select(denominator_zero, real_inf * a.real, result.real);
-        result.imag = self.cx_select(denominator_zero, imag_inf * a.imag, result.imag);
+        // Eager ignores both denominator sign bits for complex zero division.
+        let infinity = self.constant_like(b.real, f64::INFINITY);
+        result.real = self.cx_select(denominator_zero, infinity * a.real, result.real);
+        result.imag = self.cx_select(denominator_zero, infinity * a.imag, result.imag);
         Ok(result)
     }
 
@@ -1440,9 +1459,15 @@ impl Translator<'_> {
         b.real = br;
         b.imag = bi;
 
-        if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
-            b = self.scale_addend(node, b)?;
-        }
+        // ATen evaluates complex add/sub as `self + signed_alpha * other`.
+        // The complex multiply is observable even for unit alpha: its zero
+        // cross terms propagate infinities and signed zeros exactly like eager.
+        let op = if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+            b = self.scale_addend(node, b, matches!(op, BinaryOp::Sub))?;
+            BinaryOp::Add
+        } else {
+            op
+        };
         self.apply_complex_binary(op, a, b)
     }
 
@@ -1456,19 +1481,33 @@ impl Translator<'_> {
         let a = self.value_as_complex(self.input_value_name(node, 0)?, dtype)?;
         let (scalar_real, scalar_imag) = self.complex_scalar_arg(node, 1)?;
         let mut scalar = self.complex_constant_like(a.real, scalar_real, scalar_imag, dtype);
-        if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
-            scalar = self.scale_addend(node, scalar)?;
-        }
+        // Preserve the same scaled-addend boundary for scalar overloads.
+        let op = if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+            scalar = self.scale_addend(node, scalar, matches!(op, BinaryOp::Sub))?;
+            BinaryOp::Add
+        } else {
+            op
+        };
         self.apply_complex_binary(op, a, scalar)
     }
 
-    fn scale_addend(&mut self, node: &Node, value: ComplexTensor) -> Result<ComplexTensor> {
-        let (real, imag) = match node.inputs.iter().position(|input| input.name == "alpha") {
+    fn scale_addend(
+        &mut self,
+        node: &Node,
+        value: ComplexTensor,
+        subtract: bool,
+    ) -> Result<ComplexTensor> {
+        let (mut real, mut imag) = match node.inputs.iter().position(|input| input.name == "alpha")
+        {
             Some(index) => self.complex_scalar_arg(node, index)?,
             None => (1.0, 0.0),
         };
-        if real == 1.0 && imag == 0.0 {
-            return Ok(value);
+        if subtract {
+            real = -real;
+            imag = -imag;
+            if imag == 0.0 {
+                imag = 0.0;
+            }
         }
         let alpha = self.complex_constant_like(value.real, real, imag, value.torch_dtype);
         Ok(self.complex_mul(value, alpha))
@@ -1643,18 +1682,50 @@ impl Translator<'_> {
             stable_signed_acosh,
             signed_acosh,
         );
-        let signed_acos = self.copy_sign(acos_beta, value.imag);
+        let mut signed_acos = self.copy_sign(acos_beta, value.imag);
 
         let mut acos_real = acos_beta;
         let mut acos_imag = signed_acosh * -1.0;
+
+        // PyTorch's x86-64 CPU complex128 kernel canonicalizes the imaginary
+        // result to +0 on the interior real-axis branch. Its complex64 kernel
+        // and the AArch64 kernels retain the C99 sign selected above. This is
+        // observable model behavior, so match the authored CPU kernel instead
+        // of treating the two zero encodings as interchangeable.
+        if cfg!(target_arch = "x86_64")
+            && self
+                .device
+                .as_ref()
+                .is_some_and(|device| device.kind == "cpu")
+            && value.real.dtype == DType::F64
+        {
+            let on_real_axis = self.is_zero(value.imag);
+            let inside_branch_cut = cx_bool_and(value.real.gt(one * -1.0), value.real.lt(one));
+            let canonical_zero = self.constant_like(acos_imag, 0.0);
+            acos_imag = self.cx_select(
+                cx_bool_and(on_real_axis, inside_branch_cut),
+                canonical_zero,
+                acos_imag,
+            );
+        }
 
         let real_zero = self.is_zero(value.real);
         let zero_with_nan_imag = cx_bool_and(real_zero, imag_nan);
         let half_pi = self.constant_like(acos_real, std::f64::consts::FRAC_PI_2);
         acos_real = self.cx_select(zero_with_nan_imag, half_pi, acos_real);
+        // CPU acosh preserves the limiting +pi/2 imaginary component at
+        // either signed real zero with a NaN imaginary component. CUDA's
+        // authored behavior leaves this component NaN.
+        if self
+            .device
+            .as_ref()
+            .is_some_and(|device| device.kind == "cpu")
+        {
+            signed_acos = self.cx_select(zero_with_nan_imag, half_pi, signed_acos);
+        }
         let real_inf_with_nan_imag = cx_bool_and(real_inf, imag_nan);
-        let signed_infinity = self.signed_constant_like(value.real, f64::INFINITY);
-        acos_imag = self.cx_select(real_inf_with_nan_imag, signed_infinity, acos_imag);
+        let negative_infinity = self.constant_like(value.real, f64::NEG_INFINITY);
+        acos_imag = self.cx_select(real_inf_with_nan_imag, negative_infinity, acos_imag);
 
         let mut asin_real = self.cx_asin(beta);
         asin_real = self.cx_select(zero_with_nan_imag, value.real, asin_real);
