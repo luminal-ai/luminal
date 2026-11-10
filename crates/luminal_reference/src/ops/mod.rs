@@ -67,6 +67,7 @@ pub(crate) mod scatter;
 pub(crate) mod select;
 pub(crate) mod sin;
 pub(crate) mod sqrt;
+pub(crate) mod tanh;
 pub(crate) mod trunc;
 pub(crate) mod trunc_cast;
 
@@ -112,6 +113,7 @@ pub use rounding_cast::RoundingCast;
 pub use scatter::ScatterFunctional;
 pub use sin::SinFunctional;
 pub use sqrt::SqrtFunctional;
+pub use tanh::TanhFunctional;
 pub use trunc::TruncFunctional;
 pub use trunc_cast::TruncCast;
 pub use wrapping_add::WrappingAddFunctional;
@@ -147,6 +149,7 @@ pub use rounding_cast::RoundingCastDps;
 pub use scatter::ScatterFunctionalDps;
 pub use sin::SinFunctionalDps;
 pub use sqrt::SqrtFunctionalDps;
+pub use tanh::TanhFunctionalDps;
 pub use trunc::TruncFunctionalDps;
 pub use trunc_cast::TruncCastDps;
 pub use wrapping_add::WrappingAddFunctionalDps;
@@ -182,6 +185,7 @@ pub use scatter::ScatterFunctionalMatcher;
 pub use select::{SelectFunctional, SelectFunctionalDps, SelectFunctionalMatcher};
 pub use sin::SinFunctionalMatcher;
 pub use sqrt::SqrtFunctionalMatcher;
+pub use tanh::TanhFunctionalMatcher;
 pub use trunc::TruncFunctionalMatcher;
 pub use trunc_cast::TruncCastMatcher;
 pub use trunc_div::{TruncDivFunctional, TruncDivFunctionalDps, TruncDivFunctionalMatcher};
@@ -372,6 +376,10 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(SinFunctionalMatcher),
                 kernel: entry::<SinFunctionalDps>("SinFunctionalGeneric", sin::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(TanhFunctionalMatcher),
+                kernel: entry::<TanhFunctionalDps>("TanhFunctionalGeneric", tanh::kernel),
             },
             ReferenceOp {
                 matcher: || Box::new(RecipFunctionalMatcher),

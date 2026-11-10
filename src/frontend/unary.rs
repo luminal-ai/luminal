@@ -523,7 +523,13 @@ impl GraphTensor {
 
     /// The tanh activation function
     pub fn tanh(self) -> GraphTensor {
-        (self * 2.0).sigmoid() * 2.0 - 1.0
+        let new_id = self.graph().logical.op(
+            LogicalOp::Tanh,
+            &[(self.id, self.dims())],
+            self.dims(),
+            self.dtype,
+        );
+        GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
     /// The leaky relu activation function
@@ -567,9 +573,8 @@ impl GraphTensor {
     /// what cuBLASLt's GELU epilogue / the GLUMoE Gemma-GELU recognition match.
     #[allow(clippy::excessive_precision)]
     pub fn gelu_fast_tanh_approximation(self) -> GraphTensor {
-        // Based on https://github.com/tinygrad/tinygrad/blob/9fc4465557831b614b56dd645eebc940ca0fa1bb/tinygrad/tensor.py#L1162C26-L1162C104
-        let scaled = 1.5957691216 * self * (1. + 0.044715 * self * self);
-        self * scaled.sigmoid()
+        let scaled = 0.7978845608028654 * self * (1. + 0.044715 * self * self);
+        0.5 * self * (1. + scaled.tanh())
     }
 
     /// Compute the sorted indexes of this tensor along a certian axis

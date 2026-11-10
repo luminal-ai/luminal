@@ -104,7 +104,6 @@ test_hlir_ops.py::test_conv2d_dilation_pt2
 test_hlir_ops.py::test_conv2d_no_pad_pt2
 test_hlir_ops.py::test_conv3d_same_pad_pt2
 test_hlir_ops.py::test_depthwise_multiplier_conv2d_pt2
-test_hlir_ops.py::test_gelu_tanh
 test_hlir_ops.py::test_grouped_conv2d_groups3_batch4_pt2
 test_hlir_ops.py::test_input_backed_index_put_mutates_caller_tensor
 test_hlir_ops.py::test_int_index_put_scalar_src

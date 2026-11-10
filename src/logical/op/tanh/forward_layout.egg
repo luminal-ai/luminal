@@ -1,0 +1,11 @@
+; Forward LayoutTensor Propagation : Logical Tanh
+(rule
+  (
+    (= ?out_logical (LogicalTanh ?in_logical))
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+  )
+  (
+    (let new_out_layout_tensor (LayoutTensorLit ?out_logical ?in_layout)) ; Forward Propagation
+  )
+  :ruleset main_ruleset :name "tanh/forward_layout: LogicalTanh result in the operand's layout"
+)

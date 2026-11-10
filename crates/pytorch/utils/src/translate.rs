@@ -39,6 +39,8 @@ mod expr;
 mod frexp;
 #[cfg(test)]
 mod gcd_tests;
+#[cfg(test)]
+mod gelu_tests;
 mod grouped_mm;
 mod index;
 #[cfg(test)]

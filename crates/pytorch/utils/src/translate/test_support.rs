@@ -63,6 +63,10 @@ pub(crate) fn scalar_bool(name: &str, value: bool) -> NodeInput {
     input(name, Argument::Bool(BoolArg { as_bool: value }))
 }
 
+pub(crate) fn string(name: &str, value: &str) -> NodeInput {
+    input(name, Argument::Other(serde_json::json!(value)))
+}
+
 pub(crate) fn scalar_type(name: &str, code: u32) -> NodeInput {
     input(
         name,
