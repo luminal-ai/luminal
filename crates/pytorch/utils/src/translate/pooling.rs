@@ -613,11 +613,26 @@ impl Translator<'_> {
             output += bias;
         }
 
+        let cuda_no_training = no_training
+            && self
+                .device
+                .as_ref()
+                .is_some_and(|device| device.kind == "cuda");
         let mut bound = vec![output.cast(input.dtype)];
-        for (index, statistic) in [(1usize, batch_mean), (2usize, Some(invstd))] {
+        for (index, statistic) in [
+            (
+                1usize,
+                if cuda_no_training {
+                    Some(mean)
+                } else {
+                    batch_mean
+                },
+            ),
+            (2usize, Some(invstd)),
+        ] {
             if output_names.len() > index {
-                bound.push(if training {
-                    statistic.context("training batch norm statistic is missing")?
+                bound.push(if training || cuda_no_training {
+                    statistic.context("batch norm statistic is missing")?
                 } else {
                     self.zero_for_output(&output_names[index])?
                 });
