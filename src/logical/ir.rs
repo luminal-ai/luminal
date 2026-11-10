@@ -142,6 +142,7 @@ pub enum LogicalOp {
     Exp2,
     Log2,
     Sin,
+    Tanh,
     Floor,
     Ceil,
     Trunc,
@@ -225,6 +226,7 @@ impl LogicalOp {
             Self::Exp2 => "LogicalExp2",
             Self::Log2 => "LogicalLog2",
             Self::Sin => "LogicalSin",
+            Self::Tanh => "LogicalTanh",
             Self::Floor => "LogicalFloor",
             Self::Ceil => "LogicalCeil",
             Self::Trunc => "LogicalTrunc",
@@ -274,6 +276,7 @@ impl LogicalOp {
             | Self::Exp2
             | Self::Log2
             | Self::Sin
+            | Self::Tanh
             | Self::Floor
             | Self::Ceil
             | Self::Trunc
@@ -331,6 +334,7 @@ impl LogicalOp {
             | Self::Exp2
             | Self::Log2
             | Self::Sin
+            | Self::Tanh
             | Self::Floor
             | Self::Ceil
             | Self::Trunc

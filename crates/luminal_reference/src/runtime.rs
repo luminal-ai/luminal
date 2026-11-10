@@ -92,6 +92,7 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
         | "LeftSequentialScanSum"
         | "SelectFunctionalGeneric"
         | "SinFunctionalGeneric"
+        | "TanhFunctionalGeneric"
         | "SqrtFunctionalGeneric"
         | "TruncCastGeneric"
         | "RoundingCastGeneric"
@@ -1287,6 +1288,7 @@ mod tests {
             "LayoutTensorOpScatterFunctionalGeneric",
             "LayoutTensorOpSelectFunctionalGeneric",
             "LayoutTensorOpSinFunctionalGeneric",
+            "LayoutTensorOpTanhFunctionalGeneric",
             "LayoutTensorOpSqrtFunctionalGeneric",
             "LayoutTensorOpTruncCastGeneric",
             "LayoutTensorOpRoundingCastGeneric",

@@ -1,0 +1,12 @@
+; Shape Propagation : LogicalTanh
+(rule
+  (
+    (= ?out_logical (LogicalTanh ?in_logical))
+    (= ?shape (shape-of ?in_logical))
+  )
+  (
+    (set (shape-of ?out_logical) ?shape)
+  )
+  :ruleset prop
+  :name "tanh/shape: shape of LogicalTanh from its operand"
+)

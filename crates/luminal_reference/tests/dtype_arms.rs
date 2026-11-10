@@ -4,7 +4,7 @@
 //! an f32 detour, an i32 accumulator, comparing raw float codes — fails.
 
 use luminal::buffer_tensor_ir::BufferTensorIrOp;
-use luminal::prelude::f16;
+use luminal::prelude::{bf16, f16};
 use luminal_reference::{ReferenceKernelCtx, TypedBuffer, kernels, ops};
 
 fn run(
@@ -61,6 +61,52 @@ fn narrow_float_less_than_compares_values_not_codes() {
     let lhs = f(&[-2.0, -0.0, 1.0, f32::NAN]);
     let rhs = f(&[1.0, 0.0, -3.0, 1.0]);
     assert_eq!(less_than(lhs, rhs), vec![1, 0, 0, 0]);
+}
+
+#[test]
+fn narrow_transcendentals_use_f32_opmath_and_round_once() {
+    let values = [-2.0, -0.0, 0.25, 1.5, f32::INFINITY, f32::NAN];
+    let f16_input: Vec<_> = values.into_iter().map(f16::from_f32).collect();
+    let f16_expected: Vec<_> = f16_input
+        .iter()
+        .map(|value| f16::from_f32(value.to_f32().tanh()).to_bits())
+        .collect();
+    let f16_output = run(
+        &ops::TanhFunctionalDps,
+        vec![TypedBuffer::F16(f16_input)],
+        TypedBuffer::F16(vec![f16::ZERO; values.len()]),
+    )
+    .unwrap();
+    assert_eq!(
+        f16_output
+            .as_f16()
+            .unwrap()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        f16_expected
+    );
+
+    let bf16_input: Vec<_> = values.into_iter().map(bf16::from_f32).collect();
+    let bf16_expected: Vec<_> = bf16_input
+        .iter()
+        .map(|value| bf16::from_f32(value.to_f32().tanh()).to_bits())
+        .collect();
+    let bf16_output = run(
+        &ops::TanhFunctionalDps,
+        vec![TypedBuffer::Bf16(bf16_input)],
+        TypedBuffer::Bf16(vec![bf16::ZERO; values.len()]),
+    )
+    .unwrap();
+    assert_eq!(
+        bf16_output
+            .as_bf16()
+            .unwrap()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        bf16_expected
+    );
 }
 
 #[test]
