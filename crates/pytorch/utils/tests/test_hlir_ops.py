@@ -1001,8 +1001,8 @@ def test_view_then_add_matches_eager(
     view: Callable[..., torch.Tensor],
     shapes: list[tuple[int, ...]],
 ) -> None:
-    generator = torch.Generator().manual_seed(0)
-    inputs = [torch.rand(shape, generator=generator).to(device) for shape in shapes]
+    generator = torch.Generator(device=device).manual_seed(0)
+    inputs = [torch.rand(shape, generator=generator, device=device) for shape in shapes]
     model = _ViewThenAdd(view)
     expected = model(*inputs)
     actual = torch.compile(model, backend=luminal_backend)(*inputs)
