@@ -87,12 +87,14 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
         | "RecipFunctionalGeneric"
         | "ReduceMaxGeneric"
         | "ReduceSumGeneric"
+        | "RoundDecimalsFunctionalGeneric"
         | "RoundFunctionalGeneric"
         | "LeftSequentialScanMax"
         | "LeftSequentialScanProd"
         | "LeftSequentialScanSum"
         | "SelectFunctionalGeneric"
         | "SinFunctionalGeneric"
+        | "TanhFunctionalGeneric"
         | "SqrtFunctionalGeneric"
         | "TruncCastGeneric"
         | "RoundingCastGeneric"
@@ -1285,10 +1287,12 @@ mod tests {
             "LayoutTensorOpRecipFunctionalGeneric",
             "LayoutTensorOpReduceMaxGeneric",
             "LayoutTensorOpReduceSumGeneric",
+            "LayoutTensorOpRoundDecimalsFunctionalGeneric",
             "LayoutTensorOpRoundFunctionalGeneric",
             "LayoutTensorOpScatterFunctionalGeneric",
             "LayoutTensorOpSelectFunctionalGeneric",
             "LayoutTensorOpSinFunctionalGeneric",
+            "LayoutTensorOpTanhFunctionalGeneric",
             "LayoutTensorOpSqrtFunctionalGeneric",
             "LayoutTensorOpTruncCastGeneric",
             "LayoutTensorOpRoundingCastGeneric",

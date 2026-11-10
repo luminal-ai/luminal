@@ -63,11 +63,13 @@ pub mod recip;
 pub mod reduce_max;
 pub mod reduce_sum;
 pub mod round;
+pub mod round_decimals;
 pub mod rounding_cast;
 pub mod scatter;
 pub mod select;
 pub mod sin;
 pub mod sqrt;
+pub mod tanh;
 pub mod tf32_round_trip;
 pub mod trunc;
 pub mod trunc_cast;
@@ -193,6 +195,10 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(ceil::CeilFunctionalMatcher, ceil::CeilFunctional),
         reg(trunc::TruncFunctionalMatcher, trunc::TruncFunctional),
         reg(round::RoundFunctionalMatcher, round::RoundFunctional),
+        reg(
+            round_decimals::RoundDecimalsFunctionalMatcher,
+            round_decimals::RoundDecimalsFunctional { decimals: 0 },
+        ),
         reg(trunc_cast::TruncCastMatcher, trunc_cast::TruncCast),
         reg(
             rounding_cast::RoundingCastMatcher,
@@ -270,6 +276,7 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(exp2::Exp2FunctionalMatcher, exp2::Exp2Functional),
         reg(log2::Log2FunctionalMatcher, log2::Log2Functional),
         reg(sin::SinFunctionalMatcher, sin::SinFunctional),
+        reg(tanh::TanhFunctionalMatcher, tanh::TanhFunctional),
         reg(recip::RecipFunctionalMatcher, recip::RecipFunctional),
         reg(modulo::ModFunctionalMatcher, modulo::ModFunctional),
         reg(less_than::LessThanMatcher, less_than::LessThan),

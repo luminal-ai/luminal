@@ -190,6 +190,14 @@ impl Translator<'_> {
 
     pub(super) fn translate_gelu(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.unary_input(node)?;
+        let approximate = named_string(node, "approximate").unwrap_or_else(|| "none".into());
+        if approximate == "tanh" {
+            return Ok(x.gelu_fast_tanh_approximation());
+        }
+        anyhow::ensure!(
+            approximate == "none",
+            "unsupported gelu approximation {approximate:?}"
+        );
         let result = x.gelu();
         let cpu = self
             .device

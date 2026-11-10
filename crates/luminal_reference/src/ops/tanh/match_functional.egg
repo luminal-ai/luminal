@@ -1,0 +1,19 @@
+; Layout Tensor Op Tanh Generic
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_logical (LogicalTanh ?in_logical))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op (LayoutTensorOpTanhFunctionalGeneric ?in_layout_tensor ?out_layout))
+  )
+  :ruleset backend
+  :name "reference/tanh/match_functional: TanhFunctionalGeneric mint at an injective destination"
+)

@@ -33,6 +33,7 @@ pub mod scatter;
 pub mod select;
 pub mod sin;
 pub mod sqrt;
+pub mod tanh;
 pub mod trunc;
 pub mod trunc_cast;
 pub mod trunc_div;
@@ -146,6 +147,7 @@ pub fn metal_registry() -> Vec<RegisteredOp> {
         reg(exp2::Exp2FunctionalMatcher, exp2::Exp2Functional),
         reg(log2::Log2FunctionalMatcher, log2::Log2Functional),
         reg(sin::SinFunctionalMatcher, sin::SinFunctional),
+        reg(tanh::TanhFunctionalMatcher, tanh::TanhFunctional),
         reg(recip::RecipFunctionalMatcher, recip::RecipFunctional),
         reg(modulo::ModFunctionalMatcher, modulo::ModFunctional),
         reg(less_than::LessThanMatcher, less_than::LessThan),

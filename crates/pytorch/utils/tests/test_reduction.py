@@ -132,6 +132,7 @@ class ComplexComposedReductions(torch.nn.Module):
             ),
             torch.ops.aten.linalg_vector_norm.default(value, 1.5, [], False),
             torch.ops.aten.var.correction(value, [1], correction=1, keepdim=False),
+            torch.ops.aten.std.correction(value, [0], correction=0.5, keepdim=True),
             variance,
             mean,
         )
@@ -535,10 +536,13 @@ def test_boolean_scatter_reductions_use_logical_semantics():
     index = torch.tensor([0, 0, 1])
     source = torch.tensor([True, True, False])
     module = BooleanScatterReductions()
+    # Eager CUDA does not implement Bool scatter reductions. CPU eager is the
+    # authored ATen semantic reference; the compiled path still receives the
+    # original CUDA tensors and therefore exercises the selected backend.
+    expected = module(value.cpu(), index.cpu(), source.cpu())
     actual = _compile_and_run(module, value, index, source)
-    expected = module(value, index, source)
     for result, reference in zip(actual, expected):
-        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        torch.testing.assert_close(result, reference.to(result.device), rtol=0, atol=0)
 
 
 class ScalarScatterAndIndexReductions(torch.nn.Module):

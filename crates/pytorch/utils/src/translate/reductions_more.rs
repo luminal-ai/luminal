@@ -253,7 +253,12 @@ impl Translator<'_> {
     /// The reduced axes for a variance/reduction node. A missing or empty
     /// dim list means "reduce every axis". A rank-0 operand has no axis to
     /// reduce; torch accepts dim 0 or -1 for it.
-    fn reduction_axes(&self, node: &Node, index: usize, rank: usize) -> Result<Vec<usize>> {
+    pub(super) fn reduction_axes(
+        &self,
+        node: &Node,
+        index: usize,
+        rank: usize,
+    ) -> Result<Vec<usize>> {
         let dims = match node.inputs.get(index) {
             Some(input) if input.arg.as_ints().is_some() || input.arg.as_sym_ints().is_some() => {
                 self.get_ints_arg(node, index)?
@@ -282,7 +287,7 @@ impl Translator<'_> {
     /// `unbiased` bool of the `.default`/`.dim` overloads (true is Bessel's
     /// 1, false is 0), and then to torch's default of 1. A correction this
     /// arm cannot read as a literal number is refused, never defaulted.
-    fn variance_correction(&self, node: &Node) -> Result<f64> {
+    pub(super) fn variance_correction(&self, node: &Node) -> Result<f64> {
         if let Some(input) = node.inputs.iter().find(|input| input.name == "correction") {
             if let Some(correction) = input.arg.as_float() {
                 return Ok(correction);
@@ -302,7 +307,7 @@ impl Translator<'_> {
             .map_or(1.0, |unbiased| if unbiased { 1.0 } else { 0.0 }))
     }
 
-    fn keepdim_flag(&self, node: &Node, positional: usize) -> bool {
+    pub(super) fn keepdim_flag(&self, node: &Node, positional: usize) -> bool {
         self.named_bool_arg(node, "keepdim")
             .or_else(|| node.inputs.get(positional).and_then(|i| i.arg.as_bool()))
             .unwrap_or(false)

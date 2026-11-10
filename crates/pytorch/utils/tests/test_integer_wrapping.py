@@ -9,7 +9,7 @@ They run unattested: the exact Int ops would need value-range proofs.
 
 import pytest
 import torch
-from backend_test_utils import luminal_backend
+from backend_test_utils import eager_or_skip_unsupported, luminal_backend
 
 WIDE = (
     pytest.param(torch.int32, id="int32"),
@@ -44,8 +44,9 @@ class Unary(torch.nn.Module):
 
 def _run(model, *inputs) -> None:
     torch._dynamo.reset()
+    expected = eager_or_skip_unsupported(model, *inputs)
     compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
-    actual, expected = compiled(*inputs), model(*inputs)
+    actual = compiled(*inputs)
     assert actual.dtype == expected.dtype
     assert torch.equal(actual, expected), f"{actual.tolist()} != {expected.tolist()}"
 

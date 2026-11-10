@@ -39,6 +39,8 @@ mod expr;
 mod frexp;
 #[cfg(test)]
 mod gcd_tests;
+#[cfg(test)]
+mod gelu_tests;
 mod grouped_mm;
 mod index;
 #[cfg(test)]
@@ -49,6 +51,8 @@ mod linalg;
 #[cfg(test)]
 mod matmul_tests;
 mod movement_more;
+#[cfg(test)]
+mod one_hot_tests;
 mod opinfo_more;
 #[cfg(test)]
 mod opinfo_more_tests;
@@ -1408,10 +1412,20 @@ impl Translator<'_> {
             "round.default" => self.operand(&n[0])?.round(),
             "round.decimals" => {
                 let decimals = n.get(1).and_then(|i| i.arg.as_int()).unwrap_or(0);
-                if decimals != 0 {
-                    bail!("round(decimals={decimals}) is not ported (only decimals=0)");
+                let value = self.operand(&n[0])?;
+                anyhow::ensure!(
+                    is_float(value.dtype),
+                    "round(decimals={decimals}) requires a floating input"
+                );
+                if decimals == 0 {
+                    value.round()
+                } else {
+                    // Keep this as one logical operator. ATen's CPU and CUDA
+                    // kernels intentionally differ in how the decimal scale
+                    // is typed, so decomposing it would erase authored
+                    // placement semantics at narrow dtypes and IEEE edges.
+                    value.round_decimals(decimals)
                 }
-                self.operand(&n[0])?.round()
             }
             // ---- elementwise binary ----
             "add.Tensor" | "add.Scalar" => self.add_sub(&n[0], &n[1], alpha_input(n), false)?,
@@ -1626,6 +1640,7 @@ impl Translator<'_> {
             "arange.start" => self.translate_arange(node, 1)?,
             "arange.default" => self.translate_arange(node, 0)?,
             "scalar_tensor.default" => self.translate_scalar_tensor(node)?,
+            "one_hot.default" => self.translate_one_hot(node)?,
             "where.self" => self.translate_where(node, false)?,
             "where.ScalarOther" => self.translate_where(node, true)?,
             "masked_fill.Scalar" => self.translate_masked_fill_scalar(node)?,
@@ -2164,7 +2179,6 @@ fn opmath_target(target: &str) -> bool {
             | "ldexp.Tensor"
             | "square.default"
             | "reciprocal.default"
-            | "round.decimals"
             | "logit.default" | "logaddexp.default" | "logaddexp2.default"
             | "xlogy.Tensor" | "special_xlog1py.default" | "sinc.default"
             | "softplus.default" | "mish.default" | "celu.default" | "glu.default"

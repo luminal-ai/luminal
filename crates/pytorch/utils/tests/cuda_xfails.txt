@@ -8,7 +8,6 @@ test_binary.py::test_searchsorted_and_bucketize_of_an_empty_float_query
 test_binary.py::test_zero_element_binary_float_ops[atan2-(1, 0, 3)]
 test_binary.py::test_zero_element_binary_float_ops[clamp_max-(1, 0, 3)]
 test_binary.py::test_zero_element_binary_float_ops[clamp_min-(1, 0, 3)]
-test_binary.py::test_zero_element_binary_float_ops[hypot-(1, 0, 3)]
 test_binary.py::test_zero_element_binary_float_ops[logaddexp-(1, 0, 3)]
 test_binary.py::test_zero_element_binary_float_ops[logical_and-(1, 0, 3)]
 test_binary.py::test_zero_element_binary_float_ops[logical_or-(1, 0, 3)]
@@ -104,11 +103,9 @@ test_hlir_ops.py::test_conv2d_dilation_pt2
 test_hlir_ops.py::test_conv2d_no_pad_pt2
 test_hlir_ops.py::test_conv3d_same_pad_pt2
 test_hlir_ops.py::test_depthwise_multiplier_conv2d_pt2
-test_hlir_ops.py::test_gelu_tanh
 test_hlir_ops.py::test_grouped_conv2d_groups3_batch4_pt2
 test_hlir_ops.py::test_input_backed_index_put_mutates_caller_tensor
 test_hlir_ops.py::test_int_index_put_scalar_src
-test_hlir_ops.py::test_onehot
 test_hlir_ops.py::test_repeat_leading_and_tile
 test_hlir_ops.py::test_repeat_leading_dims
 test_hlir_ops.py::test_reshape_1d_to_3d
@@ -162,10 +159,7 @@ test_narrow_float_storage.py::test_ordering_ops_on_narrow_storage_match_bitwise[
 test_narrow_float_storage.py::test_ordering_ops_on_narrow_storage_match_bitwise[topk-bfloat16]
 test_narrow_float_storage.py::test_ordering_ops_on_narrow_storage_match_bitwise[topk-float16]
 test_reduction.py::test_boolean_scatter_reductions_use_logical_semantics
-test_reduction.py::test_composed_complex_reductions_match_eager
-test_reduction.py::test_cumprod_complex_scalar_and_empty_inputs
 test_reduction.py::test_scalar_log_softmax_preserves_ieee_behavior
-test_reduction.py::test_scatter_and_index_reduce_accept_bounded_symbolic_update_extents
 test_remaining_existing_hlir_lowerings.py::test_adaptive_pool_windows_match_eager_on_the_backend_path
 test_remaining_existing_hlir_lowerings.py::test_antialiased_bilinear_resize_float_and_uint8
 test_remaining_existing_hlir_lowerings.py::test_cdist_pdist_order_zero_follow_the_cpu_kernel_on_nan[torch.float32]
@@ -222,11 +216,6 @@ test_remaining_existing_hlir_lowerings.py::test_histogram_uniform_edges_match_ea
 test_remaining_existing_hlir_lowerings.py::test_histogramdd_uniform_edges_match_eager[False]
 test_remaining_existing_hlir_lowerings.py::test_histogramdd_uniform_edges_match_eager[True]
 test_remaining_existing_hlir_lowerings.py::test_histogramdd_without_samples_matches_eager
-test_remaining_existing_hlir_lowerings.py::test_hypot_follows_c_special_values[dtype0-wide]
-test_remaining_existing_hlir_lowerings.py::test_hypot_follows_c_special_values[dtype1-special]
-test_remaining_existing_hlir_lowerings.py::test_hypot_follows_c_special_values[dtype1-wide]
-test_remaining_existing_hlir_lowerings.py::test_hypot_follows_c_special_values[dtype2-wide]
-test_remaining_existing_hlir_lowerings.py::test_hypot_follows_c_special_values[dtype3-wide]
 test_remaining_existing_hlir_lowerings.py::test_inference_batch_norm_uses_running_stats_and_returns_empty_saved_stats
 test_remaining_existing_hlir_lowerings.py::test_ordering_and_distance_composites
 test_remaining_existing_hlir_lowerings.py::test_pdist_matches_eager_across_orders[0.5]

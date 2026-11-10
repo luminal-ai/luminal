@@ -63,11 +63,13 @@ pub(crate) mod recip;
 pub(crate) mod reduce_max;
 pub(crate) mod reduce_sum;
 pub(crate) mod round;
+pub(crate) mod round_decimals;
 pub(crate) mod rounding_cast;
 pub(crate) mod scatter;
 pub(crate) mod select;
 pub(crate) mod sin;
 pub(crate) mod sqrt;
+pub(crate) mod tanh;
 pub(crate) mod trunc;
 pub(crate) mod trunc_cast;
 
@@ -110,10 +112,12 @@ pub use recip::RecipFunctional;
 pub use reduce_max::ReduceMax;
 pub use reduce_sum::ReduceSum;
 pub use round::RoundFunctional;
+pub use round_decimals::RoundDecimalsFunctional;
 pub use rounding_cast::RoundingCast;
 pub use scatter::ScatterFunctional;
 pub use sin::SinFunctional;
 pub use sqrt::SqrtFunctional;
+pub use tanh::TanhFunctional;
 pub use trunc::TruncFunctional;
 pub use trunc_cast::TruncCast;
 pub use wrapping_add::WrappingAddFunctional;
@@ -146,10 +150,12 @@ pub use recip::RecipFunctionalDps;
 pub use reduce_max::ReduceMaxDps;
 pub use reduce_sum::ReduceSumDps;
 pub use round::RoundFunctionalDps;
+pub use round_decimals::RoundDecimalsFunctionalDps;
 pub use rounding_cast::RoundingCastDps;
 pub use scatter::ScatterFunctionalDps;
 pub use sin::SinFunctionalDps;
 pub use sqrt::SqrtFunctionalDps;
+pub use tanh::TanhFunctionalDps;
 pub use trunc::TruncFunctionalDps;
 pub use trunc_cast::TruncCastDps;
 pub use wrapping_add::WrappingAddFunctionalDps;
@@ -181,11 +187,13 @@ pub use recip::RecipFunctionalMatcher;
 pub use reduce_max::ReduceMaxMatcher;
 pub use reduce_sum::ReduceSumMatcher;
 pub use round::RoundFunctionalMatcher;
+pub use round_decimals::RoundDecimalsFunctionalMatcher;
 pub use rounding_cast::RoundingCastMatcher;
 pub use scatter::ScatterFunctionalMatcher;
 pub use select::{SelectFunctional, SelectFunctionalDps, SelectFunctionalMatcher};
 pub use sin::SinFunctionalMatcher;
 pub use sqrt::SqrtFunctionalMatcher;
+pub use tanh::TanhFunctionalMatcher;
 pub use trunc::TruncFunctionalMatcher;
 pub use trunc_cast::TruncCastMatcher;
 pub use trunc_div::{TruncDivFunctional, TruncDivFunctionalDps, TruncDivFunctionalMatcher};
@@ -358,6 +366,13 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
                 kernel: entry::<RoundFunctionalDps>("RoundFunctionalGeneric", round::kernel),
             },
             ReferenceOp {
+                matcher: || Box::new(RoundDecimalsFunctionalMatcher),
+                kernel: entry::<RoundDecimalsFunctionalDps>(
+                    "RoundDecimalsFunctionalGeneric",
+                    round_decimals::kernel,
+                ),
+            },
+            ReferenceOp {
                 matcher: || Box::new(TruncCastMatcher),
                 kernel: entry::<TruncCastDps>("TruncCastGeneric", trunc_cast::kernel),
             },
@@ -380,6 +395,10 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(SinFunctionalMatcher),
                 kernel: entry::<SinFunctionalDps>("SinFunctionalGeneric", sin::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(TanhFunctionalMatcher),
+                kernel: entry::<TanhFunctionalDps>("TanhFunctionalGeneric", tanh::kernel),
             },
             ReferenceOp {
                 matcher: || Box::new(RecipFunctionalMatcher),

@@ -247,7 +247,7 @@ impl Translator<'_> {
     }
 
     /// `linalg_vector_norm` after the caller constructed real magnitudes.
-    fn vector_norm_from_magnitude(
+    pub(super) fn vector_norm_from_magnitude(
         &mut self,
         node: &Node,
         magnitude: GraphTensor,

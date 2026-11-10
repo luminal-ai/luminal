@@ -754,31 +754,44 @@ impl ReferenceKernelCtx {
         Ok(())
     }
 
-    /// Apply the supplied operation at the declared F32 or F64 width.
-    /// Half operations use their explicit helper; other types return an error
-    /// rather than silently changing arithmetic precision.
+    /// Apply the supplied operation at the dtype's authored transcendental
+    /// width. F16 and BF16 use F32 opmath and round once to their declared
+    /// storage dtype; F32 and F64 execute directly at their declared width.
     pub fn unary_elementwise_typed(
         &mut self,
         f32_fn: impl Fn(f32) -> f32,
         f64_fn: impl Fn(f64) -> f64,
     ) -> Result<()> {
-        let double = match &self.operands[0] {
-            TypedBuffer::F32(_) => false,
-            TypedBuffer::F64(_) => true,
-            other => anyhow::bail!(
-                "unary transcendental has no {} arm (cast at the call site; \
-                 a silent bridge through f32 would hide a precision change)",
-                other.type_name()
-            ),
-        };
-        if !double {
-            return self.unary_elementwise(f32_fn);
-        }
-        let input = self.operands[0].as_f64()?;
-        let dest = self.dests[0].as_f64_mut()?;
-        anyhow::ensure!(input.len() == dest.len(), "unary kernel length mismatch");
-        for (out, x) in dest.iter_mut().zip(input) {
-            *out = f64_fn(*x);
+        match &self.operands[0] {
+            TypedBuffer::F16(input) => {
+                let dest = self.dests[0].as_f16_mut()?;
+                anyhow::ensure!(input.len() == dest.len(), "unary kernel length mismatch");
+                for (out, x) in dest.iter_mut().zip(input) {
+                    *out = half::f16::from_f32(f32_fn(x.to_f32()));
+                }
+            }
+            TypedBuffer::Bf16(input) => {
+                let dest = self.dests[0].as_bf16_mut()?;
+                anyhow::ensure!(input.len() == dest.len(), "unary kernel length mismatch");
+                for (out, x) in dest.iter_mut().zip(input) {
+                    *out = half::bf16::from_f32(f32_fn(x.to_f32()));
+                }
+            }
+            TypedBuffer::F32(input) => {
+                let dest = self.dests[0].as_f32_mut()?;
+                anyhow::ensure!(input.len() == dest.len(), "unary kernel length mismatch");
+                for (out, x) in dest.iter_mut().zip(input) {
+                    *out = f32_fn(*x);
+                }
+            }
+            TypedBuffer::F64(input) => {
+                let dest = self.dests[0].as_f64_mut()?;
+                anyhow::ensure!(input.len() == dest.len(), "unary kernel length mismatch");
+                for (out, x) in dest.iter_mut().zip(input) {
+                    *out = f64_fn(*x);
+                }
+            }
+            other => anyhow::bail!("unary transcendental has no {} arm", other.type_name()),
         }
         Ok(())
     }

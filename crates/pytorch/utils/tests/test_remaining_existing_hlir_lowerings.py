@@ -87,6 +87,45 @@ def test_elementwise_composites_cover_ieee_edges() -> None:
     _check(module, value, other)
 
 
+class RoundDecimals(torch.nn.Module):
+    def forward(self, value):
+        return tuple(
+            torch.ops.aten.round.decimals(value, decimals=decimals)
+            for decimals in (-5, -2, -1, 1, 2, 5)
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+)
+def test_round_decimals_preserves_dtype_and_device_semantics(dtype) -> None:
+    info = torch.finfo(dtype)
+    value = torch.tensor(
+        [
+            -info.max,
+            -123.45,
+            -2.675,
+            -0.0,
+            0.005,
+            1.2345,
+            info.max,
+            float("inf"),
+            float("nan"),
+        ],
+        dtype=dtype,
+    )
+    module = RoundDecimals()
+    expected = module(value)
+    actual = _compile(module, value)(value)
+    for result, reference in zip(actual, expected):
+        assert result.dtype == reference.dtype == dtype
+        torch.testing.assert_close(result, reference, rtol=0, atol=0, equal_nan=True)
+        finite_zero = (reference == 0) & torch.isfinite(reference)
+        assert torch.equal(
+            torch.signbit(result[finite_zero]), torch.signbit(reference[finite_zero])
+        )
+
+
 class Hypot(torch.nn.Module):
     def forward(self, value, other):
         return torch.hypot(value, other)

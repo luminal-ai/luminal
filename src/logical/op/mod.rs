@@ -167,11 +167,13 @@ mod recip;
 mod reduce_max;
 mod reduce_sum;
 mod round;
+mod round_decimals;
 mod rounding_cast;
 mod scatter;
 mod select;
 mod sin;
 mod sqrt;
+mod tanh;
 mod trunc;
 mod trunc_cast;
 mod trunc_div;
@@ -213,11 +215,13 @@ pub use recip::LogicalRecip;
 pub use reduce_max::LogicalReduceMax;
 pub use reduce_sum::LogicalReduceSum;
 pub use round::LogicalRound;
+pub use round_decimals::LogicalRoundDecimals;
 pub use rounding_cast::LogicalRoundingCast;
 pub use scatter::LogicalScatter;
 pub use select::LogicalSelect;
 pub use sin::LogicalSin;
 pub use sqrt::LogicalSqrt;
+pub use tanh::LogicalTanh;
 pub use trunc::LogicalTrunc;
 pub use trunc_cast::LogicalTruncCast;
 pub use trunc_div::LogicalTruncDiv;
@@ -255,6 +259,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalTrunc),
             Box::new(LogicalRound),
             Box::new(LogicalHypot),
+            Box::new(LogicalRoundDecimals),
             Box::new(LogicalAdd),
             Box::new(LogicalMul),
             Box::new(LogicalWrappingAdd),
@@ -271,6 +276,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalExp2),
             Box::new(LogicalLog2),
             Box::new(LogicalSin),
+            Box::new(LogicalTanh),
             Box::new(LogicalRecip),
             Box::new(LogicalMod),
             Box::new(LogicalLessThan),
