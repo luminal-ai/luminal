@@ -37,11 +37,11 @@ the legacy default stream cannot host, so it runs on a dedicated
 ``torch.cuda.Stream`` borrowed through ``use_borrowed_stream`` and ordered
 against the caller's stream with ``side.wait_stream(caller)`` before the
 launch and ``caller.wait_stream(side)`` after. The intermediate-scratch
-arena is PyTorch's, not the runtime's: ``arena_bytes()`` is the searched
-program's requirement, the wrapper ``caching_allocator_alloc``s exactly
-that against the side stream, passes it to ``execute``, and
-``caching_allocator_delete``s it right after ``execute`` — so PyTorch
-accounts for the bytes and can reuse the block on the next call.
+arena is PyTorch's, not the runtime's: the wrapper retains one grow-only
+``uint8`` tensor per compiled model, records its side-stream use, and passes
+its pointer to ``execute``. Repeated calls therefore reuse the searched
+program's scratch storage instead of asking the caching allocator to make a
+second plan-sized segment available.
 """
 
 import concurrent.futures
@@ -402,9 +402,8 @@ class CompiledModel:
       pointer;
     * parameters and buffers are addressed once at compile time, user inputs
       and freshly allocated outputs once per call;
-    * the intermediate-scratch arena is ``caching_allocator_alloc``'d for the
-      duration of the call and ``caching_allocator_delete``'d right after, so
-      PyTorch accounts for it and can reuse the block next call.
+    * one PyTorch-owned intermediate arena grows to the largest requirement
+      observed by this compiled model and is reused across calls.
     """
 
     def __init__(
@@ -450,6 +449,7 @@ class CompiledModel:
         self._shape_carrier_indices = frozenset(shape_carrier_indices)
         # Fixed once a program is searched; the per-execution arena sizes to it.
         self._arena_bytes = graph.arena_bytes()
+        self._execution_arena: torch.Tensor | None = None
         self._host_staging = graph.allocate_staging()
         # The runtime always launches captured CUDA graphs, which the legacy
         # default stream cannot host, so it runs on a dedicated side stream
@@ -800,7 +800,24 @@ class CompiledModel:
             self._region_arena.record_stream(side)
             arena = self._region_arena.data_ptr()
         else:
-            arena = torch.cuda.caching_allocator_alloc(arena_bytes, device, side)
+            if (
+                self._execution_arena is None
+                or self._execution_arena.numel() < arena_bytes
+            ):
+                # A larger shape cannot coexist with an enormous prior arena
+                # merely so the allocator can replace it. Finish its raw
+                # pointer use, release it, and return the free segment first.
+                side.synchronize()
+                self._execution_arena = None
+                free_bytes, _ = torch.cuda.mem_get_info(device)
+                if arena_bytes > free_bytes:
+                    torch.cuda.empty_cache()
+                with torch.cuda.stream(side):
+                    self._execution_arena = torch.empty(
+                        arena_bytes, dtype=torch.uint8, device=device
+                    )
+            self._execution_arena.record_stream(side)
+            arena = self._execution_arena.data_ptr()
         self._graph.use_borrowed_stream(side.cuda_stream)
         # EVERY CHECK IS BEHIND US: the addresses go in here and come out in
         # `finally`, so no refusal of this call can leave one standing.
@@ -855,8 +872,6 @@ class CompiledModel:
                 # different shape needs another binding with independent staging.
                 self._captured_signature = signature
         finally:
-            if not static:
-                torch.cuda.caching_allocator_delete(arena)
             # These addresses belong to this call only: forget them, so an
             # execute that skipped a binding refuses by name instead of
             # reading storage the caller has released.

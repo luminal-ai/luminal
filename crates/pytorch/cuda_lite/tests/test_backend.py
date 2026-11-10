@@ -33,15 +33,25 @@ def test_compiler_available():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_linear_roundtrip_repeated_calls():
-    """Fresh inputs each call: the per-execution arena is alloc/free'd each time
-    and outputs are separate tensors, so every call must still be exact."""
+    """Fresh inputs reuse scratch while outputs remain separate and exact."""
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
+    native = []
+
+    def backend(gm, inputs):
+        result = luminal_cuda_lite.Compiler()(gm, inputs)
+        native.append(result)
+        return result
+
+    compiled = torch.compile(model, backend=backend)
+    arena_ptrs = set()
     with torch.no_grad():
         for _ in range(5):
             x = torch.randn(4, 16, device="cuda")
             torch.testing.assert_close(compiled(x), model(x))
+            arena_ptrs.add(native[0]._execution_arena.data_ptr())
+    assert len(native) == 1
+    assert len(arena_ptrs) == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
