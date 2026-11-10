@@ -1172,7 +1172,7 @@ impl Translator<'_> {
     // Complex algebra
     // ---------------------------------------------------------------
 
-    fn complex_mul(&self, a: ComplexTensor, b: ComplexTensor) -> ComplexTensor {
+    fn complex_mul(&mut self, a: ComplexTensor, b: ComplexTensor) -> ComplexTensor {
         let storage = a.real.dtype;
         let compute = if storage.is_narrow_float() {
             DType::F32
@@ -1185,11 +1185,42 @@ impl Translator<'_> {
             b.real.cast(compute),
             b.imag.cast(compute),
         );
-        ComplexTensor::new(
-            super::util::round_to_storage(ar * br - ai * bi, storage),
-            super::util::round_to_storage(ar * bi + ai * br, storage),
-            a.torch_dtype,
-        )
+        let real_product = ar * br;
+        let imag_product = ai * bi;
+        let mut real = super::util::round_to_storage(real_product - imag_product, storage);
+        let imag = super::util::round_to_storage(ar * bi + ai * br, storage);
+
+        // The CPU complex64 kernel returns -0 for the real component when
+        // two positive, nonzero products both underflow to zero before their
+        // subtraction. Complex128 and CUDA return +0. This also differs from
+        // subtracting two already-rounded +0 scalar products, so preserve the
+        // authored device and dtype's observable signed-zero boundary.
+        let cpu = self
+            .device
+            .as_ref()
+            .is_some_and(|device| device.kind == "cpu");
+        if cpu && storage == DType::F32 {
+            let real_underflow = cx_bool_and(
+                self.is_zero(real_product),
+                cx_bool_and(cx_bool_not(self.is_zero(ar)), cx_bool_not(self.is_zero(br))),
+            );
+            let imag_underflow = cx_bool_and(
+                self.is_zero(imag_product),
+                cx_bool_and(cx_bool_not(self.is_zero(ai)), cx_bool_not(self.is_zero(bi))),
+            );
+            let real_product_positive = self.signbit(ar).eq(self.signbit(br));
+            let imag_product_positive = self.signbit(ai).eq(self.signbit(bi));
+            let force_negative_zero = cx_bool_and(
+                cx_bool_and(real_underflow, imag_underflow),
+                cx_bool_and(real_product_positive, imag_product_positive),
+            );
+            let zero = self.constant_like(real, 0.0);
+            let negative_one = self.constant_like(real, -1.0);
+            let negative_zero = self.copy_sign(zero, negative_one);
+            real = self.cx_select(force_negative_zero, negative_zero, real);
+        }
+
+        ComplexTensor::new(real, imag, a.torch_dtype)
     }
 
     fn complex_matmul(&self, a: ComplexTensor, b: ComplexTensor) -> ComplexTensor {
@@ -1634,7 +1665,7 @@ impl Translator<'_> {
             stable_signed_acosh,
             signed_acosh,
         );
-        let signed_acos = self.copy_sign(acos_beta, value.imag);
+        let mut signed_acos = self.copy_sign(acos_beta, value.imag);
 
         let mut acos_real = acos_beta;
         let mut acos_imag = signed_acosh * -1.0;
@@ -1643,6 +1674,16 @@ impl Translator<'_> {
         let zero_with_nan_imag = cx_bool_and(real_zero, imag_nan);
         let half_pi = self.constant_like(acos_real, std::f64::consts::FRAC_PI_2);
         acos_real = self.cx_select(zero_with_nan_imag, half_pi, acos_real);
+        // CPU acosh preserves the limiting +pi/2 imaginary component at
+        // either signed real zero with a NaN imaginary component. CUDA's
+        // authored behavior leaves this component NaN.
+        if self
+            .device
+            .as_ref()
+            .is_some_and(|device| device.kind == "cpu")
+        {
+            signed_acos = self.cx_select(zero_with_nan_imag, half_pi, signed_acos);
+        }
         let real_inf_with_nan_imag = cx_bool_and(real_inf, imag_nan);
         let negative_infinity = self.constant_like(value.real, f64::NEG_INFINITY);
         acos_imag = self.cx_select(real_inf_with_nan_imag, negative_infinity, acos_imag);

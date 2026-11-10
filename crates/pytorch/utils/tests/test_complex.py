@@ -509,8 +509,8 @@ def test_complex_scalar_casts_and_noncontiguous_negative_views():
         _assert_close(result, reference, rtol=0, atol=0)
 
 
-# Complex user inputs are refused upstream (LUM-1100), so these graphs build
-# their complex value in-graph from real components.
+# These cases build complex values in-graph to exercise branch-cut behavior
+# independently of the interleaved complex input boundary.
 
 
 class NegativeRealAxis(torch.nn.Module):

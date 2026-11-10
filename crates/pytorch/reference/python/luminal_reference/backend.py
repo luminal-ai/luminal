@@ -48,16 +48,35 @@ def _tensor_bytes(tensor: torch.Tensor) -> bytes:
     return tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
 
 
-def _output_tensor(raw: bytes, dtype_code: int, shape: Sequence[int]) -> torch.Tensor:
+def _storage_shape(tensor: torch.Tensor) -> list[int]:
+    """The translated shape over the caller tensor's exact storage bytes."""
+    shape = list(tensor.shape)
+    return [*shape, 2] if tensor.is_complex() else shape
+
+
+def _output_tensor(
+    raw: bytes,
+    dtype_code: int,
+    shape: Sequence[int],
+    logical_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     dtype = _PT2_TO_TORCH.get(dtype_code)
     if dtype is None:
         raise RuntimeError(
             f"luminal_reference cannot materialize PT2 dtype code {dtype_code}"
         )
     if 0 in shape and not raw:
-        return torch.empty(tuple(shape), dtype=dtype, device="cpu")
-    tensor = torch.frombuffer(bytearray(raw), dtype=dtype)
-    return tensor.reshape(tuple(shape)).clone()
+        tensor = torch.empty(tuple(shape), dtype=dtype, device="cpu")
+    else:
+        tensor = torch.frombuffer(bytearray(raw), dtype=dtype)
+        tensor = tensor.reshape(tuple(shape)).clone()
+    if logical_dtype is not None and logical_dtype.is_complex:
+        if not shape or shape[-1] != 2:
+            raise RuntimeError(
+                "luminal_reference complex output storage must end in extent 2"
+            )
+        return torch.view_as_complex(tensor)
+    return tensor
 
 
 class CompiledModel:
@@ -83,6 +102,15 @@ class CompiledModel:
         ]
         self._output_names = graph.output_names
         self._output_dtypes = graph.output_dtypes
+        node_values = {
+            node.name: node.meta.get("val") for node in ep.graph_module.graph.nodes
+        }
+        self._output_logical_dtypes = [
+            value.dtype
+            if isinstance((value := node_values.get(name)), torch.Tensor)
+            else None
+            for name in self._output_names
+        ]
         self._output_mutations = graph.output_mutations
         self._output_returns = graph.output_returns
 
@@ -91,7 +119,7 @@ class CompiledModel:
             self._graph.fork(), self._ep, self._scalar_output_positions, self._held
         )
         for name, value in self._held.items():
-            model._graph.set_input(name, _tensor_bytes(value), list(value.shape))
+            model._graph.set_input(name, _tensor_bytes(value), _storage_shape(value))
         return model
 
     @property
@@ -116,7 +144,7 @@ class CompiledModel:
                 f"got {len(inputs)}"
             )
         for name, value in zip(self._user_input_names, inputs):
-            self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
+            self._graph.set_input(name, _tensor_bytes(value), _storage_shape(value))
         # Output shapes depend on the bound dims, so read them after the
         # inputs are staged rather than caching them at compile time.
         output_shapes = self._graph.output_shapes
@@ -126,12 +154,22 @@ class CompiledModel:
         outputs = zip(
             self._output_names,
             self._output_dtypes,
+            self._output_logical_dtypes,
             output_shapes,
             self._output_mutations,
             self._output_returns,
         )
-        for index, (_, dtype_code, shape, mutation, returned) in enumerate(outputs):
-            tensor = _output_tensor(self._graph.output_bytes(index), dtype_code, shape)
+        for index, (
+            _,
+            dtype_code,
+            logical_dtype,
+            shape,
+            mutation,
+            returned,
+        ) in enumerate(outputs):
+            tensor = _output_tensor(
+                self._graph.output_bytes(index), dtype_code, shape, logical_dtype
+            )
             if mutation is not None:
                 # A mutation target is a graph input: a user input, or a
                 # parameter/buffer held from the export's state_dict.
@@ -414,7 +452,7 @@ def compile_exported(
                 value = torch.ones(
                     tuple(profile_value(d) for d in value.shape), dtype=value.dtype
                 )
-        graph.set_input(name, _tensor_bytes(value), list(value.shape))
+        graph.set_input(name, _tensor_bytes(value), _storage_shape(value))
 
     if user_index != len(export_inputs):
         raise RuntimeError(
