@@ -10,7 +10,7 @@ undecomposed stage (no decomposition may hide a missing widening).
 
 import pytest
 import torch
-from backend_test_utils import luminal_backend
+from backend_test_utils import eager_or_skip_unsupported, luminal_backend
 
 NARROW = (
     pytest.param(torch.float16, id="float16"),
@@ -226,8 +226,9 @@ def test_accumulations_into_narrow_storage_round_each_step(stage_one_only, fn, d
 def test_histc_counts_into_narrow_storage(stage_one_only, dtype):
     model = Unary(lambda x: torch.histc(x, bins=4, min=0, max=3))
     x = torch.tensor([0.0, 1.0, 1.0, 3.0, 2.0, 1.0, 0.0], dtype=dtype)
+    expected = eager_or_skip_unsupported(model, x)
     compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
-    _assert_bitwise(compiled(x), model(x))
+    _assert_bitwise(compiled(x), expected)
 
 
 @pytest.mark.parametrize(
