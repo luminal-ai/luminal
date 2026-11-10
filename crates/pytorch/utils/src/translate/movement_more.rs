@@ -1024,7 +1024,12 @@ impl Translator<'_> {
             let inf = self.constant_like(base, f64::INFINITY);
             let key = self.order_select(nan_mask, inf, base);
             let value_order = key.stable_argsort(axis, false);
-            let nan_order = nan_mask.cast(DType::F32).stable_argsort(axis, false);
+            // The second stable sort operates in the first sort's frame.
+            // Sorting the original mask would use original coordinates as
+            // positions into `value_order`, which misorders every row where
+            // a NaN precedes a finite value.
+            let sorted_nan_mask = self.order_gather(nan_mask, value_order, axis);
+            let nan_order = sorted_nan_mask.cast(DType::F32).stable_argsort(axis, false);
             let sort_order = self.order_gather(value_order, nan_order, axis);
             // Torch's nanmedian takes the lower of the two middle valid
             // values: slot (valid_count - 1) / 2, or 0 when every value is

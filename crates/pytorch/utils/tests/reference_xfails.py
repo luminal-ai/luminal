@@ -131,10 +131,7 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ticket="LUM-1105",
         url="https://linear.app/luminalai/issue/LUM-1105/reference-backend-numeric-mismatches-vs-eager-float64-add-alpha-acos",
         reason=("reference backend output differs numerically from eager"),
-        tests=(
-            "test_remaining_existing_hlir_lowerings.py::test_ordering_and_distance_composites",
-            "test_upsample.py::test_upsample_nearest_noninteger_scale_same_size",
-        ),
+        tests=("test_upsample.py::test_upsample_nearest_noninteger_scale_same_size",),
     ),
     KnownFailure(
         ticket="LUM-1106",
