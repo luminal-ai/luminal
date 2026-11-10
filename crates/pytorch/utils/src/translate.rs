@@ -64,6 +64,8 @@ mod reductions_more;
 #[cfg(test)]
 mod remainder_tests;
 #[cfg(test)]
+mod repeat_tests;
+#[cfg(test)]
 mod scan_tests;
 mod shifts;
 mod special;
