@@ -430,6 +430,44 @@ impl Translator<'_> {
                     self.values.insert(output_name.to_string(), out);
                 }
             }
+            "copy.default" => {
+                let output_dtype = self.output_torch_dtype(output_name)?;
+                let source_name = self.input_value_name(node, 1)?;
+                if output_dtype.is_complex() {
+                    let destination = self.get_complex_input(node, 0)?;
+                    let source = self.value_as_complex(source_name, output_dtype)?;
+                    let (broadcast_destination, real) =
+                        broadcast_binary(destination.real, source.real);
+                    let (_, imag) = broadcast_binary(destination.imag, source.imag);
+                    anyhow::ensure!(
+                        broadcast_destination.dims() == destination.real.dims(),
+                        "complex copy source shape {:?} cannot broadcast into destination shape {:?}",
+                        source.real.dims(),
+                        destination.real.dims()
+                    );
+                    self.store_complex(output_name, ComplexTensor::new(real, imag, output_dtype));
+                } else {
+                    let destination = self.get_input_tensor(node, 0)?;
+                    let source = self.get_complex(source_name)?;
+                    let dtype = DType::try_from(output_dtype)
+                        .map_err(|t| anyhow!("unsupported real copy target {}", t.name()))?;
+                    let source = if dtype == DType::Bool {
+                        let real_zero = self.is_zero(source.real);
+                        let imag_zero = self.is_zero(source.imag);
+                        cx_bool_not(cx_bool_and(real_zero, imag_zero))
+                    } else {
+                        source.real.cast(dtype)
+                    };
+                    let (broadcast_destination, source) = broadcast_binary(destination, source);
+                    anyhow::ensure!(
+                        broadcast_destination.dims() == destination.dims(),
+                        "complex copy source shape {:?} cannot broadcast into destination shape {:?}",
+                        source.dims(),
+                        destination.dims()
+                    );
+                    self.values.insert(output_name.to_string(), source);
+                }
+            }
 
             // ---- elementwise elementary functions ----
             "exp.default" => {

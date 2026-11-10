@@ -69,7 +69,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "test_reduction.py::test_composed_complex_reductions_match_eager",
             "test_reduction.py::test_cumprod_complex_scalar_and_empty_inputs",
             "test_remaining_existing_hlir_lowerings.py::test_complex_movement_is_componentwise",
-            "test_straightforward_lowerings.py::test_copy_supports_broadcast_and_real_complex_conversions",
             "test_straightforward_lowerings.py::test_optional_index_put_accumulates_real_and_complex_duplicates",
         ),
     ),
