@@ -1190,16 +1190,17 @@ impl Translator<'_> {
         let mut real = super::util::round_to_storage(real_product - imag_product, storage);
         let imag = super::util::round_to_storage(ar * bi + ai * br, storage);
 
-        // The CPU complex64 kernel returns -0 for the real component when
-        // two positive, nonzero products both underflow to zero before their
-        // subtraction. Complex128 and CUDA return +0. This also differs from
-        // subtracting two already-rounded +0 scalar products, so preserve the
-        // authored device and dtype's observable signed-zero boundary.
+        // PyTorch's AArch64 CPU complex64 kernel returns -0 for the real
+        // component when two positive, nonzero products both underflow to
+        // zero before their subtraction. Its x86 kernel, complex128, and CUDA
+        // return +0. This differs from subtracting two already-rounded +0
+        // scalar products, so preserve the authored target's signed-zero
+        // boundary explicitly.
         let cpu = self
             .device
             .as_ref()
             .is_some_and(|device| device.kind == "cpu");
-        if cpu && storage == DType::F32 {
+        if cpu && cfg!(target_arch = "aarch64") && storage == DType::F32 {
             let real_underflow = cx_bool_and(
                 self.is_zero(real_product),
                 cx_bool_and(cx_bool_not(self.is_zero(ar)), cx_bool_not(self.is_zero(br))),
