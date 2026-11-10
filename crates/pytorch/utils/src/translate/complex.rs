@@ -807,6 +807,30 @@ impl Translator<'_> {
                     ComplexTensor::new(real, imag, destination.torch_dtype),
                 );
             }
+            "diagonal_scatter.default" => {
+                let destination = self.get_complex_input(node, 0)?;
+                let source = self
+                    .value_as_complex(self.input_value_name(node, 1)?, destination.torch_dtype)?;
+                let real =
+                    self.translate_diagonal_scatter_values(destination.real, source.real, node)?;
+                let imag =
+                    self.translate_diagonal_scatter_values(destination.imag, source.imag, node)?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real, imag, destination.torch_dtype),
+                );
+            }
+            "unfold.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let backing = value
+                    .backing
+                    .map(|backing| self.translate_unfold_interleaved_backing(backing, node))
+                    .transpose()?;
+                let mut value =
+                    value.try_map(|component| self.translate_unfold_value(component, node))?;
+                value.backing = backing;
+                self.store_complex(output_name, value);
+            }
             "masked_scatter.default" => {
                 let destination = self.get_complex_input(node, 0)?;
                 let mask = self.get_input_tensor(node, 1)?;

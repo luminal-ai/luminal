@@ -106,7 +106,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "test_hlir_ops.py::test_int_index_put_scalar_src",
             "test_ops_batch4.py::test_masked_scatter",
             "test_ops_batch4.py::test_scatter",
-            "test_straightforward_lowerings.py::test_movement_lowerings_support_noncontiguous_real_and_complex_values",
         ),
     ),
     KnownFailure(
