@@ -2,7 +2,7 @@
 //! its inputs must agree, and no value may sit anywhere else, which is how a
 //! device move inside the graph is refused.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use anyhow::{Result, bail};
@@ -47,9 +47,57 @@ pub fn program_device(parsed: &ParsedPT2) -> Result<Option<TorchDevice>> {
             .and_then(|meta| meta.device.as_ref())
             .map(TorchDevice::from)
     };
+    let is_cpu_scalar = |name: &str| {
+        graph.tensor_values.get(name).is_some_and(|meta| {
+            meta.sizes.is_empty()
+                && meta
+                    .device
+                    .as_ref()
+                    .is_some_and(|device| device.kind == "cpu")
+        })
+    };
+    let mut host_scalar_carriers: HashSet<&str> = graph
+        .inputs
+        .iter()
+        .filter_map(|input| input.value_name())
+        .filter(|name| is_cpu_scalar(name))
+        .collect();
+    // Export may preserve the scalar's CPU placement through value-only
+    // carrier operations before it is consumed by a CUDA op. These operations
+    // do not compute new scalar semantics; the translator preserves the exact
+    // value while the backend stages its boundary source.
+    for node in &graph.nodes {
+        let carries_value = matches!(
+            node.target.as_str(),
+            "torch.ops.aten.clone.default"
+                | "torch.ops.aten.alias.default"
+                | "torch.ops.aten.detach.default"
+                | "torch.ops.aten.lift_fresh_copy.default"
+        ) && node.inputs.iter().any(|input| {
+            input
+                .arg
+                .as_value_name()
+                .is_some_and(|name| host_scalar_carriers.contains(name))
+        });
+        if carries_value {
+            host_scalar_carriers.extend(
+                node.outputs
+                    .iter()
+                    .filter_map(|output| output.value_name())
+                    .filter(|name| is_cpu_scalar(name)),
+            );
+        }
+    }
 
+    // PyTorch permits a rank-zero CPU tensor as a scalar operand of a CUDA
+    // operation. It is a boundary staging exception, not the program's
+    // execution device, so choose the device from ordinary inputs first.
     let mut program: Option<(String, TorchDevice)> = None;
-    for input in &graph.inputs {
+    for input in graph.inputs.iter().filter(|input| {
+        input
+            .value_name()
+            .is_none_or(|name| !host_scalar_carriers.contains(name))
+    }) {
         let Some(name) = input.value_name() else {
             continue;
         };
@@ -64,6 +112,12 @@ pub fn program_device(parsed: &ParsedPT2) -> Result<Option<TorchDevice>> {
             ),
             Some(_) => {}
         }
+    }
+    if program.is_none() {
+        program = graph.inputs.iter().find_map(|input| {
+            let name = input.value_name()?;
+            Some((name.to_string(), device_of(name)?))
+        });
     }
     let Some((_, expected)) = program else {
         return Ok(None);
@@ -83,6 +137,9 @@ pub fn program_device(parsed: &ParsedPT2) -> Result<Option<TorchDevice>> {
         if let Some(device) = device_of(name)
             && device != expected
         {
+            if expected.kind == "cuda" && host_scalar_carriers.contains(name.as_str()) {
+                continue;
+            }
             let producer = producers
                 .get(name.as_str())
                 .map_or_else(|| "a graph input".to_string(), |t| format!("`{t}`"));
@@ -177,6 +234,64 @@ mod tests {
             err.contains("\"a\" is on cpu") && err.contains("\"b\" is on cuda:0"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn rank_zero_cpu_input_is_a_cuda_scalar_operand_not_the_program_device() {
+        let mut parsed = program([
+            Some(device("cpu", None)),
+            Some(device("cuda", Some(0))),
+            Some(device("cuda", Some(0))),
+        ]);
+        parsed
+            .program
+            .graph_module
+            .graph
+            .tensor_values
+            .get_mut("a")
+            .unwrap()
+            .sizes
+            .clear();
+
+        let found = program_device(&parsed).unwrap();
+        assert_eq!(found.map(|d| d.to_string()), Some("cuda:0".to_string()));
+    }
+
+    #[test]
+    fn value_only_carriers_keep_a_staged_cpu_scalar_legal() {
+        let mut parsed = program([
+            Some(device("cpu", None)),
+            Some(device("cuda", Some(0))),
+            Some(device("cuda", Some(0))),
+        ]);
+        let graph = &mut parsed.program.graph_module.graph;
+        graph.tensor_values.get_mut("a").unwrap().sizes.clear();
+        graph.tensor_values.insert(
+            "a_clone".into(),
+            TensorMeta {
+                dtype: FLOAT,
+                sizes: vec![],
+                strides: None,
+                storage_offset: None,
+                layout: Some(7),
+                device: Some(device("cpu", None)),
+            },
+        );
+        graph.nodes = vec![
+            node(
+                "torch.ops.aten.clone.default",
+                vec![tensor_input("input", "a")],
+                &["a_clone"],
+            ),
+            node(
+                "torch.ops.aten.add.Tensor",
+                vec![tensor_input("self", "b"), tensor_input("other", "a_clone")],
+                &["y"],
+            ),
+        ];
+
+        let found = program_device(&parsed).unwrap();
+        assert_eq!(found.map(|d| d.to_string()), Some("cuda:0".to_string()));
     }
 
     #[test]
