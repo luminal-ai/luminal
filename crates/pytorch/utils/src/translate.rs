@@ -1582,7 +1582,9 @@ impl Translator<'_> {
             }
             // ---- batch 10: distances, norms, histograms, segment reduce ----
             "dist.default" => self.translate_dist(node, DistVariant::Dist)?,
-            "_cdist_forward.default" => self.translate_dist(node, DistVariant::Cdist)?,
+            "cdist.default" | "_cdist_forward.default" => {
+                self.translate_dist(node, DistVariant::Cdist)?
+            }
             "pdist.default" | "_pdist_forward.default" => {
                 self.translate_dist(node, DistVariant::Pdist)?
             }
@@ -2247,6 +2249,7 @@ fn opmath_target(target: &str) -> bool {
             // casts to the resolved result dtype, scans in that dtype's
             // opmath (F32 for half: ATen's acc_type) and rounds once.
             | "dist.default"
+            | "cdist.default"
             | "_cdist_forward.default"
             | "pdist.default"
             | "_pdist_forward.default"
