@@ -1,0 +1,19 @@
+(rule
+  (
+    (= ?in-layout-tensor (LayoutTensorLit ?in-logical ?in-layout))
+    (= ?out-layout-tensor (LayoutTensorLit ?out-logical ?out-layout))
+    (= ?out-layout (RightMajorContiguousElementLayoutLit ?shape ?bits))
+    (= ?out-logical (LogicalRoundDecimals ?in-logical ?decimals))
+    (= (injectivity-of ?out-layout-tensor) (Injective))
+  )
+  (
+    (let ?layout-tensor-op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in-layout-tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out-layout-tensor (LayoutTensorNil))))
+    (union ?layout-tensor-op
+      (LayoutTensorOpRoundDecimalsFunctionalGeneric
+        ?in-layout-tensor ?decimals ?out-layout))
+  )
+  :ruleset main_ruleset
+  :name "cuda_lite/round_decimals/match_functional: direct decimal rounding")

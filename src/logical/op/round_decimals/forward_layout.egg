@@ -1,0 +1,8 @@
+(rule
+  (
+    (= ?out (LogicalRoundDecimals ?in ?decimals))
+    (= ?in-layout-tensor (LayoutTensorLit ?in ?layout))
+  )
+  ((let new-out-layout-tensor (LayoutTensorLit ?out ?layout)))
+  :ruleset main_ruleset
+  :name "round_decimals/forward_layout: result in the operand layout")
