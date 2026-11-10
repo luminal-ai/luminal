@@ -81,7 +81,7 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "(the upsample lowering's coordinate-form gathers)"
         ),
         tests=(
-            "test_remaining_existing_hlir_lowerings.py::test_antialiased_bilinear_resize_float_and_uint8",
+            "test_remaining_existing_hlir_lowerings.py::test_antialiased_bilinear_resize_float_and_uint8[dtype2]",
         ),
     ),
     KnownFailure(
