@@ -1310,9 +1310,8 @@ def test_nanmedian_slot_matches_eager_on_the_backend_path(monkeypatch) -> None:
     # Odd and even non-NaN counts, a single value, and an all-NaN row. Median
     # indices are device-specific when the selected value is not unique, so
     # compare values to eager and separately prove that each returned index
-    # names its returned value. The NaNs trail each row: the lowering's NaN
-    # reorder is composed in the wrong frame when a NaN precedes a value
-    # (reported separately), and this test is about the selected slot.
+    # names its returned value. A leading NaN proves that the secondary NaN
+    # reorder is composed in the value-sorted frame, not original coordinates.
     nan = float("nan")
     inputs = (
         torch.tensor(
@@ -1322,6 +1321,7 @@ def test_nanmedian_slot_matches_eager_on_the_backend_path(monkeypatch) -> None:
                 [7.0, nan, nan, nan, nan],
                 [nan, nan, nan, nan, nan],
                 [2.0, 2.0, 1.0, 1.0, nan],
+                [nan, 2.0, 3.0, 4.0, nan],
             ]
         ),
     )
