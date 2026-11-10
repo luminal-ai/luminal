@@ -53,6 +53,21 @@ def test_empty_cpu_weight_preserves_shape_and_dtype() -> None:
     assert torch.equal(actual, expected)
 
 
+def test_noncanonical_bool_storage_preserves_logical_values() -> None:
+    """PyTorch interprets every nonzero bool-storage byte as true; stage that
+    logical value through the reference runtime's canonical Bool8 carrier."""
+    model = BoundaryNoopModel()
+    compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
+    x = torch.zeros(4, dtype=torch.bool)
+    x.view(torch.uint8).copy_(torch.tensor([0, 2, 128, 1], dtype=torch.uint8))
+
+    expected = model(x)
+    actual = compiled(x)
+
+    assert torch.equal(expected, torch.tensor([False, True, True, True]))
+    assert torch.equal(actual, expected)
+
+
 def test_cpu_input_rejects_non_bytes_payload():
     """The native boundary accepts owned bytes, never arbitrary host pointers."""
     from luminal_reference.backend import compile_exported
