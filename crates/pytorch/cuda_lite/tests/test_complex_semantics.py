@@ -1,7 +1,6 @@
+import luminal_cuda_lite
 import pytest
 import torch
-
-import luminal_cuda_lite
 
 
 class ComplexLogcumsumexpEdges(torch.nn.Module):
