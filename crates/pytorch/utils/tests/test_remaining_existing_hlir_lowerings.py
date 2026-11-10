@@ -2336,9 +2336,8 @@ def _check_fractional_max_pool_real_path(module, value, random_samples):
 
 
 # (module, value shape, random_samples shape). The wide 2d case has
-# inputSize - poolSize = 301, which bfloat16 cannot hold, so the window
-# starts only match eager when every interval term rounds in the sample
-# dtype the way ATen's generate_intervals<scalar_t> does.
+# inputSize - poolSize = 301, which bfloat16 cannot hold. It distinguishes
+# CPU's scalar_t interval rounding from CUDA's F32 interval arithmetic.
 _FRACTIONAL_MAX_POOL_CASES = {
     "2d": (FractionalMaxPool2d([2, 3], [3, 2]), (2, 3, 7, 8), (2, 3, 2)),
     "2d_unbatched": (FractionalMaxPool2d([3, 2], [4, 3]), (2, 9, 8), (1, 2, 2)),
