@@ -172,8 +172,17 @@ SCATTERS = (
 @pytest.mark.parametrize("fn", SCATTERS)
 def test_integer_scatter_accumulation_wraps_like_eager(stage_one_only, fn, dtype):
     """Scatter accumulation runs in the data dtype: exact past 2^24 and
-    wrapping on overflow; an integer mean floor-divides."""
-    _run(Binary(fn), *_scatter_inputs(dtype))
+    wrapping on overflow; an integer mean floor-divides. CUDA labels its
+    scatter product kernel nondeterministic, but every reduction here is
+    order-independent in wrapping integer arithmetic. Permit that eager
+    kernel only for this parity check and restore the session policy."""
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(False)
+    try:
+        _run(Binary(fn), *_scatter_inputs(dtype))
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
 
 
 @pytest.mark.parametrize("dtype", WIDE)
