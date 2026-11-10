@@ -308,7 +308,7 @@ impl GraphTensor {
     /// at the source of truth — no intermediate movement scaffolding.
     /// Entries are listed per PARENT axis (outermost inward), each an
     /// expression in the OUT space's coordinates (from-end convention).
-    pub(crate) fn record_view_map(
+    pub fn record_view_map(
         mut self,
         entries: Vec<crate::graph::MapEntry>,
         out_dims: Vec<IntExpr>,

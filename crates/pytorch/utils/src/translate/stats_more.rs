@@ -202,7 +202,7 @@ impl Translator<'_> {
     /// Order 0 counts the nonzero entries, torch's sum of `x != 0`. A NaN
     /// entry is nonzero, so it counts once (`inf - inf` included):
     /// `util::is_zero` is torch's `== 0`, which is false for NaN.
-    fn vector_norm_reduce(
+    pub(super) fn vector_norm_reduce(
         &mut self,
         magnitude: GraphTensor,
         ord: f64,

@@ -556,6 +556,17 @@ impl Translator<'_> {
     pub(super) fn translate_slice_scatter(&mut self, node: &Node) -> Result<GraphTensor> {
         let destination = self.operand(&node.inputs[0])?;
         let source = self.operand(&node.inputs[1])?.cast(destination.dtype);
+        self.translate_slice_scatter_values(destination, source, node)
+    }
+
+    /// Dtype-agnostic slice-scatter geometry shared with complex component
+    /// lowering.
+    pub(super) fn translate_slice_scatter_values(
+        &mut self,
+        destination: GraphTensor,
+        source: GraphTensor,
+        node: &Node,
+    ) -> Result<GraphTensor> {
         let rank = destination.rank();
         anyhow::ensure!(rank > 0, "slice_scatter on a rank-0 tensor is not ported");
         anyhow::ensure!(

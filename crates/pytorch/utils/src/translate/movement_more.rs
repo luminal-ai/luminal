@@ -283,6 +283,17 @@ impl Translator<'_> {
     pub(super) fn translate_diagonal_scatter(&mut self, node: &Node) -> Result<GraphTensor> {
         let destination = self.operand(&node.inputs[0])?;
         let source = self.operand(&node.inputs[1])?;
+        self.translate_diagonal_scatter_values(destination, source, node)
+    }
+
+    /// Dtype-agnostic `diagonal_scatter` geometry. Complex lowering applies
+    /// the same coordinates independently to the real and imaginary parts.
+    pub(super) fn translate_diagonal_scatter_values(
+        &mut self,
+        destination: GraphTensor,
+        source: GraphTensor,
+        node: &Node,
+    ) -> Result<GraphTensor> {
         let offset = self.get_int_arg(node, 2).unwrap_or(0);
         let (dim1, dim2) = normalize_diagonal_dims(
             self.get_int_arg(node, 3).unwrap_or(0),
@@ -331,38 +342,104 @@ impl Translator<'_> {
             return self.translate_im2col(node);
         }
         let x = self.operand(&node.inputs[0])?;
-        let rank = x.rank();
-        anyhow::ensure!(rank > 0, "unfold on a rank-0 tensor is not ported");
+        self.translate_unfold_value(x, node)
+    }
+
+    /// Dtype-agnostic `Tensor.unfold` geometry. Complex lowering applies the
+    /// same logical read map independently to both storage components.
+    pub(super) fn translate_unfold_value(
+        &mut self,
+        x: GraphTensor,
+        node: &Node,
+    ) -> Result<GraphTensor> {
+        self.translate_unfold_view(x, node)
+    }
+
+    /// Preserve an interleaved complex boundary backing across `Tensor.unfold`.
+    /// The physical component axis stays last; the authored window axis is
+    /// inserted immediately before it, matching the logical complex shape.
+    pub(super) fn translate_unfold_interleaved_backing(
+        &mut self,
+        x: GraphTensor,
+        node: &Node,
+    ) -> Result<GraphTensor> {
+        let physical_rank = x.rank();
+        let logical_rank = physical_rank
+            .checked_sub(1)
+            .context("complex unfold backing has no component axis")?;
+        anyhow::ensure!(logical_rank > 0, "unfold on a rank-0 tensor is not ported");
         let raw_dim = self.get_int_arg(node, 1)?;
         anyhow::ensure!(
-            raw_dim >= -(rank as i64) && raw_dim < rank as i64,
-            "unfold dimension {raw_dim} out of range for rank {rank}"
+            raw_dim >= -(logical_rank as i64) && raw_dim < logical_rank as i64,
+            "unfold dimension {raw_dim} out of range for rank {logical_rank}"
         );
-        let dim = normalize_dim(raw_dim, rank);
+        let dim = normalize_dim(raw_dim, logical_rank);
         let size = self.get_int_arg(node, 2)?;
         let step = self.get_int_arg(node, 3)?;
         anyhow::ensure!(size >= 0, "unfold size must be nonnegative, got {size}");
         anyhow::ensure!(step > 0, "unfold step must be positive, got {step}");
-        // The declared output shape carries the window count; author the read
-        // map directly instead of relying on the symbolic window contract.
+
+        let mut kernel = vec![IntExpr::from(1); physical_rank];
+        let mut strides = vec![IntExpr::from(1); physical_rank];
+        let dilation = vec![IntExpr::from(1); physical_rank];
+        kernel[dim] = IntExpr::from(size);
+        strides[dim] = IntExpr::from(step);
+        let mut view = x.unfold_view(kernel, strides, dilation);
+        for axis in (0..physical_rank).rev() {
+            if axis != dim {
+                view = view.squeeze(physical_rank + axis);
+            }
+        }
+        let mut axes: Vec<_> = (0..=physical_rank).collect();
+        axes.swap(logical_rank, physical_rank);
+        Ok(view.permute(axes).finish())
+    }
+
+    fn translate_unfold_view(&mut self, x: GraphTensor, node: &Node) -> Result<GraphTensor> {
+        let logical_rank = x.rank();
+        anyhow::ensure!(logical_rank > 0, "unfold on a rank-0 tensor is not ported");
+        let raw_dim = self.get_int_arg(node, 1)?;
+        anyhow::ensure!(
+            raw_dim >= -(logical_rank as i64) && raw_dim < logical_rank as i64,
+            "unfold dimension {raw_dim} out of range for rank {logical_rank}"
+        );
+        let dim = normalize_dim(raw_dim, logical_rank);
+        let size = self.get_int_arg(node, 2)?;
+        let step = self.get_int_arg(node, 3)?;
+        anyhow::ensure!(size >= 0, "unfold size must be nonnegative, got {size}");
+        anyhow::ensure!(step > 0, "unfold step must be positive, got {step}");
+
+        // Use the exported shape spelling itself. Dynamic export may name the
+        // window count with a fresh derived symbol; recording an equivalent
+        // arithmetic spelling would prevent the boundary layout from rejoining
+        // the view before that equality is available.
         let out_shape = self.output_meta_shape(node)?;
         anyhow::ensure!(
-            out_shape.len() == rank + 1,
-            "unfold output rank {} does not match input rank {rank}",
+            out_shape.len() == logical_rank + 1,
+            "unfold output rank {} does not match input rank {logical_rank}",
             out_shape.len()
         );
-        let kernel_axis = rank;
-        let mut coords = Vec::with_capacity(rank);
-        for axis in 0..rank {
-            coords.push(self.cx.iota(out_shape.clone(), move |c| {
-                if axis == dim {
-                    c[axis] * IntExpr::from(step) + c[kernel_axis]
-                } else {
-                    c[axis]
-                }
-            }));
+        let out_rank = out_shape.len();
+        let window_axis = logical_rank;
+        let mut entries = Vec::with_capacity(x.rank());
+        for axis in 0..logical_rank {
+            let coordinate = MapEntry::Coord {
+                from_end: out_rank - 1 - axis,
+                extent: out_shape[axis],
+            };
+            entries.push(if axis == dim {
+                MapEntry::Add(
+                    Box::new(MapEntry::Mul(Box::new(coordinate), IntExpr::from(step))),
+                    Box::new(MapEntry::Coord {
+                        from_end: out_rank - 1 - window_axis,
+                        extent: out_shape[window_axis],
+                    }),
+                )
+            } else {
+                coordinate
+            });
         }
-        Ok(x.gather(&coords))
+        Ok(x.record_view_map(entries, out_shape))
     }
 
     /// `aten.im2col.default(self, kernel_size, dilation, padding, stride)`:

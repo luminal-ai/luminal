@@ -713,6 +713,14 @@ impl Translator<'_> {
                     self.store_complex(output_name, value.map(|c| c.cumsum(vec![dim])));
                 }
             }
+            "logcumsumexp.default" => {
+                let value = self.translate_complex_logcumsumexp(node)?;
+                self.store_complex(output_name, value);
+            }
+            "dist.default" => {
+                let value = self.translate_complex_dist(node)?;
+                self.values.insert(output_name.to_string(), value);
+            }
             "var.default" | "var.dim" | "var.correction" => {
                 let (axes, variance, _) = self.translate_complex_variance(node)?;
                 let variance = restore_reduced_dims(variance, &axes, self.keepdim_flag(node, 3));
@@ -774,6 +782,84 @@ impl Translator<'_> {
             }
 
             // ---- movement ----
+            "gather.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let value =
+                    value.try_map(|component| self.translate_gather_value(component, node))?;
+                self.store_complex(output_name, value);
+            }
+            "index.Tensor" => {
+                let value = self.get_complex_input(node, 0)?;
+                let value = value
+                    .try_map(|component| self.translate_index_tensor_value(component, node))?;
+                self.store_complex(output_name, value);
+            }
+            "slice_scatter.default" => {
+                let destination = self.get_complex_input(node, 0)?;
+                let source = self
+                    .value_as_complex(self.input_value_name(node, 1)?, destination.torch_dtype)?;
+                let real =
+                    self.translate_slice_scatter_values(destination.real, source.real, node)?;
+                let imag =
+                    self.translate_slice_scatter_values(destination.imag, source.imag, node)?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real, imag, destination.torch_dtype),
+                );
+            }
+            "diagonal_scatter.default" => {
+                let destination = self.get_complex_input(node, 0)?;
+                let source = self
+                    .value_as_complex(self.input_value_name(node, 1)?, destination.torch_dtype)?;
+                let real =
+                    self.translate_diagonal_scatter_values(destination.real, source.real, node)?;
+                let imag =
+                    self.translate_diagonal_scatter_values(destination.imag, source.imag, node)?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real, imag, destination.torch_dtype),
+                );
+            }
+            "unfold.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let backing = value
+                    .backing
+                    .map(|backing| self.translate_unfold_interleaved_backing(backing, node))
+                    .transpose()?;
+                let mut value =
+                    value.try_map(|component| self.translate_unfold_value(component, node))?;
+                value.backing = backing;
+                self.store_complex(output_name, value);
+            }
+            "masked_scatter.default" => {
+                let destination = self.get_complex_input(node, 0)?;
+                let mask = self.get_input_tensor(node, 1)?;
+                let source = self
+                    .value_as_complex(self.input_value_name(node, 2)?, destination.torch_dtype)?;
+                let real = self.idx_masked_scatter(destination.real, mask, source.real)?;
+                let imag = self.idx_masked_scatter(destination.imag, mask, source.imag)?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real, imag, destination.torch_dtype),
+                );
+            }
+            "put.default" => {
+                let destination = self.get_complex_input(node, 0)?;
+                let indices = self.get_input_tensor(node, 1)?;
+                let source = self
+                    .value_as_complex(self.input_value_name(node, 2)?, destination.torch_dtype)?;
+                let accumulate = node
+                    .inputs
+                    .get(3)
+                    .and_then(|input| input.arg.as_bool())
+                    .unwrap_or(false);
+                let real = self.idx_put(destination.real, indices, source.real, accumulate)?;
+                let imag = self.idx_put(destination.imag, indices, source.imag, accumulate)?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real, imag, destination.torch_dtype),
+                );
+            }
             "view.default" | "view_copy.default" | "reshape.default" | "_unsafe_view.default" => {
                 let value = self.get_complex_input(node, 0)?;
                 let target_shape = match self.resolve_shape_arg(node, 1) {
@@ -2457,6 +2543,124 @@ impl Translator<'_> {
         ))
     }
 
+    /// Ordered complex log-cumulative-sum-exp. The scan state stays in log
+    /// space and each update subtracts the larger real part before taking
+    /// exponentials, so large finite inputs do not overflow. A concrete scan
+    /// extent is required; refusing a symbolic extent is preferable to an
+    /// unbounded quadratic prefix materialization.
+    fn translate_complex_logcumsumexp(&mut self, node: &Node) -> Result<ComplexTensor> {
+        let value = self.get_complex_input(node, 0)?;
+        let rank = value.real.rank();
+        if rank == 0 {
+            anyhow::ensure!(
+                matches!(self.get_int_arg(node, 1)?, -1 | 0),
+                "complex logcumsumexp dimension is out of range for a scalar"
+            );
+            return Ok(value);
+        }
+        let axis = normalize_dim(self.get_int_arg(node, 1)?, rank);
+        let extent = value.real.dims()[axis]
+            .to_usize()
+            .context("complex logcumsumexp requires a concrete scan dimension")?;
+        if extent == 0 {
+            return Ok(value);
+        }
+        let select = |component: GraphTensor, index: usize| {
+            component.slice_along(index..index + 1, axis).squeeze(axis)
+        };
+        let mut prefix = ComplexTensor::new(
+            select(value.real, 0),
+            select(value.imag, 0),
+            value.torch_dtype,
+        );
+        let mut real_prefixes = Vec::with_capacity(extent);
+        let mut imag_prefixes = Vec::with_capacity(extent);
+        real_prefixes.push(prefix.real);
+        imag_prefixes.push(prefix.imag);
+        for index in 1..extent {
+            let next = ComplexTensor::new(
+                select(value.real, index),
+                select(value.imag, index),
+                value.torch_dtype,
+            );
+            prefix = self.complex_logaddexp(prefix, next)?;
+            real_prefixes.push(prefix.real);
+            imag_prefixes.push(prefix.imag);
+        }
+        Ok(ComplexTensor::new(
+            self.cx.stack(&real_prefixes, axis),
+            self.cx.stack(&imag_prefixes, axis),
+            value.torch_dtype,
+        ))
+    }
+
+    fn complex_logaddexp(
+        &mut self,
+        lhs: ComplexTensor,
+        rhs: ComplexTensor,
+    ) -> Result<ComplexTensor> {
+        // Match ATen's complex _log_add_exp_helper, including the complex
+        // value associated with the larger real part and its explicit equal
+        // infinity branches.
+        let lhs_nan = cx_bool_or(self.is_nan(lhs.real), self.is_nan(lhs.imag));
+        let rhs_nan = cx_bool_or(self.is_nan(rhs.real), self.is_nan(rhs.imag));
+        let ordered = lhs.real.lt(rhs.real);
+        let select_complex = |this: &mut Self,
+                              condition: GraphTensor,
+                              if_true: ComplexTensor,
+                              if_false: ComplexTensor| {
+            ComplexTensor::new(
+                this.cx_select(condition, if_true.real, if_false.real),
+                this.cx_select(condition, if_true.imag, if_false.imag),
+                if_true.torch_dtype,
+            )
+        };
+        let ordinary_min = select_complex(self, ordered, lhs, rhs);
+        let ordinary_max = select_complex(self, ordered, rhs, lhs);
+        let min = select_complex(self, rhs_nan, rhs, ordinary_min);
+        let min = select_complex(self, lhs_nan, lhs, min);
+        let max = select_complex(self, rhs_nan, rhs, ordinary_max);
+        let max = select_complex(self, lhs_nan, lhs, max);
+
+        let difference = self.apply_complex_binary(BinaryOp::Sub, min, max)?;
+        let exponential = self.complex_exp(difference);
+        let one = self.complex_constant_like(exponential.real, 1.0, 0.0, exponential.torch_dtype);
+        let ordinary = self.complex_log(self.add_complex(one, exponential));
+        let ordinary = self.apply_complex_binary(BinaryOp::Add, ordinary, max)?;
+
+        let min_exponential = self.complex_exp(min);
+        let max_exponential = self.complex_exp(max);
+        let infinite_sum = self.add_complex(min_exponential, max_exponential);
+        let plus_infinity = self.complex_log(infinite_sum);
+        let zero = self.constant_like(min.real, 0.0);
+        let negative = min.real.lt(zero);
+        let infinite_result = select_complex(self, negative, min, plus_infinity);
+        let equal_real = min.real.eq(max.real);
+        let nonfinite = cx_bool_not(self.is_finite(min.real));
+        let equal_nonfinite = cx_bool_and(equal_real, nonfinite);
+        let result = select_complex(self, equal_nonfinite, infinite_result, ordinary);
+
+        let any_nan = cx_bool_or(lhs_nan, rhs_nan);
+        let nan = self.complex_constant_like(min.real, f64::NAN, f64::NAN, min.torch_dtype);
+        Ok(select_complex(self, any_nan, nan, result))
+    }
+
+    fn translate_complex_dist(&mut self, node: &Node) -> Result<GraphTensor> {
+        let output = self.output_meta_dtype(node)?;
+        let dtype = match output {
+            DType::F16 => TorchDType::ComplexHalf,
+            DType::F32 => TorchDType::ComplexFloat,
+            DType::F64 => TorchDType::ComplexDouble,
+            other => bail!("complex dist has non-floating output dtype {other:?}"),
+        };
+        let lhs = self.value_as_complex(self.input_value_name(node, 0)?, dtype)?;
+        let rhs = self.value_as_complex(self.input_value_name(node, 1)?, dtype)?;
+        let difference = self.apply_complex_binary(BinaryOp::Sub, lhs, rhs)?;
+        let magnitude = self.complex_abs(difference).cast(output);
+        let p = self.get_float_arg(node, 2).unwrap_or(2.0);
+        let axes = (0..magnitude.rank()).collect();
+        Ok(self.vector_norm_reduce(magnitude, p, axes))
+    }
     fn translate_complex_matmul(
         &mut self,
         node: &Node,
