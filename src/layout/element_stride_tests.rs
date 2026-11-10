@@ -435,6 +435,72 @@ fn literal_expression_recovery_preserves_origin_and_singleton_freedom() {
 }
 
 #[test]
+fn demanded_shifted_layouts_rejoin_only_on_the_complete_affine_certificate() {
+    let mut g = graph();
+    run(
+        &mut g,
+        r#"
+(let shape (ShapeLit (IntExprCons (IntLit 3) (IntExprCons (IntLit 4) (IntExprNil)))))
+(let other_shape (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 6) (IntExprNil)))))
+(let row (CoordVar shape 1))
+(let column (CoordVar shape 0))
+(let lhs (ElementOffsetExpressionLayoutLit
+ (IntAdd (IntLit 5) (IntAdd (IntMul row (IntLit 8)) (IntMul column (IntLit 2))))
+ shape (BitWidthLit 32)))
+(let rhs (ElementOffsetExpressionLayoutLit
+ (IntAdd (IntMul (IntLit 2) column) (IntAdd (IntMul (IntLit 8) row) (IntLit 5)))
+ shape (BitWidthLit 32)))
+(let other_origin (ElementOffsetExpressionLayoutLit
+ (IntAdd (IntLit 6) (IntAdd (IntMul row (IntLit 8)) (IntMul column (IntLit 2))))
+ shape (BitWidthLit 32)))
+(let other_coefficient (ElementOffsetExpressionLayoutLit
+ (IntAdd (IntLit 5) (IntAdd (IntMul row (IntLit 7)) (IntMul column (IntLit 2))))
+ shape (BitWidthLit 32)))
+(let other_width (ElementOffsetExpressionLayoutLit
+ (IntAdd (IntLit 5) (IntAdd (IntMul row (IntLit 8)) (IntMul column (IntLit 2))))
+ shape (BitWidthLit 64)))
+(let other_domain (ElementOffsetExpressionLayoutLit
+ (IntAdd (IntLit 5)
+  (IntAdd (IntMul (CoordVar other_shape 1) (IntLit 8))
+          (IntMul (CoordVar other_shape 0) (IntLit 2))))
+ other_shape (BitWidthLit 32)))
+(let bit-lhs (BitOffsetExpressionLayoutLit
+ (IntAdd (IntLit 160)
+  (IntMul (IntAdd (IntMul row (IntLit 8)) (IntMul column (IntLit 2))) (IntLit 32)))
+ shape (BitWidthLit 32)))
+(let bit-rhs (BitOffsetExpressionLayoutLit
+ (IntAdd (IntMul (IntLit 64) column)
+  (IntAdd (IntMul (IntLit 256) row) (IntLit 160)))
+ shape (BitWidthLit 32)))
+(let bit-other-origin (BitOffsetExpressionLayoutLit
+ (IntAdd (IntLit 192)
+  (IntMul (IntAdd (IntMul row (IntLit 8)) (IntMul column (IntLit 2))) (IntLit 32)))
+ shape (BitWidthLit 32)))
+(element-stride-discovery-demand lhs)
+(element-stride-discovery-demand rhs)
+(element-stride-discovery-demand other_origin)
+(element-stride-discovery-demand other_coefficient)
+(element-stride-discovery-demand other_width)
+(element-stride-discovery-demand other_domain)
+(element-stride-discovery-demand bit-lhs)
+(element-stride-discovery-demand bit-rhs)
+(element-stride-discovery-demand bit-other-origin)
+(run-schedule (saturate (run element-stride-discovery) (run main_ruleset) (run prop)))
+(check (= lhs rhs))
+(check (= bit-lhs bit-rhs))
+(fail (check (= lhs other_origin)))
+(fail (check (= lhs other_coefficient)))
+(fail (check (= lhs other_width)))
+(fail (check (= lhs other_domain)))
+(fail (check (= bit-lhs bit-other-origin)))
+; A shifted layout remains shifted; equality does not erase its origin by
+; manufacturing an ordinary zero-origin stride presentation.
+(fail (check (element-stride-discovered lhs)))
+"#,
+    );
+}
+
+#[test]
 fn exact_conflicts_are_not_proof_of_singleton_freedom() {
     let mut g = graph();
     run(

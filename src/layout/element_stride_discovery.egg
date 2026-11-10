@@ -2,7 +2,10 @@
 ; filing narrow demands; CUDA uses it for layouts of model-bound alias outputs.
 ; Whole linear certificates replace independently merged coefficient/constant
 ; cells. Arithmetic stays in BigInt, outside IntExpr ring rewriting, until a
-; complete nonnegative zero-origin presentation has been proved.
+; complete affine presentation has been proved.  Zero-origin presentations
+; may additionally publish ordinary element strides; shifted presentations
+; remain offset expressions, but two demanded layouts with the same complete
+; certificate are extensionally equal and may safely rejoin.
 (ruleset element-stride-discovery)
 (datatype ElementStrideLiteralCoefficients
   (ElementStrideLiteralCoefficientsNil)
@@ -43,6 +46,8 @@
  ((element-stride-coefficients-scaled (ElementStrideLiteralCoefficientsCons ?h ?t) ?s (ElementStrideLiteralCoefficientsCons (* ?h ?s) ?tail))) :ruleset element-stride-discovery)
 
 (rule ((element-stride-discovery-demand ?layout) (= ?layout (ElementOffsetExpressionLayoutLit ?e ?shape ?w)))
+ ((element-stride-linear-certificate-demand ?e ?shape)) :ruleset element-stride-discovery)
+(rule ((element-stride-discovery-demand ?layout) (= ?layout (BitOffsetExpressionLayoutLit ?e ?shape ?w)))
  ((element-stride-linear-certificate-demand ?e ?shape)) :ruleset element-stride-discovery)
 (rule ((element-stride-linear-certificate-demand ?e (ShapeLit ?dims)) (= ?e (IntLit ?n))
        (element-stride-literal-zero-coefficients ?dims ?zeros))
@@ -86,3 +91,35 @@
        (element-stride-linear-certificate ?e ?shape ?coeffs (bigint 0)) (element-stride-coefficients-published ?coeffs ?strides))
  ((union ?layout (ElementStridedLayoutLit ?shape ?strides ?w)) (element-stride-discovered ?layout))
  :ruleset element-stride-discovery :name "element-stride: publish only complete zero-origin certificates")
+
+; A nonzero origin cannot be represented by ElementStridedLayoutLit, but it
+; is still part of the complete affine function.  Rejoin only layouts that
+; were explicitly demanded and whose independently derived certificates have
+; the identical shape, width, coefficient list, and origin.  This preserves
+; shifted boundary views without making unrestricted scalar reassociation a
+; global e-graph rule.
+(rule
+ ((element-stride-discovery-demand ?lhs)
+  (element-stride-discovery-demand ?rhs)
+  (= ?lhs (ElementOffsetExpressionLayoutLit ?lhs-expr ?shape ?width))
+  (= ?rhs (ElementOffsetExpressionLayoutLit ?rhs-expr ?shape ?width))
+  (element-stride-linear-certificate ?lhs-expr ?shape ?coeffs ?origin)
+  (element-stride-linear-certificate ?rhs-expr ?shape ?coeffs ?origin))
+ ((union ?lhs ?rhs))
+ :ruleset element-stride-discovery
+ :name "element-stride: equal complete demanded affine certificates rejoin")
+
+; Shifted boundary aliases are born directly in bit-offset vocabulary: their
+; byte offset is an additive bit constant, not an element expression that the
+; zero-origin bit-to-element rule may divide.  Compare those complete bit-level
+; certificates by the same exact criterion.
+(rule
+ ((element-stride-discovery-demand ?lhs)
+  (element-stride-discovery-demand ?rhs)
+  (= ?lhs (BitOffsetExpressionLayoutLit ?lhs-expr ?shape ?width))
+  (= ?rhs (BitOffsetExpressionLayoutLit ?rhs-expr ?shape ?width))
+  (element-stride-linear-certificate ?lhs-expr ?shape ?coeffs ?origin)
+  (element-stride-linear-certificate ?rhs-expr ?shape ?coeffs ?origin))
+ ((union ?lhs ?rhs))
+ :ruleset element-stride-discovery
+ :name "element-stride: equal complete demanded affine bit certificates rejoin")
