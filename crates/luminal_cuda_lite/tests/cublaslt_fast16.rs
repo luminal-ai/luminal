@@ -210,6 +210,25 @@ fn casts_after_arithmetic_cannot_authorize_input_conversion() {
 }
 
 #[test]
+fn implementation_masked_fast16_calls_require_static_vendor_geometry() {
+    for dtype in [DType::F16, DType::Bf16] {
+        let mut graph = Graph::new();
+        let k = IntExpr::from('k');
+        let a = graph.tensor(vec![3.into(), k], DType::F32);
+        let b = graph.tensor(vec![k, 5.into()], DType::F32);
+        let _out = q(a, dtype).matmul(q(b, dtype));
+        let runtime = luminal_cuda_lite::CudaRuntime::load(&graph).unwrap();
+        let bounds = SymbolBounds::from_ranges([('k'.into(), (2, 16))]).unwrap();
+        let (separate, tied) = calls(&runtime.saturated_egraph(&bounds).unwrap());
+        assert!(
+            separate.iter().all(|op| op.computation != mode(dtype))
+                && tied.iter().all(|op| op.computation != mode(dtype)),
+            "a device implementation mask validated at one shape cannot cover a symbolic k"
+        );
+    }
+}
+
+#[test]
 fn earlier_rounding_is_preserved_through_views_and_final_casts() {
     use luminal::egglog_utils::eclass::{ConstructorRegistry, EGraphView};
     for dtype in [DType::F16, DType::Bf16] {

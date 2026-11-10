@@ -67,6 +67,104 @@
   (CublasLtExpressionFrame CublasLtMatrixDescriptor IntExpr Dtype
     CublasLtCMatrixArgument CublasLtCMatrixDataType CublasLtBiasArgument
     CublasLtBiasDataType CublasLtScalarPointerMode CublasLtScalarArguments))
+; The three implementation-masked F32 modes are not shape-total vendor
+; operations: cuBLASLt can expose an INPUT_TF32/16F/16BF algorithm for one
+; geometry and no such algorithm for another. Search profiles one concrete
+; assignment, so a dynamic call could otherwise be selected at the hint shape
+; and fail at another valid shape. Admit these modes only when all vendor
+; dimensions contain no runtime symbol; candidate preparation then validates
+; that exact geometry. Shape-total modes remain available for dynamic
+; dimensions.
+(relation cublaslt-positive-geometry-computation (CublasLtComputationType))
+(cublaslt-positive-geometry-computation (CublasLtFloat16Computation))
+(cublaslt-positive-geometry-computation (CublasLtFloat32Computation))
+(cublaslt-positive-geometry-computation (CublasLtFloat64Computation))
+(cublaslt-positive-geometry-computation (CublasLtTensorFloat32Computation))
+(cublaslt-positive-geometry-computation (CublasLtFloat32FastFloat16Computation))
+(cublaslt-positive-geometry-computation (CublasLtFloat32FastBfloat16Computation))
+(relation cublaslt-implementation-masked-computation (CublasLtComputationType))
+(cublaslt-implementation-masked-computation (CublasLtTensorFloat32Computation))
+(cublaslt-implementation-masked-computation (CublasLtFloat32FastFloat16Computation))
+(cublaslt-implementation-masked-computation (CublasLtFloat32FastBfloat16Computation))
+; This is a monotone may-depend analysis over each IntExpr e-class. A dynamic
+; expression can also acquire a literal presentation during saturation; max
+; keeps the IntVar witness authoritative, matching extraction's capture_dims.
+(function cublaslt-symbol-dependency-of (IntExpr) i64 :merge (max old new))
+(rule ((= ?expr (IntLit ?value)))
+  ((set (cublaslt-symbol-dependency-of ?expr) 0))
+  :ruleset main_ruleset
+  :name "cublaslt: integer literals have no runtime symbol dependency")
+(rule ((= ?expr (IntVar ?name)))
+  ((set (cublaslt-symbol-dependency-of ?expr) 1))
+  :ruleset main_ruleset
+  :name "cublaslt: integer variables carry a runtime symbol dependency")
+(rule ((= ?expr (CoordVar ?shape ?axis)))
+  ((set (cublaslt-symbol-dependency-of ?expr) 0))
+  :ruleset main_ruleset
+  :name "cublaslt: coordinates carry no runtime dimension parameter")
+(rule
+  ((= ?expr (IntAdd ?lhs ?rhs))
+   (= ?lhs_dependency (cublaslt-symbol-dependency-of ?lhs))
+   (= ?rhs_dependency (cublaslt-symbol-dependency-of ?rhs)))
+  ((set (cublaslt-symbol-dependency-of ?expr) (max ?lhs_dependency ?rhs_dependency)))
+  :ruleset main_ruleset
+  :name "cublaslt: add propagates runtime symbol dependencies")
+(rule
+  ((= ?expr (IntMul ?lhs ?rhs))
+   (= ?lhs_dependency (cublaslt-symbol-dependency-of ?lhs))
+   (= ?rhs_dependency (cublaslt-symbol-dependency-of ?rhs)))
+  ((set (cublaslt-symbol-dependency-of ?expr) (max ?lhs_dependency ?rhs_dependency)))
+  :ruleset main_ruleset
+  :name "cublaslt: multiply propagates runtime symbol dependencies")
+(rule
+  ((= ?expr (IntTruncDiv ?lhs ?rhs))
+   (= ?lhs_dependency (cublaslt-symbol-dependency-of ?lhs))
+   (= ?rhs_dependency (cublaslt-symbol-dependency-of ?rhs)))
+  ((set (cublaslt-symbol-dependency-of ?expr) (max ?lhs_dependency ?rhs_dependency)))
+  :ruleset main_ruleset
+  :name "cublaslt: truncating divide propagates runtime symbol dependencies")
+(rule
+  ((= ?expr (IntTruncRem ?lhs ?rhs))
+   (= ?lhs_dependency (cublaslt-symbol-dependency-of ?lhs))
+   (= ?rhs_dependency (cublaslt-symbol-dependency-of ?rhs)))
+  ((set (cublaslt-symbol-dependency-of ?expr) (max ?lhs_dependency ?rhs_dependency)))
+  :ruleset main_ruleset
+  :name "cublaslt: remainder propagates runtime symbol dependencies")
+(rule
+  ((= ?expr (IntCeilDiv ?lhs ?rhs))
+   (= ?lhs_dependency (cublaslt-symbol-dependency-of ?lhs))
+   (= ?rhs_dependency (cublaslt-symbol-dependency-of ?rhs)))
+  ((set (cublaslt-symbol-dependency-of ?expr) (max ?lhs_dependency ?rhs_dependency)))
+  :ruleset main_ruleset
+  :name "cublaslt: ceiling divide propagates runtime symbol dependencies")
+(rule
+  ((= ?expr (IntMin ?lhs ?rhs))
+   (= ?lhs_dependency (cublaslt-symbol-dependency-of ?lhs))
+   (= ?rhs_dependency (cublaslt-symbol-dependency-of ?rhs)))
+  ((set (cublaslt-symbol-dependency-of ?expr) (max ?lhs_dependency ?rhs_dependency)))
+  :ruleset main_ruleset
+  :name "cublaslt: minimum propagates runtime symbol dependencies")
+(rule
+  ((= ?expr (IntMax ?lhs ?rhs))
+   (= ?lhs_dependency (cublaslt-symbol-dependency-of ?lhs))
+   (= ?rhs_dependency (cublaslt-symbol-dependency-of ?rhs)))
+  ((set (cublaslt-symbol-dependency-of ?expr) (max ?lhs_dependency ?rhs_dependency)))
+  :ruleset main_ruleset
+  :name "cublaslt: maximum propagates runtime symbol dependencies")
+(rule ((= ?expr (IntCastFromBool ?predicate)))
+  ((set (cublaslt-symbol-dependency-of ?expr) 1))
+  :ruleset main_ruleset
+  :name "cublaslt: predicate casts are not static descriptor geometry")
+(relation cublaslt-vendor-geometry-supported
+  (CublasLtComputationType IntExpr IntExpr IntExpr))
+(rule
+  ((cublaslt-positive-geometry-computation ?computation_type)
+   (cublaslt-positive-extent ?m)
+   (cublaslt-positive-extent ?n)
+   (cublaslt-positive-extent ?k))
+  ((cublaslt-vendor-geometry-supported ?computation_type ?m ?n ?k))
+  :ruleset backend
+  :name "cublaslt: computations admit positive vendor geometry before dynamic masking")
 ; Complete, whitelist-approved call descriptions are proof facts, not ops.
 ; Executable forms consume this same admission result without reinterpreting it.
 (relation cublaslt-approved-call
@@ -77,6 +175,79 @@
   (CublasLtConfiguration CublasLtMatrixDescriptor CublasLtMatrixDescriptor
     CublasLtCMatrixArgument CublasLtBiasArgument CublasLtMatrixDescriptor
     CublasLtExpressionFrame CublasLtScalarArguments LayoutTensorList))
+
+; Implementation-mask availability is descriptor-specific. A positive symbol
+; dependency is monotone even when saturation also gives the expression a
+; literal presentation, so these markers can safely retire dynamic physical
+; calls after they are emitted without negative matching or Rust filtering.
+(relation cublaslt-symbolic-matrix-descriptor (CublasLtMatrixDescriptor))
+(rule
+  ((= ?descriptor (CublasLtMatrixDescriptorOf ?tensor
+      (CublasLtMatrixLayoutLit ?dtype ?order ?rows ?cols ?ld ?batch_count ?batch_stride)))
+   (= 1 (cublaslt-symbol-dependency-of ?rows)))
+  ((cublaslt-symbolic-matrix-descriptor ?descriptor))
+  :ruleset backend :name "cublaslt: symbolic matrix rows mark the descriptor")
+(rule
+  ((= ?descriptor (CublasLtMatrixDescriptorOf ?tensor
+      (CublasLtMatrixLayoutLit ?dtype ?order ?rows ?cols ?ld ?batch_count ?batch_stride)))
+   (= 1 (cublaslt-symbol-dependency-of ?cols)))
+  ((cublaslt-symbolic-matrix-descriptor ?descriptor))
+  :ruleset backend :name "cublaslt: symbolic matrix columns mark the descriptor")
+(rule
+  ((= ?descriptor (CublasLtMatrixDescriptorOf ?tensor
+      (CublasLtMatrixLayoutLit ?dtype ?order ?rows ?cols ?ld ?batch_count ?batch_stride)))
+   (= 1 (cublaslt-symbol-dependency-of ?ld)))
+  ((cublaslt-symbolic-matrix-descriptor ?descriptor))
+  :ruleset backend :name "cublaslt: symbolic leading dimension marks the descriptor")
+(rule
+  ((= ?descriptor (CublasLtMatrixDescriptorOf ?tensor
+      (CublasLtMatrixLayoutLit ?dtype ?order ?rows ?cols ?ld ?batch_count ?batch_stride)))
+   (= 1 (cublaslt-symbol-dependency-of ?batch_count)))
+  ((cublaslt-symbolic-matrix-descriptor ?descriptor))
+  :ruleset backend :name "cublaslt: symbolic batch count marks the descriptor")
+(rule
+  ((= ?descriptor (CublasLtMatrixDescriptorOf ?tensor
+      (CublasLtMatrixLayoutLit ?dtype ?order ?rows ?cols ?ld ?batch_count ?batch_stride)))
+   (= 1 (cublaslt-symbol-dependency-of ?batch_stride)))
+  ((cublaslt-symbolic-matrix-descriptor ?descriptor))
+  :ruleset backend :name "cublaslt: symbolic batch stride marks the descriptor")
+(relation cublaslt-dynamic-implementation-masked-call (LayoutTensorOp))
+(rule
+  ((= ?op (LayoutTensorOpCublasLtCall ?configuration ?A_descriptor ?B_descriptor
+      ?C_argument ?bias ?D_descriptor ?inputs ?frame ?scalars))
+   (= ?configuration (CublasLtConfigurationOf ?computation_type ?scalar_dtype
+      ?A_dtype ?B_dtype ?C_dtype ?D_dtype ?bias_dtype ?pointer_mode ?epilogue
+      ?A_order ?B_order ?D_order ?A_transpose ?B_transpose ?reduction))
+   (cublaslt-implementation-masked-computation ?computation_type)
+   (cublaslt-symbolic-matrix-descriptor ?A_descriptor))
+  ((cublaslt-dynamic-implementation-masked-call ?op)
+   (subsume (LayoutTensorOpCublasLtCall ?configuration ?A_descriptor ?B_descriptor
+      ?C_argument ?bias ?D_descriptor ?inputs ?frame ?scalars)))
+  :ruleset backend :name "cublaslt: retire implementation-masked calls with symbolic A descriptors")
+(rule
+  ((= ?op (LayoutTensorOpCublasLtCall ?configuration ?A_descriptor ?B_descriptor
+      ?C_argument ?bias ?D_descriptor ?inputs ?frame ?scalars))
+   (= ?configuration (CublasLtConfigurationOf ?computation_type ?scalar_dtype
+      ?A_dtype ?B_dtype ?C_dtype ?D_dtype ?bias_dtype ?pointer_mode ?epilogue
+      ?A_order ?B_order ?D_order ?A_transpose ?B_transpose ?reduction))
+   (cublaslt-implementation-masked-computation ?computation_type)
+   (cublaslt-symbolic-matrix-descriptor ?B_descriptor))
+  ((cublaslt-dynamic-implementation-masked-call ?op)
+   (subsume (LayoutTensorOpCublasLtCall ?configuration ?A_descriptor ?B_descriptor
+      ?C_argument ?bias ?D_descriptor ?inputs ?frame ?scalars)))
+  :ruleset backend :name "cublaslt: retire implementation-masked calls with symbolic B descriptors")
+(rule
+  ((= ?op (LayoutTensorOpCublasLtCall ?configuration ?A_descriptor ?B_descriptor
+      ?C_argument ?bias ?D_descriptor ?inputs ?frame ?scalars))
+   (= ?configuration (CublasLtConfigurationOf ?computation_type ?scalar_dtype
+      ?A_dtype ?B_dtype ?C_dtype ?D_dtype ?bias_dtype ?pointer_mode ?epilogue
+      ?A_order ?B_order ?D_order ?A_transpose ?B_transpose ?reduction))
+   (cublaslt-implementation-masked-computation ?computation_type)
+   (cublaslt-symbolic-matrix-descriptor ?D_descriptor))
+  ((cublaslt-dynamic-implementation-masked-call ?op)
+   (subsume (LayoutTensorOpCublasLtCall ?configuration ?A_descriptor ?B_descriptor
+      ?C_argument ?bias ?D_descriptor ?inputs ?frame ?scalars)))
+  :ruleset backend :name "cublaslt: retire implementation-masked calls with symbolic D descriptors")
 
 ; Exact F32 values may use their own storage or an authored narrow-to-F32
 ; widening. This relation never bypasses TF32 input rounding.
@@ -747,6 +918,7 @@
    (cublaslt-b-matrix-semantics ?expression_frame ?computation_type ?arithmetic_data_type
      ?scalar_data_type ?B_storage_data_type ?k ?n ?B_matrix_order ?B_transpose_operation
      ?B_matrix_descriptor)
+   (cublaslt-vendor-geometry-supported ?computation_type ?m ?n ?k)
    (cublaslt-destination-semantics ?expression_frame ?m ?n ?D_storage_data_type
      ?D_matrix_order ?D_matrix_descriptor ?epilogue))
   ((cublaslt-matrix-product-semantics ?expression_frame ?computation_type

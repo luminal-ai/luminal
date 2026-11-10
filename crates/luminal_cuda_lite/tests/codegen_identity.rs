@@ -248,7 +248,10 @@ fn sources_via_descriptors(
         // an operand whose read does not simplify to the identity.
         // (A view whose composed layout IS direct would be a flat read
         // on both routes, correctly.)
-        let folded = operand_info.iter().any(|slot| {
+        let folded = operand_info.iter().enumerate().any(|(operand, slot)| {
+            if !op.operand_reads_memory(operand) {
+                return false;
+            }
             let dims = slot
                 .layout
                 .literal_extents()

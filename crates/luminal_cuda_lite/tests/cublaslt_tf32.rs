@@ -200,6 +200,27 @@ fn rounding_after_arithmetic_never_authorizes_tf32_input_computation() {
 }
 
 #[test]
+fn implementation_masked_tf32_calls_require_static_vendor_geometry() {
+    let mut graph = Graph::new();
+    let k = IntExpr::from('k');
+    let a = graph.tensor(vec![3.into(), k], DType::F32);
+    let b = graph.tensor(vec![k, 5.into()], DType::F32);
+    let _out = q(a).matmul(q(b));
+    let runtime = luminal_cuda_lite::CudaRuntime::load(&graph).unwrap();
+    let bounds = SymbolBounds::from_ranges([('k'.into(), (2, 16))]).unwrap();
+    let (separate, tied) = calls(&runtime.saturated_egraph(&bounds).unwrap());
+    assert!(
+        separate
+            .iter()
+            .all(|op| op.computation != LtComputation::TensorFloat32)
+            && tied
+                .iter()
+                .all(|op| op.computation != LtComputation::TensorFloat32),
+        "a device implementation mask validated at one shape cannot cover a symbolic k"
+    );
+}
+
+#[test]
 fn tf32_preserves_earlier_narrowing_and_composes_with_final_casts_and_views() {
     for dtype in [DType::Bf16, DType::F16] {
         let mut graph = Graph::new();

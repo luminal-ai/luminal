@@ -373,6 +373,11 @@ If no algorithm supports a descriptor, preparation refuses that candidate;
 ordinary F32 calls over materialized rounded operands remain available to
 production search. The agreed environment assumption is that
 `NVIDIA_TF32_OVERRIDE` is unset. No runtime environment check is added.
+The implementation mask is shape-specific vendor capability, not a semantic
+operation that is available over every positive geometry. TF32 calls therefore
+require symbol-free `m`, `n`, and `k`; candidate preparation validates that
+exact geometry. A dynamic graph keeps the materialized TF32 round trip and
+ordinary F32 call, whose availability does not depend on a profiled hint shape.
 
 ### FP16/BF16 input conversion over FP32 storage
 
@@ -401,6 +406,13 @@ TF32 requires `INPUT_TF32`. The vendor's
 describe the inner dot-product input precision. If no matching algorithm is
 available, preparation refuses the candidate and materialized-rounding
 alternatives remain available. Reduction masks stay in the whitelist.
+For the same reason, FAST FP16/BF16 calls require symbol-free `m`, `n`, and `k`.
+In particular, CUDA 12.8 and 13 probes exposed an F32-to-BF16 implementation
+for `m=k=4, n=128` but none for the otherwise identical `m=k=6` descriptor.
+Search profiles one concrete assignment, so allowing symbolic vendor geometry
+would incorrectly let the first shape stand in for the complete dynamic domain.
+Dynamic graphs instead retain the authored cast materializations and an
+ordinary FP32-compute call.
 
 ## Element strides and strided batches
 
