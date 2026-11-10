@@ -49,6 +49,34 @@ impl Translator<'_> {
         Ok(cmp(a, b))
     }
 
+    /// Lower `aten.one_hot` over its valid input domain. ATen requires a LongTensor
+    /// whose values are in `[0, num_classes)`; outside that domain it raises rather
+    /// than producing a tensor. Export records a concrete positive class count, so
+    /// equality against the class coordinate is the operation's exact value semantics.
+    pub(super) fn translate_one_hot(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.operand(&node.inputs[0])?;
+        anyhow::ensure!(
+            input.dtype == DType::I64,
+            "one_hot requires an int64 input, got {:?}",
+            input.dtype
+        );
+        let num_classes = self.int_arg(&node.inputs[1])?;
+        anyhow::ensure!(
+            num_classes > 0,
+            "one_hot requires an exported positive num_classes, got {num_classes}"
+        );
+        let num_classes = usize::try_from(num_classes)?;
+        let rank = input.rank();
+        let mut output_shape = input.dims();
+        output_shape.push(num_classes.into());
+        let input = input.expand_dim(rank, num_classes);
+        let classes = self
+            .cx
+            .iota(output_shape, move |coordinates| coordinates[rank])
+            .cast(DType::I64);
+        Ok(input.eq(classes).cast(self.output_meta_dtype(node)?))
+    }
+
     pub(super) fn logical_binary(
         &mut self,
         node: &Node,

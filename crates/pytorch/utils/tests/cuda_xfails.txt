@@ -108,7 +108,6 @@ test_hlir_ops.py::test_gelu_tanh
 test_hlir_ops.py::test_grouped_conv2d_groups3_batch4_pt2
 test_hlir_ops.py::test_input_backed_index_put_mutates_caller_tensor
 test_hlir_ops.py::test_int_index_put_scalar_src
-test_hlir_ops.py::test_onehot
 test_hlir_ops.py::test_repeat_leading_and_tile
 test_hlir_ops.py::test_repeat_leading_dims
 test_hlir_ops.py::test_reshape_1d_to_3d
