@@ -789,23 +789,25 @@ impl Translator<'_> {
             }
             "slice.Tensor" => {
                 let value = self.get_complex_input(node, 0)?;
+                let dim = normalize_dim(self.get_int_arg(node, 1).unwrap_or(0), value.real.rank());
                 let backing = value
                     .backing
-                    .map(|backing| self.slice_complex_component(backing, node))
+                    .map(|backing| self.slice_complex_component(backing, node, dim))
                     .transpose()?;
-                let mut value =
-                    value.try_map(|component| self.slice_complex_component(component, node))?;
+                let mut value = value
+                    .try_map(|component| self.slice_complex_component(component, node, dim))?;
                 value.backing = backing;
                 self.store_complex(output_name, value);
             }
             "select.int" => {
                 let value = self.get_complex_input(node, 0)?;
+                let dim = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank());
                 let backing = value
                     .backing
-                    .map(|backing| self.select_complex_component(backing, node))
+                    .map(|backing| self.select_complex_component(backing, node, dim))
                     .transpose()?;
-                let mut value =
-                    value.try_map(|component| self.select_complex_component(component, node))?;
+                let mut value = value
+                    .try_map(|component| self.select_complex_component(component, node, dim))?;
                 value.backing = backing;
                 self.store_complex(output_name, value);
             }
@@ -1947,9 +1949,12 @@ impl Translator<'_> {
         Ok(value.expand(raw))
     }
 
-    fn slice_complex_component(&self, value: GraphTensor, node: &Node) -> Result<GraphTensor> {
-        let rank = value.rank();
-        let dim = normalize_dim(self.get_int_arg(node, 1).unwrap_or(0), rank);
+    fn slice_complex_component(
+        &self,
+        value: GraphTensor,
+        node: &Node,
+        dim: usize,
+    ) -> Result<GraphTensor> {
         let start = match node.inputs.get(2) {
             Some(input) => {
                 let expr = self
@@ -1981,8 +1986,12 @@ impl Translator<'_> {
         Ok(value.slice(ranges))
     }
 
-    fn select_complex_component(&self, value: GraphTensor, node: &Node) -> Result<GraphTensor> {
-        let dim = normalize_dim(self.get_int_arg(node, 1)?, value.rank());
+    fn select_complex_component(
+        &self,
+        value: GraphTensor,
+        node: &Node,
+        dim: usize,
+    ) -> Result<GraphTensor> {
         let index = self.get_int_arg(node, 2)?;
         let index = if index < 0 {
             let size = value.dims()[dim]
@@ -2409,6 +2418,51 @@ mod tests {
         }
     }
 
+    fn negative_dimension_program() -> ParsedPT2 {
+        let json = r#"{
+          "graph_module": {
+            "graph": {
+              "inputs": [{"as_tensor": {"name": "x"}}],
+              "outputs": [
+                {"as_tensor": {"name": "selected"}},
+                {"as_tensor": {"name": "sliced"}}
+              ],
+              "nodes": [
+                {"target": "torch.ops.aten.select.int",
+                 "inputs": [
+                   {"name": "self", "arg": {"as_tensor": {"name": "x"}}},
+                   {"name": "dim", "arg": {"as_int": -1}},
+                   {"name": "index", "arg": {"as_int": -1}}
+                 ],
+                 "outputs": [{"as_tensor": {"name": "selected"}}]},
+                {"target": "torch.ops.aten.slice.Tensor",
+                 "inputs": [
+                   {"name": "self", "arg": {"as_tensor": {"name": "x"}}},
+                   {"name": "dim", "arg": {"as_int": -1}},
+                   {"name": "start", "arg": {"as_int": 1}},
+                   {"name": "end", "arg": {"as_int": 3}},
+                   {"name": "step", "arg": {"as_int": 1}}
+                 ],
+                 "outputs": [{"as_tensor": {"name": "sliced"}}]}
+              ],
+              "tensor_values": {
+                "x": {"dtype": 10, "sizes": [{"as_int": 5}, {"as_int": 3}]},
+                "selected": {"dtype": 10, "sizes": [{"as_int": 5}]},
+                "sliced": {"dtype": 10, "sizes": [{"as_int": 5}, {"as_int": 2}]}
+              }
+            },
+            "signature": {"input_specs": []}
+          }
+        }"#;
+        ParsedPT2 {
+            program: serde_json::from_str(json).expect("complex movement fixture must parse"),
+            constants_config: None,
+            weights_config: None,
+            archive_prefix: String::new(),
+            pt2_path: String::new(),
+        }
+    }
+
     #[test]
     fn complex_core_ops_record() {
         let parsed = program();
@@ -2438,5 +2492,18 @@ mod tests {
             assert_eq!(input.shape, vec![2, 3, 2], "{}", input.graph_name);
             assert_eq!(input.dtype, luminal::prelude::DType::F32);
         }
+    }
+
+    #[test]
+    fn complex_negative_dims_exclude_the_hidden_component_axis() {
+        let translated =
+            translate(&negative_dimension_program()).expect("complex views must translate");
+        let shapes: std::collections::BTreeMap<_, _> = translated
+            .outputs
+            .iter()
+            .map(|output| (output.graph_name.as_str(), output.shape.as_slice()))
+            .collect();
+        assert_eq!(shapes["selected"], [5, 2]);
+        assert_eq!(shapes["sliced"], [5, 2, 2]);
     }
 }
