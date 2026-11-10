@@ -17,8 +17,15 @@ jobs:
             github.event_name == 'push'
             || github.event_name == 'workflow_dispatch'
             || (github.event_name == 'pull_request_target'
-                && contains(github.event.pull_request.labels.*.name, 'modal-ready'))
+                && contains(github.event.pull_request.labels.*.name, 'modal-ready')
+                && (github.event.action == 'synchronize'
+                    || (github.event.action == 'labeled'
+                        && github.event.label.name == 'modal-ready')))
         name: Python CUDA Tests
+        # Keep skipped label events out of the active PR job's concurrency group.
+        concurrency:
+            group: modal-python-cuda-${{ github.event.pull_request.number || github.run_id }}
+            cancel-in-progress: true
         runs-on: ubuntu-latest
         environment: Modal
         timeout-minutes: 120

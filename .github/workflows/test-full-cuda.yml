@@ -14,8 +14,15 @@ jobs:
         if: >-
             github.event_name == 'workflow_dispatch'
             || (github.event_name == 'pull_request_target'
-                && contains(github.event.pull_request.labels.*.name, 'full-modal-ready'))
+                && contains(github.event.pull_request.labels.*.name, 'full-modal-ready')
+                && (github.event.action == 'synchronize'
+                    || (github.event.action == 'labeled'
+                        && github.event.label.name == 'full-modal-ready')))
         name: Rust CUDA Ignored Tests
+        # Keep skipped label events out of the active PR job's concurrency group.
+        concurrency:
+            group: modal-rust-cuda-ignored-${{ github.event.pull_request.number || github.run_id }}
+            cancel-in-progress: true
         runs-on: ubuntu-latest
         environment: Modal
         timeout-minutes: 300
@@ -43,8 +50,15 @@ jobs:
         if: >-
             github.event_name == 'workflow_dispatch'
             || (github.event_name == 'pull_request_target'
-                && contains(github.event.pull_request.labels.*.name, 'full-modal-ready'))
+                && contains(github.event.pull_request.labels.*.name, 'full-modal-ready')
+                && (github.event.action == 'synchronize'
+                    || (github.event.action == 'labeled'
+                        && github.event.label.name == 'full-modal-ready')))
         name: Python CUDA Slow Tests
+        # Keep skipped label events out of the active PR job's concurrency group.
+        concurrency:
+            group: modal-python-cuda-slow-${{ github.event.pull_request.number || github.run_id }}
+            cancel-in-progress: true
         runs-on: ubuntu-latest
         environment: Modal
         timeout-minutes: 300
