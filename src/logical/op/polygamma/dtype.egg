@@ -1,0 +1,8 @@
+(rule
+  (
+    (= ?out (LogicalPolygamma ?in ?order))
+    (= ?dtype (dtype-of ?in))
+  )
+  ((set (dtype-of ?out) ?dtype))
+  :ruleset prop
+  :name "polygamma/dtype: preserves its operand dtype")

@@ -151,6 +151,9 @@ pub enum LogicalOp {
     /// operator metadata because its device kernels have observable narrow
     /// dtype behavior that a multiply/round/divide graph cannot erase.
     RoundDecimals(i64),
+    /// The nth derivative of digamma. The order is authored operator
+    /// metadata and every backend must preserve its runtime semantics.
+    Polygamma(i64),
     Recip,
     Add,
     Mul,
@@ -239,6 +242,7 @@ impl LogicalOp {
             Self::Trunc => "LogicalTrunc",
             Self::Round => "LogicalRound",
             Self::RoundDecimals(_) => "LogicalRoundDecimals",
+            Self::Polygamma(_) => "LogicalPolygamma",
             Self::Recip => "LogicalRecip",
             Self::Add => "LogicalAdd",
             Self::Mul => "LogicalMul",
@@ -291,6 +295,7 @@ impl LogicalOp {
             | Self::Trunc
             | Self::Round
             | Self::RoundDecimals(_)
+            | Self::Polygamma(_)
             | Self::Recip
             | Self::Add
             | Self::Mul
@@ -351,6 +356,7 @@ impl LogicalOp {
             | Self::Trunc
             | Self::Round
             | Self::RoundDecimals(_)
+            | Self::Polygamma(_)
             | Self::Recip
             | Self::ReduceSum { .. }
             | Self::WrappingReduceSum { .. }
@@ -1326,6 +1332,7 @@ impl LogicalGraph {
                         parts.push(axis_from_end.to_string());
                     }
                     LogicalOp::RoundDecimals(decimals) => parts.push(decimals.to_string()),
+                    LogicalOp::Polygamma(order) => parts.push(order.to_string()),
                     LogicalOp::IndexMapApply { entries } => {
                         let source_shape = Self::shape_term(&self.graph[operands[0]].dims)?;
                         let mut entries_term = "(IntExprNil)".to_string();

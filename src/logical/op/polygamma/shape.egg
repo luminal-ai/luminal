@@ -1,0 +1,8 @@
+(rule
+  (
+    (= ?out (LogicalPolygamma ?in ?order))
+    (= ?shape (shape-of ?in))
+  )
+  ((set (shape-of ?out) ?shape))
+  :ruleset prop
+  :name "polygamma/shape: preserves its operand shape")

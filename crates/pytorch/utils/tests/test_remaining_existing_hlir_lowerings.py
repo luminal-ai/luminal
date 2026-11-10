@@ -319,7 +319,7 @@ def test_polygamma_orders_reflection_poles_and_infinities() -> None:
     module = PolygammaOrders()
     for dtype in (torch.float32, torch.float64):
         value = torch.tensor(values, dtype=dtype)
-        _check(module, value, rtol=2e-4, atol=2e-5)
+        _check(module, value, rtol=0, atol=0)
 
 
 class ModifiedBesselFamily(torch.nn.Module):

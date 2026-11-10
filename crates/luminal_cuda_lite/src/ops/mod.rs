@@ -59,6 +59,7 @@ pub mod modulo;
 pub mod mul;
 pub mod not;
 pub mod or;
+pub mod polygamma;
 pub mod recip;
 pub mod reduce_max;
 pub mod reduce_sum;
@@ -184,6 +185,10 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(and::AndMatcher, and::And),
         reg(or::OrMatcher, or::Or),
         reg(not::NotMatcher, not::Not),
+        reg(
+            polygamma::PolygammaFunctionalMatcher,
+            polygamma::PolygammaFunctional { order: 0 },
+        ),
         reg(add::AddFunctionalMatcher, add::AddFunctional),
         reg(hypot::HypotFunctionalMatcher, hypot::HypotFunctional),
         reg(

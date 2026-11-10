@@ -1,0 +1,8 @@
+(rule
+  (
+    (= ?out (LogicalPolygamma ?in ?order))
+    (= ?in-layout-tensor (LayoutTensorLit ?in ?layout))
+  )
+  ((let new-out-layout-tensor (LayoutTensorLit ?out ?layout)))
+  :ruleset main_ruleset
+  :name "polygamma/forward_layout: result in the operand layout")
