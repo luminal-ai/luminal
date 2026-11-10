@@ -13,6 +13,7 @@ use crate::pt2_schema::{
 use crate::translate::Translation;
 
 pub(crate) const INT: u32 = 4;
+pub(crate) const LONG: u32 = 5;
 pub(crate) const HALF: u32 = 6;
 pub(crate) const FLOAT: u32 = 7;
 pub(crate) const BOOL: u32 = 12;

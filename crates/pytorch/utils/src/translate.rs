@@ -49,6 +49,8 @@ mod linalg;
 #[cfg(test)]
 mod matmul_tests;
 mod movement_more;
+#[cfg(test)]
+mod one_hot_tests;
 mod opinfo_more;
 #[cfg(test)]
 mod opinfo_more_tests;
@@ -1626,6 +1628,7 @@ impl Translator<'_> {
             "arange.start" => self.translate_arange(node, 1)?,
             "arange.default" => self.translate_arange(node, 0)?,
             "scalar_tensor.default" => self.translate_scalar_tensor(node)?,
+            "one_hot.default" => self.translate_one_hot(node)?,
             "where.self" => self.translate_where(node, false)?,
             "where.ScalarOther" => self.translate_where(node, true)?,
             "masked_fill.Scalar" => self.translate_masked_fill_scalar(node)?,
