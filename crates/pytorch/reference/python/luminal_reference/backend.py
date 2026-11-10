@@ -44,6 +44,12 @@ _PT2_TO_TORCH = {
 
 def _tensor_bytes(tensor: torch.Tensor) -> bytes:
     tensor = tensor.detach().cpu().contiguous()
+    # PyTorch's bool storage may contain any nonzero byte (notably after
+    # ``torch.empty``), while the Rust Bool8 carrier deliberately accepts only
+    # its canonical 0/1 representation. Converting through uint8 preserves the
+    # logical bool value and makes that boundary representation explicit.
+    if tensor.dtype is torch.bool:
+        tensor = tensor.to(torch.uint8)
     # Flatten first: a 0-dim tensor cannot be viewed as a wider dtype.
     return tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
 
