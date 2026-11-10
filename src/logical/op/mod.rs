@@ -154,6 +154,7 @@ mod exp;
 mod exp2;
 mod floor;
 mod gather;
+mod hypot;
 mod index_map_apply;
 mod iota;
 mod less_than;
@@ -199,6 +200,7 @@ pub use exp::LogicalExp;
 pub use exp2::LogicalExp2;
 pub use floor::LogicalFloor;
 pub use gather::LogicalGather;
+pub use hypot::LogicalHypot;
 pub use index_map_apply::LogicalIndexMapApply;
 pub use iota::LogicalIota;
 pub use less_than::LogicalLessThan;
@@ -252,6 +254,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalCeil),
             Box::new(LogicalTrunc),
             Box::new(LogicalRound),
+            Box::new(LogicalHypot),
             Box::new(LogicalAdd),
             Box::new(LogicalMul),
             Box::new(LogicalWrappingAdd),

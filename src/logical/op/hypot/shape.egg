@@ -1,0 +1,9 @@
+(rule
+  (
+    (= ?out (LogicalHypot ?lhs ?rhs))
+    (= ?shape (shape-of ?lhs))
+    (= ?shape (shape-of ?rhs))
+  )
+  ((set (shape-of ?out) ?shape))
+  :ruleset prop
+  :name "hypot/shape: preserves the proven-equal operand shape")

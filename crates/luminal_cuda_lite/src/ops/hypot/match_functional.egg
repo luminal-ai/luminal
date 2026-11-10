@@ -1,0 +1,21 @@
+(rule
+  (
+    (= ?lhs-layout-tensor (LayoutTensorLit ?lhs ?lhs-layout))
+    (= ?rhs-layout-tensor (LayoutTensorLit ?rhs ?rhs-layout))
+    (= ?out-layout-tensor (LayoutTensorLit ?out ?out-layout))
+    (= ?out (LogicalHypot ?lhs ?rhs))
+    (= ?out-layout (RightMajorContiguousElementLayoutLit ?shape ?bits))
+    (= (injectivity-of ?out-layout-tensor) (Injective))
+  )
+  (
+    (let ?layout-tensor-op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?lhs-layout-tensor
+          (LayoutTensorCons ?rhs-layout-tensor (LayoutTensorNil)))
+        (LayoutTensorCons ?out-layout-tensor (LayoutTensorNil))))
+    (union ?layout-tensor-op
+      (LayoutTensorOpHypotFunctionalGeneric
+        ?lhs-layout-tensor ?rhs-layout-tensor ?out-layout))
+  )
+  :ruleset backend
+  :name "cuda_lite/hypot/match_functional: direct hypot")

@@ -271,63 +271,13 @@ impl Translator<'_> {
         Ok(a.is_nan().select(b, b_skipped))
     }
 
-    /// `hypot(a, b) = sqrt(a^2 + b^2)` with the C99 Annex F special values
-    /// torch follows, in this order of precedence:
-    ///   1. if either operand is +-inf the result is +inf, even when the
-    ///      other is NaN;
-    ///   2. otherwise, if either operand is NaN the result is NaN;
-    ///   3. otherwise `hypot(+-0, +-0) = +0`, and every other pair is the
-    ///      overflow-safe `larger * sqrt(1 + (smaller / larger)^2)`.
-    ///
-    /// INVARIANT: each case is a native select (`real_select`, a true
-    /// selection) on a predicate of the operands themselves, nested so the
-    /// outer case wins. The scaled formula is therefore only observed on
-    /// finite operands off the origin, where the ratio is in `[0, 1]`: no
-    /// intermediate overflows (only the final product can, exactly when the
-    /// true result is out of the dtype's range), and an underflowing
-    /// `ratio^2` only drops a term below `1`'s precision. Its `inf / inf`
-    /// and `0 / 0` elsewhere are selected away, never multiplied by a mask.
-    /// The origin's `+0` is a constant rather than the formula's value:
-    /// core `abs` is `select(x < 0, -x, x)`, which keeps `-0.0`.
+    /// Keep `hypot` as a logical operation. Its CPU and CUDA implementations
+    /// have observably different overflow behavior near the largest finite
+    /// value, so an algebraically stable decomposition would change the
+    /// authored program's placement semantics.
     pub(super) fn translate_hypot(&mut self, node: &Node) -> Result<GraphTensor> {
         let (lhs, rhs) = self.promoted_binary_inputs(node)?;
-        let lhs = self.real_abs(lhs);
-        let rhs = self.real_abs(rhs);
-        let larger = lhs.maximum(rhs);
-        let smaller = lhs.minimum(rhs);
-        let zero = self.constant_like(larger, 0.0);
-        let one = self.constant_like(larger, 1.0);
-
-        // The ratio's divisor must have a finite, normal reciprocal: core
-        // division below F64 is `smaller * (1 / larger)`, and in F32
-        // `1 / larger` overflows for a subnormal `larger` (and is itself
-        // subnormal, so inexact, above 2^126). The ratio is invariant under
-        // scaling both magnitudes by one power of two, which is exact while
-        // they stay normal, so scale before dividing: by 2^64 below 1, by
-        // 2^-64 from 1 up, which puts an F32 `larger` in [2^-85, 2^64). A
-        // `smaller` the down-scaling takes out of the normal range is below
-        // 2^-62 * `larger`, where `ratio^2` is below `1`'s precision anyway.
-        // F64 divides directly; the same exact scaling is harmless there.
-        // The result multiplies the unscaled `larger`, so the scaling adds
-        // no rounding.
-        let up = self.constant_like(larger, 2f64.powi(64));
-        let down = self.constant_like(larger, 2f64.powi(-64));
-        let scale = self.real_select(larger.lt(one), up, down);
-        let ratio = (smaller * scale) / (larger * scale);
-        let scaled = larger * (one + ratio.square()).sqrt();
-        // IEEE `==` (false for NaN): both magnitudes are zero.
-        let origin = larger.eq(zero);
-        let finite = self.real_select(origin, zero, scaled);
-
-        let any_nan = self.bool_or(lhs.is_nan(), rhs.is_nan());
-        let nan = self.constant_like(larger, f64::NAN);
-        let result = self.real_select(any_nan, nan, finite);
-
-        let lhs_inf = self.is_inf(lhs);
-        let rhs_inf = self.is_inf(rhs);
-        let any_inf = self.bool_or(lhs_inf, rhs_inf);
-        let infinity = self.constant_like(larger, f64::INFINITY);
-        Ok(self.real_select(any_inf, infinity, result))
+        Ok(lhs.hypot(rhs))
     }
 
     pub(super) fn translate_gcd(&mut self, node: &Node) -> Result<GraphTensor> {
