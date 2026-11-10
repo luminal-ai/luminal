@@ -587,6 +587,43 @@ fn zero_extent_outputs_plan_at_both_contiguous_stride_spellings() {
     rendered.expect("the preamble's own right-major rendering of (4, 0) plans");
 }
 
+/// An empty output view still carries exact stride and storage-alias metadata,
+/// but it has no coordinates whose address mapping must be evaluated. Search
+/// must therefore select the zero-write view on the read-only input buffer
+/// even though substitution through the empty axis has no in-range witness.
+#[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
+fn zero_extent_view_output_can_alias_a_read_only_input() {
+    let mut cx = Graph::new();
+    let scalar = cx.tensor(Vec::<usize>::new(), DType::F32);
+    let empty = scalar.unsqueeze(0).slice_along(0..0, 0);
+
+    let mut bindings = CudaBindings::new();
+    let home = bindings.input_external(scalar.id);
+    bindings.output_on_with(empty.id, home, BoundaryLayout::strided_literal([1]));
+    let mut runtime =
+        CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt()).expect("load");
+    runtime
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &harness_search_options(),
+        )
+        .expect("empty view aliases the read-only input without a write");
+
+    assert_eq!(
+        runtime.output_buffer(empty.id).expect("output binding"),
+        home
+    );
+    runtime
+        .check_external_outputs()
+        .expect("the empty output stays on the caller's input buffer");
+}
+
 /// A SYMBOLIC STRIDE ON A USER-VISIBLE OUTPUT ROUND-TRIPS THROUGH BIND:
 /// the output's element layout reaches the preamble as the dim itself,
 /// so the caller's declared strides stay a statement over the program's
