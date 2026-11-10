@@ -13,11 +13,16 @@ env:
 
 jobs:
     python_cuda_tests:
+        concurrency:
+            group: test-python-cuda-${{ github.event.pull_request.number || github.ref }}
+            cancel-in-progress: true
         if: >-
             github.event_name == 'push'
             || github.event_name == 'workflow_dispatch'
             || (github.event_name == 'pull_request_target'
-                && contains(github.event.pull_request.labels.*.name, 'modal-ready'))
+                && contains(github.event.pull_request.labels.*.name, 'modal-ready')
+                && (github.event.action == 'synchronize'
+                    || github.event.label.name == 'modal-ready'))
         name: Python CUDA Tests
         runs-on: ubuntu-latest
         environment: Modal

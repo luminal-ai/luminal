@@ -11,10 +11,15 @@ env:
 
 jobs:
     rust_cuda_ignored_tests:
+        concurrency:
+            group: test-full-cuda-rust-${{ github.event.pull_request.number || github.ref }}
+            cancel-in-progress: true
         if: >-
             github.event_name == 'workflow_dispatch'
             || (github.event_name == 'pull_request_target'
-                && contains(github.event.pull_request.labels.*.name, 'full-modal-ready'))
+                && contains(github.event.pull_request.labels.*.name, 'full-modal-ready')
+                && (github.event.action == 'synchronize'
+                    || github.event.label.name == 'full-modal-ready'))
         name: Rust CUDA Ignored Tests
         runs-on: ubuntu-latest
         environment: Modal
@@ -40,10 +45,15 @@ jobs:
               run: modal run ci/modal_cargo_test.py
 
     python_cuda_slow_tests:
+        concurrency:
+            group: test-full-cuda-python-${{ github.event.pull_request.number || github.ref }}
+            cancel-in-progress: true
         if: >-
             github.event_name == 'workflow_dispatch'
             || (github.event_name == 'pull_request_target'
-                && contains(github.event.pull_request.labels.*.name, 'full-modal-ready'))
+                && contains(github.event.pull_request.labels.*.name, 'full-modal-ready')
+                && (github.event.action == 'synchronize'
+                    || github.event.label.name == 'full-modal-ready'))
         name: Python CUDA Slow Tests
         runs-on: ubuntu-latest
         environment: Modal
