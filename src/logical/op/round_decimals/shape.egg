@@ -1,0 +1,8 @@
+(rule
+  (
+    (= ?out (LogicalRoundDecimals ?in ?decimals))
+    (= ?shape (shape-of ?in))
+  )
+  ((set (shape-of ?out) ?shape))
+  :ruleset prop
+  :name "round_decimals/shape: preserves its operand shape")

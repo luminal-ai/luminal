@@ -1,0 +1,8 @@
+(rule
+  (
+    (= ?out (LogicalRoundDecimals ?in ?decimals))
+    (= ?dtype (dtype-of ?in))
+  )
+  ((set (dtype-of ?out) ?dtype))
+  :ruleset prop
+  :name "round_decimals/dtype: preserves its operand dtype")

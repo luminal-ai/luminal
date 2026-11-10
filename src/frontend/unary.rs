@@ -176,6 +176,12 @@ impl GraphTensor {
         self.round_logical(LogicalOp::Round)
     }
 
+    /// Round to `decimals` decimal places with the authored runtime's
+    /// dtype/device semantics; ties go to even.
+    pub fn round_decimals(self, decimals: i64) -> GraphTensor {
+        self.round_logical(LogicalOp::RoundDecimals(decimals))
+    }
+
     /// Shared recorder path for the dtype-preserving rounding ops.
     fn round_logical(self, op: LogicalOp) -> GraphTensor {
         let new_id =

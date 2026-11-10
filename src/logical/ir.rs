@@ -147,6 +147,10 @@ pub enum LogicalOp {
     Ceil,
     Trunc,
     Round,
+    /// PyTorch/NumPy decimal-place rounding. The decimal count is authored
+    /// operator metadata because its device kernels have observable narrow
+    /// dtype behavior that a multiply/round/divide graph cannot erase.
+    RoundDecimals(i64),
     Recip,
     Add,
     Mul,
@@ -231,6 +235,7 @@ impl LogicalOp {
             Self::Ceil => "LogicalCeil",
             Self::Trunc => "LogicalTrunc",
             Self::Round => "LogicalRound",
+            Self::RoundDecimals(_) => "LogicalRoundDecimals",
             Self::Recip => "LogicalRecip",
             Self::Add => "LogicalAdd",
             Self::Mul => "LogicalMul",
@@ -281,6 +286,7 @@ impl LogicalOp {
             | Self::Ceil
             | Self::Trunc
             | Self::Round
+            | Self::RoundDecimals(_)
             | Self::Recip
             | Self::Add
             | Self::Mul
@@ -339,6 +345,7 @@ impl LogicalOp {
             | Self::Ceil
             | Self::Trunc
             | Self::Round
+            | Self::RoundDecimals(_)
             | Self::Recip
             | Self::ReduceSum { .. }
             | Self::WrappingReduceSum { .. }
@@ -1312,6 +1319,7 @@ impl LogicalGraph {
                     | LogicalOp::WrappingScanProd { axis_from_end } => {
                         parts.push(axis_from_end.to_string());
                     }
+                    LogicalOp::RoundDecimals(decimals) => parts.push(decimals.to_string()),
                     LogicalOp::IndexMapApply { entries } => {
                         let source_shape = Self::shape_term(&self.graph[operands[0]].dims)?;
                         let mut entries_term = "(IntExprNil)".to_string();
@@ -1471,6 +1479,12 @@ impl LogicalGraph {
         let mut found = Vec::new();
         for id in ids {
             let node = &self.graph[id];
+            // CUDA's authored round(decimals=...) kernel first converts the
+            // decimal scale to scalar_t. The logical op therefore owns its
+            // narrow dtype semantics instead of being generic F32 opmath.
+            if matches!(node.op, LogicalOp::RoundDecimals(_)) {
+                continue;
+            }
             if !node.op.is_arithmetic() {
                 continue;
             }
