@@ -5,9 +5,7 @@ import math
 import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
-from backend_test_utils import luminal_backend
-from backend_test_utils import selected_backend
-
+from backend_test_utils import luminal_backend, selected_backend
 
 _PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE = pytest.mark.skipif(
     selected_backend() == "cuda_lite",
@@ -2273,6 +2271,39 @@ def test_fixed_shape_3d_sampling_composites() -> None:
     )
     module = Sampling3d()
     _check(module, *inputs)
+
+
+class GridSampler3dNonfinite(torch.nn.Module):
+    def forward(self, value, grid):
+        return tuple(
+            torch.ops.aten.grid_sampler_3d.default(
+                value, grid, interpolation, padding, False
+            )
+            for interpolation in (0, 1)
+            for padding in (0, 1, 2)
+        )
+
+
+@pytest.mark.skipif(
+    selected_backend() != "cuda_lite",
+    reason="non-finite grid_sampler_3d semantics differ by authored device",
+)
+def test_grid_sampler_3d_preserves_nonfinite_device_semantics() -> None:
+    value = torch.arange(12, dtype=torch.float32).reshape(1, 1, 2, 2, 3)
+    grid = torch.tensor(
+        [
+            [
+                [
+                    [
+                        [float("nan"), 0.0, 0.0],
+                        [float("inf"), 0.0, 0.0],
+                        [-float("inf"), 0.0, 0.0],
+                    ]
+                ]
+            ]
+        ]
+    )
+    _check(GridSampler3dNonfinite(), value, grid, rtol=0, atol=0)
 
 
 class FractionalMaxPool2d(torch.nn.Module):

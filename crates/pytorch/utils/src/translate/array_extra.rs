@@ -69,20 +69,26 @@ impl Translator<'_> {
     }
 
     /// Map a normalized `[-1, 1]` grid coordinate to an input-space
-    /// coordinate, applying the padding mode. `nan_replacement` mirrors the
-    /// old translator's mode-specific NaN handling.
+    /// coordinate, applying the padding mode. PyTorch's 3-D CPU and CUDA
+    /// kernels sanitize non-finite coordinates differently before padding.
     fn grid_source_coordinate(
         &mut self,
         normalized: GraphTensor,
         size: IntExpr,
         padding_mode: i64,
         align_corners: bool,
-        nan_replacement: Option<f64>,
+        invalid_replacement: Option<f64>,
+        replace_infinite: bool,
     ) -> GraphTensor {
-        let normalized = if let Some(replacement) = nan_replacement {
-            let nan = self.is_nan(normalized);
+        let normalized = if let Some(replacement) = invalid_replacement {
+            let invalid = if replace_infinite {
+                let finite = self.is_finite(normalized);
+                self.bool_not(finite)
+            } else {
+                self.is_nan(normalized)
+            };
             let replacement = self.constant_like(normalized, replacement);
-            replacement.cond(nan, normalized)
+            replacement.cond(invalid, normalized)
         } else {
             normalized
         };
@@ -228,6 +234,34 @@ impl Translator<'_> {
             "unsupported grid_sampler padding mode {padding_mode}"
         );
         let output_shape = self.output_meta_shape(node)?;
+        let cuda = self
+            .device
+            .as_ref()
+            .is_some_and(|device| device.kind == "cuda");
+        let invalid_outputs = if rank == 3 && padding_mode == 0 && interpolation_mode == 0 {
+            let finite = self.is_finite(grid);
+            let invalid = self.bool_not(finite);
+            let invalid = invalid
+                .cast(DType::Int)
+                .max(vec![rank + 1])
+                .cast(DType::Bool);
+            if cuda {
+                vec![(invalid, 0.0)]
+            } else {
+                let nan = self.is_nan(grid);
+                let nan = nan.cast(DType::Int).max(vec![rank + 1]).cast(DType::Bool);
+                vec![(invalid, 0.0), (nan, f64::NAN)]
+            }
+        } else {
+            Vec::new()
+        };
+        let invalid_replacement = if rank == 3 && padding_mode != 0 {
+            Some(if cuda { -1.0 } else { 1.0 })
+        } else if interpolation_mode == 1 || (rank == 3 && padding_mode == 0) {
+            Some(-1.0)
+        } else {
+            None
+        };
         let mut coordinates = Vec::with_capacity(rank);
         for spatial in 0..rank {
             // The grid's last axis stores (x, y[, z]) — reversed relative to
@@ -243,13 +277,8 @@ impl Translator<'_> {
                     padding_mode
                 },
                 align_corners,
-                if interpolation_mode == 1 {
-                    Some(-1.0)
-                } else if rank == 3 && padding_mode != 0 {
-                    Some(1.0)
-                } else {
-                    None
-                },
+                invalid_replacement,
+                rank == 3 && padding_mode == 2,
             ));
         }
 
@@ -324,6 +353,11 @@ impl Translator<'_> {
                 align_corners,
             );
             result += value * weight.cast(input.dtype).expand_dim(1, output_shape[1]);
+        }
+        for (invalid, replacement) in invalid_outputs {
+            let invalid = invalid.expand_dim(1, output_shape[1]);
+            let replacement = self.full_tensor(result.dims(), input.dtype, replacement);
+            result = replacement.cond(invalid, result);
         }
         Ok(result)
     }
