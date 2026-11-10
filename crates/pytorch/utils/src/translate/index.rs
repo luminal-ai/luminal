@@ -1614,6 +1614,14 @@ impl Translator<'_> {
     /// delimited by `offsets`; binds (output, offset2bag, bag_size,
     /// max_indices).
     pub(super) fn translate_embedding_bag(&mut self, node: &Node) -> Result<()> {
+        // ATen exposes device-specific auxiliary-output contracts here:
+        // CUDA populates offset2bag and bag_size in sum mode and uses -1 for
+        // an empty max bag, while CPU leaves the sum metadata empty/zero and
+        // uses zero for the empty max index.
+        let cuda_semantics = self
+            .device
+            .as_ref()
+            .is_some_and(|device| device.kind == "cuda");
         let weight = self.operand(&node.inputs[0])?;
         let indices = self.operand(&node.inputs[1])?.cast(DType::Int);
         let offsets = self.operand(&node.inputs[2])?.cast(DType::Int);
@@ -1716,14 +1724,18 @@ impl Translator<'_> {
                     .cast(DType::I64);
                 let output_nonempty = nonempty.expand_dim(1, embedding_size);
                 let zero_output = self.full_tensor(values.dims(), accumulate, 0.0);
-                let zero_indices = self.cx.constant_i64(0).expand_rhs(selected_indices.dims());
+                let empty_index = if cuda_semantics { -1 } else { 0 };
+                let zero_indices = self
+                    .cx
+                    .constant_i64(empty_index)
+                    .expand_rhs(selected_indices.dims());
                 (
                     self.idx_cond(output_nonempty, values, zero_output),
                     self.idx_cond(output_nonempty, selected_indices, zero_indices),
                 )
             }
         };
-        let offset_to_bag = if mode == 0 && padding_idx < 0 {
+        let offset_to_bag = if !cuda_semantics && mode == 0 && padding_idx < 0 {
             self.cx
                 .constant_i64(0)
                 .expand_rhs(vec![IntExpr::from(0usize)])
@@ -1740,7 +1752,7 @@ impl Translator<'_> {
             let no_bag = self.cx.constant_i64(0).expand_rhs(bag_ids.dims());
             bag_membership.select(bag_ids, no_bag).sum(vec![0])
         };
-        let bag_size = if mode == 0 {
+        let bag_size = if !cuda_semantics && mode == 0 {
             self.cx.constant_i64(0).expand_rhs(vec![bag_count])
         } else {
             counts
