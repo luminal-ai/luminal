@@ -131,6 +131,26 @@ class Hypot(torch.nn.Module):
         return torch.hypot(value, other)
 
 
+@pytest.mark.parametrize(
+    "dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+)
+def test_hypot_preserves_direct_runtime_edges(dtype) -> None:
+    info = torch.finfo(dtype)
+    subnormal = info.smallest_normal * info.eps
+    value = torch.tensor(
+        [info.max, info.max, float("inf"), float("nan"), -0.0], dtype=dtype
+    )
+    other = torch.tensor(
+        [1.0, subnormal, float("nan"), float("inf"), -0.0], dtype=dtype
+    )
+    module = Hypot()
+    expected = module(value, other)
+    (actual,) = _compile(module, value, other)(value, other)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    zeros = expected == 0
+    assert not torch.signbit(actual[zeros]).any()
+
+
 def _hypot_operands(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
     """(value, other) pairs covering C hypot's special values and range ends."""
     inf, nan = float("inf"), float("nan")

@@ -99,6 +99,35 @@ impl Mul<GraphTensor> for f32 {
     }
 }
 
+impl GraphTensor {
+    /// Elementwise Euclidean norm with the authored runtime's direct
+    /// `hypot` semantics. Operands must already have matching shape and dtype.
+    pub fn hypot(self, rhs: GraphTensor) -> GraphTensor {
+        assert!(self.dims_agree(&rhs), "Dims must match to hypot tensors.");
+        assert_eq!(
+            self.dtype, rhs.dtype,
+            "Dtypes must match to hypot tensors. Got {:?} and {:?}",
+            self.dtype, rhs.dtype
+        );
+        assert!(
+            matches!(
+                self.dtype,
+                DType::F16 | DType::Bf16 | DType::F32 | DType::F64
+            ),
+            "hypot requires a real floating dtype, got {:?}",
+            self.dtype
+        );
+        let dims = self.dims();
+        let id = self.graph().logical.op(
+            LogicalOp::Hypot,
+            &[(self.id, dims.clone()), (rhs.id, dims.clone())],
+            dims.clone(),
+            self.dtype,
+        );
+        GraphTensor::from_id(id, dims, self.graph_ref, self.dtype)
+    }
+}
+
 impl<T> MulAssign<T> for GraphTensor
 where
     GraphTensor: Mul<T, Output = GraphTensor>,

@@ -1,0 +1,9 @@
+(rule
+  (
+    (= ?out (LogicalHypot ?lhs ?rhs))
+    (= ?dtype (dtype-of ?lhs))
+    (= ?dtype (dtype-of ?rhs))
+  )
+  ((set (dtype-of ?out) ?dtype))
+  :ruleset prop
+  :name "hypot/dtype: preserves the proven-equal operand dtype")

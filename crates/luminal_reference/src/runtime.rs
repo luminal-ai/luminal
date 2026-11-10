@@ -72,6 +72,7 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
         | "BitsToBoolsView" | "BoolsToBitsView" => Some(0),
 
         "AddFunctionalGeneric"
+        | "HypotFunctionalGeneric"
         | "CeilFunctionalGeneric"
         | "ConstantGeneric"
         | "DivFunctionalGeneric"
@@ -1259,6 +1260,7 @@ mod tests {
             "LayoutTensorOpNotGeneric",
             "LayoutTensorOpOrGeneric",
             "LayoutTensorOpAddFunctionalGeneric",
+            "LayoutTensorOpHypotFunctionalGeneric",
             "LayoutTensorOpCastGeneric",
             "LayoutTensorOpCeilFunctionalGeneric",
             "LayoutTensorOpConstantGeneric",

@@ -154,6 +154,9 @@ pub enum LogicalOp {
     Recip,
     Add,
     Mul,
+    /// Euclidean norm of two real values, preserving the authored runtime's
+    /// exceptional-value and overflow behavior.
+    Hypot,
     Div,
     Mod,
     LessThan,
@@ -239,6 +242,7 @@ impl LogicalOp {
             Self::Recip => "LogicalRecip",
             Self::Add => "LogicalAdd",
             Self::Mul => "LogicalMul",
+            Self::Hypot => "LogicalHypot",
             Self::Div => "LogicalDiv",
             Self::Mod => "LogicalMod",
             Self::LessThan => "LogicalLessThan",
@@ -290,6 +294,7 @@ impl LogicalOp {
             | Self::Recip
             | Self::Add
             | Self::Mul
+            | Self::Hypot
             | Self::Div
             | Self::Mod
             | Self::TruncDiv
@@ -360,6 +365,7 @@ impl LogicalOp {
             | Self::Or
             | Self::Add
             | Self::Mul
+            | Self::Hypot
             | Self::Div
             | Self::Mod
             | Self::LessThan

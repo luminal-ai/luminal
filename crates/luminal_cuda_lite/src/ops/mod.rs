@@ -43,6 +43,7 @@ pub mod exp;
 pub mod exp2;
 pub mod floor;
 pub mod gather;
+pub mod hypot;
 pub mod index_map_apply_materialize;
 pub mod index_map_apply_view;
 pub mod iota;
@@ -184,6 +185,7 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(or::OrMatcher, or::Or),
         reg(not::NotMatcher, not::Not),
         reg(add::AddFunctionalMatcher, add::AddFunctional),
+        reg(hypot::HypotFunctionalMatcher, hypot::HypotFunctional),
         reg(
             materialize_layout_copy::MaterializeLayoutCopyMatcher,
             materialize_layout_copy::MaterializeLayoutCopy,

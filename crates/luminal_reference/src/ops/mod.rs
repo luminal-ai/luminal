@@ -39,6 +39,7 @@ pub(crate) mod exp;
 pub(crate) mod exp2;
 pub(crate) mod floor;
 pub(crate) mod gather;
+pub(crate) mod hypot;
 pub(crate) mod index_map_apply_materialize;
 pub(crate) mod iota;
 pub(crate) mod less_than;
@@ -94,6 +95,7 @@ pub use exp::ExpFunctional;
 pub use exp2::Exp2Functional;
 pub use floor::FloorFunctional;
 pub use gather::Gather;
+pub use hypot::HypotFunctional;
 pub use index_map_apply_materialize::IndexMapApplyMaterialize;
 pub use iota::Iota;
 pub use left_sequential_scan_max::LeftSequentialScanMax;
@@ -134,6 +136,7 @@ pub use exp::ExpFunctionalDps;
 pub use exp2::Exp2FunctionalDps;
 pub use floor::FloorFunctionalDps;
 pub use gather::GatherDps;
+pub use hypot::HypotFunctionalDps;
 pub use index_map_apply_materialize::IndexMapApplyMaterializeDps;
 pub use iota::{IotaDps, IotaExpr};
 pub use left_sequential_scan_max::LeftSequentialScanMaxDps;
@@ -170,6 +173,7 @@ pub use exp::ExpFunctionalMatcher;
 pub use exp2::Exp2FunctionalMatcher;
 pub use floor::FloorFunctionalMatcher;
 pub use gather::GatherMatcher;
+pub use hypot::HypotFunctionalMatcher;
 pub use index_map_apply_materialize::IndexMapApplyMaterializeMatcher;
 pub use iota::IotaMatcher;
 pub use left_sequential_scan_max::LeftSequentialScanMaxMatcher;
@@ -291,6 +295,10 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(AddFunctionalMatcher),
                 kernel: entry::<AddFunctionalDps>("AddFunctionalGeneric", add::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(HypotFunctionalMatcher),
+                kernel: entry::<HypotFunctionalDps>("HypotFunctionalGeneric", hypot::kernel),
             },
             ReferenceOp {
                 matcher: || Box::new(MulFunctionalMatcher),

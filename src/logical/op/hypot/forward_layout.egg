@@ -1,0 +1,12 @@
+(rule
+  (
+    (= ?out (LogicalHypot ?lhs ?rhs))
+    (= ?lhs-layout-tensor (LayoutTensorLit ?lhs ?lhs-layout))
+    (= ?rhs-layout-tensor (LayoutTensorLit ?rhs ?rhs-layout))
+  )
+  (
+    (let lhs-out-layout-tensor (LayoutTensorLit ?out ?lhs-layout))
+    (let rhs-out-layout-tensor (LayoutTensorLit ?out ?rhs-layout))
+  )
+  :ruleset main_ruleset
+  :name "hypot/forward_layout: result in either operand layout")

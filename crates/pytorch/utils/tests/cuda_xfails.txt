@@ -8,7 +8,6 @@ test_binary.py::test_searchsorted_and_bucketize_of_an_empty_float_query
 test_binary.py::test_zero_element_binary_float_ops[atan2-(1, 0, 3)]
 test_binary.py::test_zero_element_binary_float_ops[clamp_max-(1, 0, 3)]
 test_binary.py::test_zero_element_binary_float_ops[clamp_min-(1, 0, 3)]
-test_binary.py::test_zero_element_binary_float_ops[hypot-(1, 0, 3)]
 test_binary.py::test_zero_element_binary_float_ops[logaddexp-(1, 0, 3)]
 test_binary.py::test_zero_element_binary_float_ops[logical_and-(1, 0, 3)]
 test_binary.py::test_zero_element_binary_float_ops[logical_or-(1, 0, 3)]
@@ -217,11 +216,6 @@ test_remaining_existing_hlir_lowerings.py::test_histogram_uniform_edges_match_ea
 test_remaining_existing_hlir_lowerings.py::test_histogramdd_uniform_edges_match_eager[False]
 test_remaining_existing_hlir_lowerings.py::test_histogramdd_uniform_edges_match_eager[True]
 test_remaining_existing_hlir_lowerings.py::test_histogramdd_without_samples_matches_eager
-test_remaining_existing_hlir_lowerings.py::test_hypot_follows_c_special_values[dtype0-wide]
-test_remaining_existing_hlir_lowerings.py::test_hypot_follows_c_special_values[dtype1-special]
-test_remaining_existing_hlir_lowerings.py::test_hypot_follows_c_special_values[dtype1-wide]
-test_remaining_existing_hlir_lowerings.py::test_hypot_follows_c_special_values[dtype2-wide]
-test_remaining_existing_hlir_lowerings.py::test_hypot_follows_c_special_values[dtype3-wide]
 test_remaining_existing_hlir_lowerings.py::test_inference_batch_norm_uses_running_stats_and_returns_empty_saved_stats
 test_remaining_existing_hlir_lowerings.py::test_ordering_and_distance_composites
 test_remaining_existing_hlir_lowerings.py::test_pdist_matches_eager_across_orders[0.5]
