@@ -231,11 +231,9 @@ impl Translator<'_> {
     /// At order 0, ATen's CPU kernels (`zdist_calc` in
     /// DistanceOpsKernel.cpp) map each entry `d` to `min(ceil(d), 1)`. That
     /// is 0 at zero, 1 at any other ordered value, and NaN at NaN, so one NaN
-    /// difference makes the pair's count NaN. The vector norm and `dist`
-    /// count the same entry as 1. Eager disagrees with itself across these
-    /// ops, and this lowering follows each op. The CUDA kernel (`dists::zero`
-    /// in DistanceKernel.cu) counts `d != 0` instead; the parity oracle here
-    /// is CPU eager.
+    /// difference makes the pair's count NaN. This is observably different
+    /// from `dist` and `linalg_vector_norm`, whose order-zero form counts a
+    /// NaN as nonzero.
     fn p_norm(&mut self, magnitude: GraphTensor, p: f64, axes: Vec<usize>) -> GraphTensor {
         if p != 0.0 {
             return self.vector_norm_reduce(magnitude, p, axes);
@@ -1571,10 +1569,10 @@ mod tests {
             &["x", "y"],
             &["out"],
         ));
-        // _cdist_forward.default over [M, F] x [N, F] -> [M, N].
+        // Public cdist.default over [M, F] x [N, F] -> [M, N].
         assert!(translates(
             vec![node(
-                "torch.ops.aten._cdist_forward.default",
+                "torch.ops.aten.cdist.default",
                 vec![
                     input("x1", tensor_arg("x")),
                     input("x2", tensor_arg("y")),
