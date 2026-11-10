@@ -67,8 +67,7 @@ fn row_major_strides(dims: &[IntExpr]) -> Vec<IntExpr> {
 }
 
 /// Round a value computed in its (wider) compute dtype to `dtype` and widen
-/// it back: the rounding a `scalar_t` operation performs when the
-/// translator computes half precision in F32. A no-op when the two agree.
+/// it back. A no-op when the two agree.
 fn round_through(value: GraphTensor, dtype: DType) -> GraphTensor {
     if value.dtype == dtype {
         value
@@ -1181,12 +1180,14 @@ impl Translator<'_> {
     ///
     /// INDEX INVARIANT: every index is exact, and none is a flat position
     /// carried in a float or built by Int tensor arithmetic.
-    /// * The window starts follow ATen's `generate_intervals` in the sample
-    ///   dtype (that rounding is the op's semantics). A start is an integer
-    ///   below the axis extent, held exactly in the compute dtype (F32 or
-    ///   F64), and so is start + kernel offset; the coordinate is truncated
-    ///   to Int only after that addition. (The checked Int -> F32 casts of
-    ///   positions and extents refuse an axis longer than 2^24 loudly.)
+    /// * The window starts follow the captured device's ATen kernel. CPU
+    ///   `generate_intervals<scalar_t>` rounds each narrow-float operation to
+    ///   the sample dtype; CUDA promotes F16/BF16 interval arithmetic to F32.
+    ///   A start is an integer below the axis extent, held exactly in the
+    ///   compute dtype (F32 or F64), and so is start + kernel offset; the
+    ///   coordinate is truncated to Int only after that addition. (The
+    ///   checked Int -> F32 casts of positions and extents refuse an axis
+    ///   longer than 2^24 loudly.)
     /// * The input is read with a per-axis coordinate gather (batch/channel
     ///   axis positions plus one coordinate per spatial axis), so no position
     ///   over the whole input is ever formed.
@@ -1213,15 +1214,24 @@ impl Translator<'_> {
             random_samples.rank() == 3 && random_samples.dims()[2].to_usize() == Some(rank),
             "fractional max pool random_samples must have shape [N, C, spatial_rank]"
         );
-        // ATen's `generate_intervals<scalar_t>` rounds every operation to
-        // the sample dtype. Half-precision samples are computed in F32 and
-        // rounded back after each operation, which is bit-identical (F32 has
-        // more than 2p + 2 bits for both narrow formats).
+        // CPU instantiates `generate_intervals<scalar_t>` and rounds every
+        // operation to the sample dtype. CUDA uses F32 interval arithmetic
+        // for F16/BF16 samples. Preserve the captured program device rather
+        // than selecting one convention for both backends.
         let sample_dtype = random_samples.dtype;
         let compute_dtype = match sample_dtype {
             DType::F64 | DType::F32 => sample_dtype,
             DType::F16 | DType::Bf16 => DType::F32,
             other => bail!("fractional max pool random_samples must be floating, got {other:?}"),
+        };
+        let cuda = self
+            .device
+            .as_ref()
+            .is_some_and(|device| device.kind == "cuda");
+        let interval_dtype = if cuda && sample_dtype.is_narrow_float() {
+            compute_dtype
+        } else {
+            sample_dtype
         };
         let kernel = expand_spatial(&self.stats_pool_ints(node, "kernel_size", 1)?, rank, 0)?;
         anyhow::ensure!(
@@ -1276,14 +1286,14 @@ impl Translator<'_> {
             // equals ATen's single one.
             let numerator = round_through(
                 self.cx.constant_i32(last_start).cast(compute_dtype),
-                sample_dtype,
+                interval_dtype,
             );
             let denominator = round_through(
                 self.cx.constant_i32(steps).cast(compute_dtype),
-                sample_dtype,
+                interval_dtype,
             );
             let alpha = (numerator.cast(DType::F64) / denominator.cast(DType::F64))
-                .cast(sample_dtype)
+                .cast(interval_dtype)
                 .cast(compute_dtype)
                 .expand_rhs(sample.dims());
             // ATen: int64((i + sample) * alpha) - int64(sample * alpha). `i`
@@ -1292,10 +1302,10 @@ impl Translator<'_> {
             // terms are integers of the compute dtype, so their difference
             // is exact whenever the true difference is representable, which
             // covers every in-bounds start.
-            let position = round_through(output_position.cast(compute_dtype), sample_dtype);
-            let shifted = round_through(position + sample, sample_dtype);
-            let upper = round_through(shifted * alpha, sample_dtype).trunc();
-            let lower = round_through(sample * alpha, sample_dtype).trunc();
+            let position = round_through(output_position.cast(compute_dtype), interval_dtype);
+            let shifted = round_through(position + sample, interval_dtype);
+            let upper = round_through(shifted * alpha, interval_dtype).trunc();
+            let lower = round_through(sample * alpha, interval_dtype).trunc();
             let ordinary_start = upper - lower;
             let terminal_start = self
                 .cx
