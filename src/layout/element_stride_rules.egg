@@ -1,3 +1,4 @@
+(ruleset element-stride-discovery)
 ; Relations preserve independently proved readings. The normalization cell is
 ; keyed by BOTH extent and input witness; it does not choose between live-axis
 ; coefficients. Only a static IntLit(1) proof can introduce Any.
@@ -142,6 +143,9 @@
  ((element-stride-accumulated-at-axis (ElementStrideCons ?s ?st) ?axis ?value (ElementStrideCons ?s ?tail))) :ruleset main_ruleset)
 (relation element-stride-view-composition-state
  (LayoutTensor IndexMap LogicalTensor Shape BitWidth IntExprList ElementStrideList ElementStrideList))
+(relation element-stride-affine-window-entry-demand (IntExpr Shape))
+(relation element-stride-affine-window-scaled-term (IntExpr Shape IntExpr))
+(relation element-stride-affine-window-coordinate (IntExpr Shape i64 i64))
 (relation element-stride-affine-view-first-continuation
  (LayoutTensor IndexMap LogicalTensor Shape BitWidth IntExprList ElementStrideList ElementStrideList IntExpr i64 IntExpr i64))
 (relation element-stride-affine-view-second-continuation
@@ -167,37 +171,40 @@
        (element-stride-accumulated-at-axis ?partial ?axis ?s ?placed))
  ((element-stride-view-composition-state ?parent ?map ?out ?shape ?w ?et ?st ?placed)) :ruleset main_ruleset)
 (rule ((element-stride-view-composition-state ?parent ?map ?out ?shape ?w
-          (IntExprCons (IntAdd (IntMul (CoordVar ?shape ?scaled-axis) (IntLit ?factor))
-                               (CoordVar ?shape ?unit-axis)) ?et)
-          (ElementStrideCons (ElementStrideExact ?stride) ?st) ?partial)
-       (= ?unit-axis 0))
- ((element-stride-affine-view-first-continuation ?parent ?map ?out ?shape ?w ?et ?st ?partial ?stride
-   ?scaled-axis (IntMul ?stride (IntLit ?factor)) ?unit-axis)
-  (element-stride-accumulate-at-axis-demand ?partial ?scaled-axis (IntMul ?stride (IntLit ?factor)))) :ruleset main_ruleset)
+          (IntExprCons ?entry ?et)
+          (ElementStrideCons (ElementStrideExact ?stride) ?st) ?partial))
+ ((element-stride-affine-window-entry-demand ?entry ?shape))
+ :ruleset main_ruleset
+ :name "element-stride: request an affine window-coordinate match")
+(rule ((element-stride-affine-window-entry-demand ?entry ?shape)
+       (= ?entry (IntAdd ?scaled (CoordVar ?shape 0))))
+ ((element-stride-affine-window-scaled-term ?entry ?shape ?scaled))
+ :ruleset element-stride-discovery
+ :name "element-stride: match scaled term before unit coordinate")
+(rule ((element-stride-affine-window-entry-demand ?entry ?shape)
+       (= ?entry (IntAdd (CoordVar ?shape 0) ?scaled)))
+ ((element-stride-affine-window-scaled-term ?entry ?shape ?scaled))
+ :ruleset element-stride-discovery
+ :name "element-stride: match scaled term after unit coordinate")
+(rule ((element-stride-affine-window-scaled-term ?entry ?shape ?scaled)
+       (= ?scaled (IntMul (CoordVar ?shape ?axis) (IntLit ?factor))))
+ ((element-stride-affine-window-coordinate ?entry ?shape ?axis ?factor))
+ :ruleset element-stride-discovery
+ :name "element-stride: match coordinate times literal")
+(rule ((element-stride-affine-window-scaled-term ?entry ?shape ?scaled)
+       (= ?scaled (IntMul (IntLit ?factor) (CoordVar ?shape ?axis))))
+ ((element-stride-affine-window-coordinate ?entry ?shape ?axis ?factor))
+ :ruleset element-stride-discovery
+ :name "element-stride: match literal times coordinate")
 (rule ((element-stride-view-composition-state ?parent ?map ?out ?shape ?w
-          (IntExprCons (IntAdd (IntMul (IntLit ?factor) (CoordVar ?shape ?scaled-axis))
-                               (CoordVar ?shape ?unit-axis)) ?et)
+          (IntExprCons ?entry ?et)
           (ElementStrideCons (ElementStrideExact ?stride) ?st) ?partial)
-       (= ?unit-axis 0))
+       (element-stride-affine-window-coordinate ?entry ?shape ?scaled-axis ?factor))
  ((element-stride-affine-view-first-continuation ?parent ?map ?out ?shape ?w ?et ?st ?partial ?stride
-   ?scaled-axis (IntMul ?stride (IntLit ?factor)) ?unit-axis)
-  (element-stride-accumulate-at-axis-demand ?partial ?scaled-axis (IntMul ?stride (IntLit ?factor)))) :ruleset main_ruleset)
-(rule ((element-stride-view-composition-state ?parent ?map ?out ?shape ?w
-          (IntExprCons (IntAdd (CoordVar ?shape ?unit-axis)
-                               (IntMul (CoordVar ?shape ?scaled-axis) (IntLit ?factor))) ?et)
-          (ElementStrideCons (ElementStrideExact ?stride) ?st) ?partial)
-       (= ?unit-axis 0))
- ((element-stride-affine-view-first-continuation ?parent ?map ?out ?shape ?w ?et ?st ?partial ?stride
-   ?scaled-axis (IntMul ?stride (IntLit ?factor)) ?unit-axis)
-  (element-stride-accumulate-at-axis-demand ?partial ?scaled-axis (IntMul ?stride (IntLit ?factor)))) :ruleset main_ruleset)
-(rule ((element-stride-view-composition-state ?parent ?map ?out ?shape ?w
-          (IntExprCons (IntAdd (CoordVar ?shape ?unit-axis)
-                               (IntMul (IntLit ?factor) (CoordVar ?shape ?scaled-axis))) ?et)
-          (ElementStrideCons (ElementStrideExact ?stride) ?st) ?partial)
-       (= ?unit-axis 0))
- ((element-stride-affine-view-first-continuation ?parent ?map ?out ?shape ?w ?et ?st ?partial ?stride
-   ?scaled-axis (IntMul ?stride (IntLit ?factor)) ?unit-axis)
-  (element-stride-accumulate-at-axis-demand ?partial ?scaled-axis (IntMul ?stride (IntLit ?factor)))) :ruleset main_ruleset)
+   ?scaled-axis (IntMul ?stride (IntLit ?factor)) 0)
+  (element-stride-accumulate-at-axis-demand ?partial ?scaled-axis (IntMul ?stride (IntLit ?factor))))
+ :ruleset main_ruleset
+ :name "element-stride: consume an affine window-coordinate marker")
 (rule ((element-stride-affine-view-first-continuation ?parent ?map ?out ?shape ?w ?et ?st ?partial ?stride
         ?scaled-axis ?scaled-stride ?unit-axis)
        (element-stride-accumulated-at-axis ?partial ?scaled-axis ?scaled-stride ?after-scaled))

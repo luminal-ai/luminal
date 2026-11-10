@@ -6,7 +6,6 @@
 ; may additionally publish ordinary element strides; shifted presentations
 ; remain offset expressions, but two demanded layouts with the same complete
 ; certificate are extensionally equal and may safely rejoin.
-(ruleset element-stride-discovery)
 (datatype ElementStrideLiteralCoefficients
   (ElementStrideLiteralCoefficientsNil)
   (ElementStrideLiteralCoefficientsCons BigInt ElementStrideLiteralCoefficients))

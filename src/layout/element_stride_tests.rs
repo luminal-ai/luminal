@@ -412,7 +412,13 @@ fn symbolic_affine_unfold_map_composes_exact_element_strides() {
 (let unfolded (LogicalIndexMapApply dynamic_logical unfold_map unfold_shape))
 "#,
     );
-    run(&mut g, SATURATE);
+    run(
+        &mut g,
+        "(run-schedule
+          (saturate (run main_ruleset) (run prop))
+          (saturate (run element-stride-discovery))
+          (saturate (run main_ruleset) (run prop)))",
+    );
     run(
         &mut g,
         r#"
