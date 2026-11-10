@@ -5,9 +5,7 @@ import math
 import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
-from backend_test_utils import luminal_backend
-from backend_test_utils import selected_backend
-
+from backend_test_utils import luminal_backend, selected_backend
 
 _PYTORCH_CUDA_HISTOGRAM_UNAVAILABLE = pytest.mark.skipif(
     selected_backend() == "cuda_lite",
@@ -1781,9 +1779,7 @@ class InferenceBatchNorm(torch.nn.Module):
         )
 
 
-def test_inference_batch_norm_uses_running_stats_and_returns_empty_saved_stats() -> (
-    None
-):
+def test_inference_batch_norm_preserves_device_specific_saved_stats() -> None:
     torch.manual_seed(11)
     inputs = (
         torch.randn(2, 3, 4, 5),
@@ -1795,8 +1791,9 @@ def test_inference_batch_norm_uses_running_stats_and_returns_empty_saved_stats()
     for affine in (False, True):
         module = InferenceBatchNorm(affine)
         expected = module(*inputs)
-        assert expected[1].numel() == 0
-        assert expected[2].numel() == 0
+        expected_shape = inputs[3].shape if inputs[0].is_cuda else (0,)
+        assert expected[1].shape == expected_shape
+        assert expected[2].shape == expected_shape
         _check(module, *inputs)
 
 
