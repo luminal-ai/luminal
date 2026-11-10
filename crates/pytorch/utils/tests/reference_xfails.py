@@ -121,7 +121,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "test_hlir_ops.py::test_sdpa_gqa_fp32",
             "test_reduction.py::test_scatter_and_index_reduce_accept_bounded_symbolic_update_extents",
             "test_remaining_existing_hlir_lowerings.py::test_elementwise_composites_cover_ieee_edges",
-            "test_straightforward_lowerings.py::test_index_select_and_unfold_match_scalar_semantics",
             "test_straightforward_lowerings.py::test_small_algebraic_aliases_use_existing_primitives",
         ),
     ),

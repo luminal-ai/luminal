@@ -367,7 +367,9 @@ impl Translator<'_> {
         let logical_rank = physical_rank
             .checked_sub(1)
             .context("complex unfold backing has no component axis")?;
-        anyhow::ensure!(logical_rank > 0, "unfold on a rank-0 tensor is not ported");
+        if logical_rank == 0 {
+            return self.translate_scalar_unfold_view(x, node);
+        }
         let raw_dim = self.get_int_arg(node, 1)?;
         anyhow::ensure!(
             raw_dim >= -(logical_rank as i64) && raw_dim < logical_rank as i64,
@@ -397,7 +399,9 @@ impl Translator<'_> {
 
     fn translate_unfold_view(&mut self, x: GraphTensor, node: &Node) -> Result<GraphTensor> {
         let logical_rank = x.rank();
-        anyhow::ensure!(logical_rank > 0, "unfold on a rank-0 tensor is not ported");
+        if logical_rank == 0 {
+            return self.translate_scalar_unfold_view(x, node);
+        }
         let raw_dim = self.get_int_arg(node, 1)?;
         anyhow::ensure!(
             raw_dim >= -(logical_rank as i64) && raw_dim < logical_rank as i64,
@@ -439,6 +443,50 @@ impl Translator<'_> {
                 coordinate
             });
         }
+        Ok(x.record_view_map(entries, out_shape))
+    }
+
+    /// PyTorch gives a scalar a virtual extent-one dimension for
+    /// `Tensor.unfold`. There is no separate window-count dimension: size 0
+    /// returns an empty `[0]` view and size 1 returns a `[1]` view of the
+    /// scalar. For an interleaved complex backing, `x` is `[2]`; inserting the
+    /// logical axis in front produces the corresponding `[size, 2]` storage
+    /// view without materializing either component.
+    fn translate_scalar_unfold_view(&mut self, x: GraphTensor, node: &Node) -> Result<GraphTensor> {
+        let raw_dim = self.get_int_arg(node, 1)?;
+        anyhow::ensure!(
+            matches!(raw_dim, -1 | 0),
+            "unfold dimension {raw_dim} out of range for a rank-0 tensor"
+        );
+        let size = self.get_int_arg(node, 2)?;
+        anyhow::ensure!(
+            matches!(size, 0 | 1),
+            "unfold size {size} exceeds the scalar extent 1"
+        );
+        let step = self.get_int_arg(node, 3)?;
+        anyhow::ensure!(step > 0, "unfold step must be positive, got {step}");
+
+        let mut out_shape = self.output_meta_shape(node)?;
+        anyhow::ensure!(
+            out_shape == vec![IntExpr::from(size)],
+            "scalar unfold output shape {out_shape:?} does not match size {size}"
+        );
+        let entries = if x.rank() == 0 {
+            Vec::new()
+        } else {
+            // The only non-scalar caller is the interleaved complex backing.
+            // Preserve its physical component coordinate while the new empty
+            // or singleton logical axis remains absent from the input map.
+            anyhow::ensure!(
+                x.rank() == 1 && x.dims()[0].to_usize() == Some(2),
+                "scalar unfold backing must be the extent-2 component axis"
+            );
+            out_shape.push(IntExpr::from(2));
+            vec![MapEntry::Coord {
+                from_end: 0,
+                extent: IntExpr::from(2),
+            }]
+        };
         Ok(x.record_view_map(entries, out_shape))
     }
 
