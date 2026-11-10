@@ -3,8 +3,14 @@
 import math
 import warnings
 
+import pytest
 import torch
-from backend_test_utils import compile_for_test as luminal_compile
+from backend_test_utils import (
+    compile_for_test as luminal_compile,
+)
+from backend_test_utils import (
+    eager_or_skip_unsupported,
+)
 
 
 def _compile(module: torch.nn.Module, *inputs: torch.Tensor, dynamic_shapes=None):
@@ -24,8 +30,12 @@ def _assert_outputs(actual, expected) -> None:
         assert result.dtype == reference.dtype
         assert result.shape == reference.shape
         if result.dtype.is_floating_point or result.dtype.is_complex:
+            # Reduction association is intentionally unspecified. BF16 matmul
+            # reductions can therefore differ by several output ULPs while
+            # preserving the authored BF16 accumulator and output contract.
+            rtol = 1.6e-2 if result.dtype == torch.bfloat16 else 3e-4
             torch.testing.assert_close(
-                result, reference, rtol=3e-4, atol=3e-5, equal_nan=True
+                result, reference, rtol=rtol, atol=3e-5, equal_nan=True
             )
         else:
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
@@ -232,19 +242,22 @@ class CopyConversions(torch.nn.Module):
         )
 
 
-def test_addmv_and_addbmm_preserve_real_dtypes_and_coefficients() -> None:
+@pytest.mark.parametrize("dtype", (torch.float64, torch.bfloat16, torch.int16))
+def test_addmv_and_addbmm_preserve_real_dtypes_and_coefficients(
+    dtype: torch.dtype,
+) -> None:
     torch.manual_seed(0)
-    for dtype in (torch.float64, torch.bfloat16, torch.int16):
-        inputs = (
-            torch.arange(2, dtype=dtype),
-            torch.arange(6, dtype=dtype).reshape(2, 3),
-            torch.arange(3, dtype=dtype),
-            torch.arange(8, dtype=dtype).reshape(2, 4),
-            torch.arange(30, dtype=dtype).reshape(3, 2, 5),
-            torch.arange(60, dtype=dtype).reshape(3, 5, 4),
-        )
-        module = LinearComposites(alpha=-2, beta=3)
-        _assert_outputs(_compile(module, *inputs)(*inputs), module(*inputs))
+    inputs = (
+        torch.arange(2, dtype=dtype),
+        torch.arange(6, dtype=dtype).reshape(2, 3),
+        torch.arange(3, dtype=dtype),
+        torch.arange(8, dtype=dtype).reshape(2, 4),
+        torch.arange(30, dtype=dtype).reshape(3, 2, 5),
+        torch.arange(60, dtype=dtype).reshape(3, 5, 4),
+    )
+    module = LinearComposites(alpha=-2, beta=3)
+    expected = eager_or_skip_unsupported(module, *inputs)
+    _assert_outputs(_compile(module, *inputs)(*inputs), expected)
 
 
 def test_addmv_and_addbmm_support_complex_coefficients() -> None:
@@ -274,7 +287,7 @@ def test_zero_coefficients_structurally_ignore_nan_inputs() -> None:
     _assert_outputs(_compile(module, *inputs)(*inputs), module(*inputs))
 
 
-def test_bool_coefficients_are_literal_zero_and_one() -> None:
+def test_false_coefficients_structurally_ignore_nan_inputs() -> None:
     # A Python-bool beta/alpha is the literal 0 or 1 (False == 0, True == 1),
     # so False drops its term exactly like the integer 0 above and the NaN
     # inputs never reach the result.
@@ -282,18 +295,25 @@ def test_bool_coefficients_are_literal_zero_and_one() -> None:
     nan_inputs = tuple(torch.full(shape, float("nan")) for shape in shapes)
     module = LinearComposites(alpha=False, beta=False)
     _assert_outputs(_compile(module, *nan_inputs)(*nan_inputs), module(*nan_inputs))
-    # Integer tensors take bool coefficients too. The real-dtype test above
-    # is xfailed for a bf16 rounding difference, so int16 is covered here.
+
+
+@pytest.mark.parametrize(
+    ("beta", "alpha"), ((False, True), (True, False), (True, True))
+)
+def test_integer_bool_coefficients_are_literal_zero_and_one(
+    beta: bool, alpha: bool
+) -> None:
+    # PyTorch CUDA does not implement integer addmv/addbmm, so the shared
+    # parity suite skips these cases there instead of failing while computing
+    # an eager reference. The reference runtime still exercises all three.
+    shapes = ((2,), (2, 3), (3,), (2, 4), (3, 2, 5), (3, 5, 4))
     integer_inputs = tuple(
         torch.arange(math.prod(shape), dtype=torch.int16).reshape(shape)
         for shape in shapes
     )
-    for beta, alpha in ((False, True), (True, False), (True, True)):
-        module = LinearComposites(alpha=alpha, beta=beta)
-        _assert_outputs(
-            _compile(module, *integer_inputs)(*integer_inputs),
-            module(*integer_inputs),
-        )
+    module = LinearComposites(alpha=alpha, beta=beta)
+    expected = eager_or_skip_unsupported(module, *integer_inputs)
+    _assert_outputs(_compile(module, *integer_inputs)(*integer_inputs), expected)
 
 
 def test_movement_lowerings_support_noncontiguous_real_and_complex_values() -> None:
