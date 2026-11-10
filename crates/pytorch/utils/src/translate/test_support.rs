@@ -13,6 +13,7 @@ use crate::pt2_schema::{
 use crate::translate::Translation;
 
 pub(crate) const INT: u32 = 4;
+pub(crate) const LONG: u32 = 5;
 pub(crate) const HALF: u32 = 6;
 pub(crate) const FLOAT: u32 = 7;
 pub(crate) const BOOL: u32 = 12;
@@ -60,6 +61,10 @@ pub(crate) fn scalar_int(name: &str, value: i64) -> NodeInput {
 
 pub(crate) fn scalar_bool(name: &str, value: bool) -> NodeInput {
     input(name, Argument::Bool(BoolArg { as_bool: value }))
+}
+
+pub(crate) fn string(name: &str, value: &str) -> NodeInput {
+    input(name, Argument::Other(serde_json::json!(value)))
 }
 
 pub(crate) fn scalar_type(name: &str, code: u32) -> NodeInput {

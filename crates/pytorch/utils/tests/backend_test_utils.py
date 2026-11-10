@@ -29,6 +29,25 @@ def luminal_backend(gm, example_inputs, options=None):
     return _backend(example_inputs).Compiler(**(options or {}))(gm, example_inputs)
 
 
+def eager_or_skip_unsupported(model, *inputs):
+    """Establish the authored eager reference before compiling parity tests.
+
+    A selected device may not implement every dtype/op combination. Such a
+    program has no eager result for the backend to compare against; only
+    PyTorch's explicit capability errors are skips, while every other runtime
+    error remains a test failure.
+    """
+    try:
+        return model(*inputs)
+    except (NotImplementedError, RuntimeError) as error:
+        message = str(error).lower()
+        if "not implemented" not in message and "not supported" not in message:
+            raise
+        pytest.skip(
+            f"eager PyTorch does not implement this operation on the selected device: {error}"
+        )
+
+
 def compile_for_test(model, examples, *, dynamic_shapes=None, **options):
     """Internal PT2 translator harness; public API coverage uses Compiler directly."""
     from luminal_reference.export_utils import _drop_input_guards

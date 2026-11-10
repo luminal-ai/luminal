@@ -65,6 +65,7 @@ from luminal_reference.export_utils import (
 )
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.export import export
+from torch.export.graph_signature import ConstantArgument
 
 from . import _luminal
 from .boundary import (
@@ -239,6 +240,10 @@ def _output_layout_rows(ep: Any) -> list[tuple[str, str, list[str]]]:
     for position, spec in enumerate(ep.graph_signature.output_specs):
         if spec.kind.name != "USER_OUTPUT":
             continue
+        # Constant leaves (notably `None`) are part of the Python output tree,
+        # but they are not tensor boundary values and have no layout to bind.
+        if isinstance(spec.arg, ConstantArgument):
+            continue
         name = getattr(spec.arg, "name", None)
         if name is None:
             raise UnsupportedBoundary(
@@ -275,6 +280,8 @@ def _output_alias_rows(ep: Any) -> list[tuple[str, str, int]]:
     for spec in list(ep.graph_signature.input_specs) + list(
         ep.graph_signature.output_specs
     ):
+        if isinstance(spec.arg, ConstantArgument):
+            continue
         name = getattr(spec.arg, "name", None)
         if name is not None and name not in names:
             names.append(name)

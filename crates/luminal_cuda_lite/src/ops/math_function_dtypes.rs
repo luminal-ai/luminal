@@ -74,6 +74,7 @@ fn math_kernels() -> Vec<MathKernel> {
         unary(Box::new(super::exp2::Exp2FunctionalDps), "exp2f", "exp2"),
         unary(Box::new(super::log2::Log2FunctionalDps), "log2f", "log2"),
         unary(Box::new(super::sin::SinFunctionalDps), "sinf", "sin"),
+        unary(Box::new(super::tanh::TanhFunctionalDps), "tanhf", "tanh"),
         unary(
             Box::new(super::floor::FloorFunctionalDps),
             "floorf",

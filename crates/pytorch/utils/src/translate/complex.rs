@@ -8,8 +8,8 @@
 //! This is the recorder-frontend port of the parked HLIR translator's
 //! `translator/complex.rs`. The structural `ComplexTensor`, the target
 //! routing, and the arithmetic / elementary / movement / reduction surface
-//! are ported here; the remaining target families (index/scatter, cumulative
-//! scan, and `dist`) still bail
+//! are ported here; the remaining target families (index/scatter and `dist`)
+//! still bail
 //! explicitly with the ATen target name.
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -711,6 +711,10 @@ impl Translator<'_> {
                 let magnitude = self.complex_abs(value.map(|component| component.cast(compute)));
                 let norm = self.vector_norm_from_magnitude(node, magnitude)?;
                 self.values.insert(output_name.to_string(), norm);
+            }
+            "cumprod.default" => {
+                let value = self.translate_complex_cumprod(node)?;
+                self.store_complex(output_name, value);
             }
 
             // ---- matmul family ----
@@ -2282,6 +2286,50 @@ impl Translator<'_> {
             value.torch_dtype,
         );
         Ok((axes, variance, mean))
+    }
+
+    fn translate_complex_cumprod(&mut self, node: &Node) -> Result<ComplexTensor> {
+        let value = self.get_complex_input(node, 0)?;
+        let rank = value.real.rank();
+        if rank == 0 {
+            return Ok(value);
+        }
+        let axis = normalize_dim(self.get_int_arg(node, 1)?, rank);
+        let extent = value.real.dims()[axis]
+            .to_usize()
+            .context("complex cumprod requires a concrete scan dimension")?;
+        if extent == 0 {
+            return Ok(value);
+        }
+
+        let select = |component: GraphTensor, index: usize| {
+            component.slice_along(index..index + 1, axis).squeeze(axis)
+        };
+        let mut product = ComplexTensor::new(
+            select(value.real, 0),
+            select(value.imag, 0),
+            value.torch_dtype,
+        );
+        let mut real_prefixes = Vec::with_capacity(extent);
+        let mut imag_prefixes = Vec::with_capacity(extent);
+        real_prefixes.push(product.real);
+        imag_prefixes.push(product.imag);
+        for index in 1..extent {
+            let next = ComplexTensor::new(
+                select(value.real, index),
+                select(value.imag, index),
+                value.torch_dtype,
+            );
+            product = self.complex_mul(product, next);
+            real_prefixes.push(product.real);
+            imag_prefixes.push(product.imag);
+        }
+
+        Ok(ComplexTensor::new(
+            self.cx.stack(&real_prefixes, axis),
+            self.cx.stack(&imag_prefixes, axis),
+            value.torch_dtype,
+        ))
     }
 
     fn translate_complex_matmul(

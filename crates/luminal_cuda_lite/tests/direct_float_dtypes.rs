@@ -100,6 +100,7 @@ fn direct_float_matches_execute_for_f32_f64_f16_and_bf16() {
             + x.exp2()
             + x.log2()
             + x.sin()
+            + x.tanh()
             + x.floor()
             + x.ceil()
             + x.trunc()
@@ -146,6 +147,7 @@ fn direct_float_matches_execute_for_f32_f64_f16_and_bf16() {
             "Exp2FunctionalGeneric",
             "Log2FunctionalGeneric",
             "SinFunctionalGeneric",
+            "TanhFunctionalGeneric",
             "FloorFunctionalGeneric",
             "CeilFunctionalGeneric",
             "TruncFunctionalGeneric",
