@@ -129,32 +129,38 @@ def _ordered_values(dtype: torch.dtype) -> torch.Tensor:
 
 
 ORDERING_OPS = (
-    pytest.param(lambda x: torch.sort(x, dim=1), id="sort"),
+    pytest.param(lambda x: torch.sort(x, dim=1), False, id="sort"),
     pytest.param(
-        lambda x: torch.sort(x, dim=1, stable=True, descending=True), id="sort_stable"
+        lambda x: torch.sort(x, dim=1, stable=True, descending=True),
+        True,
+        id="sort_stable",
     ),
-    pytest.param(lambda x: torch.argsort(x, dim=1), id="argsort"),
-    pytest.param(lambda x: torch.topk(x, 3, dim=1), id="topk"),
-    pytest.param(torch.min, id="min"),
-    pytest.param(lambda x: torch.amin(x, dim=1), id="amin"),
-    pytest.param(lambda x: torch.min(x, dim=1), id="min_dim"),
-    pytest.param(lambda x: torch.median(x, dim=1), id="median_dim"),
-    pytest.param(lambda x: torch.nanmedian(x), id="nanmedian"),
-    pytest.param(torch.signbit, id="signbit"),
+    pytest.param(lambda x: torch.argsort(x, dim=1), False, id="argsort"),
+    pytest.param(lambda x: torch.topk(x, 3, dim=1), False, id="topk"),
+    pytest.param(torch.min, True, id="min"),
+    pytest.param(lambda x: torch.amin(x, dim=1), True, id="amin"),
+    pytest.param(lambda x: torch.min(x, dim=1), True, id="min_dim"),
+    pytest.param(lambda x: torch.median(x, dim=1), True, id="median_dim"),
+    pytest.param(lambda x: torch.nanmedian(x), True, id="nanmedian"),
+    pytest.param(torch.signbit, True, id="signbit"),
     pytest.param(
         lambda x: torch.nn.functional.max_pool1d(
             x.unsqueeze(0), 2, return_indices=True
         ),
+        True,
         id="max_pool1d_indices",
     ),
 )
 
 
 @pytest.mark.parametrize("dtype", NARROW)
-@pytest.mark.parametrize("fn", ORDERING_OPS)
-def test_ordering_ops_on_narrow_storage_match_bitwise(stage_one_only, fn, dtype):
-    """Sorting, selecting and comparing are exact: the widened graph returns
-    torch's values and indices bit for bit."""
+@pytest.mark.parametrize("fn,exact_tie_indices", ORDERING_OPS)
+def test_ordering_ops_on_narrow_storage_match_bitwise(
+    stage_one_only, fn, exact_tie_indices, dtype
+):
+    """Sorting, selecting and comparing preserve values exactly. Stable and
+    deterministic operations also preserve indices exactly; unstable ordering
+    operations may choose any source index within an equal-value tie."""
     model = Unary(fn)
     x = _ordered_values(dtype)
     compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
@@ -164,6 +170,8 @@ def test_ordering_ops_on_narrow_storage_match_bitwise(stage_one_only, fn, dtype)
     for a, e in zip(actual, expected, strict=True):
         if e.is_floating_point():
             _assert_bitwise(a, e)
+        elif not exact_tie_indices:
+            _assert_bitwise(x.gather(1, a), x.gather(1, e))
         else:
             assert torch.equal(a, e)
 
