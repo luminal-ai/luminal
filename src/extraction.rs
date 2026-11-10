@@ -24,7 +24,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use crate::layout_ir::{
     Access, BufferInfo, ExtractedDag, ExtractedEdge, ExtractedGraph, ExtractedNode, ExtractionSite,
     FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LogicalInfo, OpInput, OpMatcher,
-    OpNode, OutputNode, OutputSlot, SerializedIndex,
+    OpNode, OutputNode, OutputSlot, SerializedIndex, Sharing,
 };
 use crate::logical_op::{LogicalRender, logical_op_for};
 
@@ -64,6 +64,10 @@ struct Extractor<'a> {
     op_specs: HashMap<ClassId, Vec<OpSpec>>,
     producer_index: HashMap<ClassId, Vec<ProducerRef>>,
     input_terminals: HashMap<ClassId, InputInfo>,
+    /// A bound output on a read-only input buffer can only be a zero-write
+    /// alias of one of that buffer's input layout tensors. Candidate filtering
+    /// enforces this physical boundary fact before genomes are sampled.
+    read_only_alias_outputs: HashMap<ClassId, HashSet<ClassId>>,
     /// The search genome, when this walk is genome-driven (see [`Genome`]).
     /// `None` = the deterministic fixture extractor (minimum-height derivation).
     genome: Option<Genome>,
@@ -684,6 +688,19 @@ fn producer_index_from(
                 if node.subsumed || !extractor.matchers.contains_key(node.op.as_str()) {
                     continue;
                 }
+                let Some(spec) = extractor
+                    .op_specs
+                    .get(&producer.op_class)
+                    .and_then(|specs| specs.get(producer.spec_index))
+                else {
+                    continue;
+                };
+                if extractor
+                    .candidate_for_layout_op(producer, spec, node_id, node)
+                    .is_none()
+                {
+                    continue;
+                }
                 entries.push((
                     node.op.to_string(),
                     ProducerChoice {
@@ -1038,6 +1055,12 @@ impl<'a> Extractor<'a> {
         let input_buffer_classes = collect_input_buffer_classes(egraph, &class_nodes);
         let input_terminals =
             collect_input_terminals(&render, &output_buffer_classes, &input_buffer_classes);
+        let alias_outputs = collect_output_alias_constraints(
+            egraph,
+            &class_nodes,
+            &output_buffer_classes,
+            &input_terminals,
+        );
         // AN INPUT TERMINAL HAS NO PRODUCERS (2026-09-02). Its value
         // exists at launch: `relax_to_fixpoint` plans it from the
         // boundary, and `candidates_for_class` offers it no candidate at
@@ -1080,7 +1103,7 @@ impl<'a> Extractor<'a> {
             }
         }
 
-        Self {
+        let mut extractor = Self {
             egraph,
             matchers,
             class_nodes,
@@ -1089,6 +1112,7 @@ impl<'a> Extractor<'a> {
             op_specs,
             producer_index,
             input_terminals,
+            read_only_alias_outputs: alias_outputs,
             genome: genome.cloned(),
             memo: HashMap::default(),
             blocked: HashMap::default(),
@@ -1098,7 +1122,28 @@ impl<'a> Extractor<'a> {
             buffer_freed_by_index: Default::default(),
             stable_key_cache: Default::default(),
             choice_candidate_cache: Default::default(),
+        };
+        let read_only_buffers: HashSet<ClassId> = extractor
+            .input_terminals
+            .values()
+            .filter(|input| {
+                extractor.buffer_access(&input.buffer_id_class) == Some(Access::ReadOnly)
+            })
+            .map(|input| input.buffer_id_class.clone())
+            .collect();
+        let read_only_terminals: HashSet<ClassId> = extractor
+            .input_terminals
+            .iter()
+            .filter(|(_, input)| read_only_buffers.contains(&input.buffer_id_class))
+            .map(|(terminal, _)| terminal.clone())
+            .collect();
+        for terminals in extractor.read_only_alias_outputs.values_mut() {
+            terminals.retain(|terminal| read_only_terminals.contains(terminal));
         }
+        extractor
+            .read_only_alias_outputs
+            .retain(|_, terminals| !terminals.is_empty());
+        extractor
     }
 
     /// RUNTIME-VIABILITY FILTER (Austin's ruling, 2026-08-05): restrict
@@ -1639,6 +1684,12 @@ impl<'a> Extractor<'a> {
             else {
                 continue;
             };
+            if self
+                .candidate_for_layout_op(producer, spec, &choice.enode, node)
+                .is_none()
+            {
+                continue;
+            }
             inputs.extend(spec.inputs.iter().cloned());
         }
         inputs.sort();
@@ -1798,6 +1849,15 @@ impl<'a> Extractor<'a> {
             }
         };
 
+        if !self.boundary_alias_candidate_is_valid(
+            &spec.outputs[producer.output_index],
+            producer.output_index,
+            spec,
+            op.as_ref(),
+        ) {
+            return None;
+        }
+
         let children = self.op_children(&spec.inputs, op.as_ref());
         Some(Candidate {
             source_eclass: Some(producer.op_class.clone()),
@@ -1809,6 +1869,32 @@ impl<'a> Extractor<'a> {
             children,
             metadata,
         })
+    }
+
+    /// A read-only boundary buffer cannot receive computed bytes. When an
+    /// output is bound on such an input buffer, the selected implementation
+    /// must state that the result writes nothing and Must-aliases an input
+    /// layout tensor bound on that exact buffer. This is an effect/placement
+    /// filter over already-equivalent implementations, not a graph rewrite.
+    fn boundary_alias_candidate_is_valid(
+        &self,
+        output_class: &ClassId,
+        result: usize,
+        spec: &OpSpec,
+        op: &dyn LayoutIrOp,
+    ) -> bool {
+        let Some(required_inputs) = self.read_only_alias_outputs.get(output_class) else {
+            return true;
+        };
+        !op.result_writes_memory(result)
+            && op.alias_info().iter().any(|alias| {
+                alias.result == result
+                    && alias.sharing == Sharing::Must
+                    && spec
+                        .inputs
+                        .get(alias.operand)
+                        .is_some_and(|input| required_inputs.contains(input))
+            })
     }
 
     fn op_children(&self, inputs: &[ClassId], op: &dyn LayoutIrOp) -> Vec<PlanChild> {
@@ -4160,6 +4246,53 @@ fn collect_input_terminals(
     }
 
     terminals
+}
+
+/// Pair each output layout tensor with the input layout tensors bound on the
+/// same buffer. Access permissions are applied by the extractor after its
+/// boundary declaration indexes are available; only read-only pairs become
+/// hard zero-write alias constraints.
+fn collect_output_alias_constraints(
+    egraph: &EGraph,
+    class_nodes: &ClassNodeIndex,
+    output_buffer_classes: &HashSet<ClassId>,
+    input_terminals: &HashMap<ClassId, InputInfo>,
+) -> HashMap<ClassId, HashSet<ClassId>> {
+    let mut inputs_by_buffer: HashMap<ClassId, HashSet<ClassId>> = HashMap::default();
+    for (layout_tensor, input) in input_terminals {
+        inputs_by_buffer
+            .entry(input.buffer_id_class.clone())
+            .or_default()
+            .insert(layout_tensor.clone());
+    }
+
+    let mut constraints: HashMap<ClassId, HashSet<ClassId>> = HashMap::default();
+    for buffer_tensor in output_buffer_classes {
+        let Some(nodes) = class_nodes.get(buffer_tensor) else {
+            continue;
+        };
+        for node_id in nodes {
+            let Some(node) = egraph.nodes.get(node_id) else {
+                continue;
+            };
+            if node.subsumed || node.op != "BufferTensorLit" {
+                continue;
+            }
+            let (Some(layout_tensor), Some(buffer)) =
+                (child_class(egraph, node, 0), child_class(egraph, node, 1))
+            else {
+                continue;
+            };
+            let Some(inputs) = inputs_by_buffer.get(&buffer) else {
+                continue;
+            };
+            constraints
+                .entry(layout_tensor)
+                .or_default()
+                .extend(inputs.iter().cloned());
+        }
+    }
+    constraints
 }
 
 fn choose_render_node<'a>(

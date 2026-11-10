@@ -1,0 +1,153 @@
+; Compose adjacent logical views before implementation selection.  The entry
+; walk is deliberately split into demand, per-entry substitution completion,
+; and the final logical union: each rule matches one small semantic marker,
+; while the existing guarded int-subst machinery remains the authority for
+; whether every coordinate substitution is valid.
+(relation index-map-entry-subst-demand (IntExprList IndexMap))
+(relation index-map-entry-subst-complete (IntExprList IndexMap))
+(relation index-map-entry-subst-result (IntExprList IndexMap IntExprList))
+(relation index-map-input-list (BufferTensorList))
+(relation index-map-read-only-input-buffer (BufferId))
+(relation index-map-bound-output-list (BufferTensorList))
+(relation index-map-bound-output (LogicalTensor))
+(relation index-map-bound-read-only-alias-output (LogicalTensor))
+
+(rule
+  ((= ?boundary (BufferInputLit ?inputs)))
+  ((index-map-input-list ?inputs))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: mark the input list"
+)
+
+(rule
+  ((index-map-input-list (BufferTensorCons ?head ?tail)))
+  ((index-map-input-list ?tail))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: walk the input suffix"
+)
+
+(rule
+  (
+    (index-map-input-list (BufferTensorCons ?head ?tail))
+    (= ?head (BufferTensorLit ?layout-tensor ?buffer))
+    (= (buffer-access-of ?buffer) (ReadOnly))
+  )
+  ((index-map-read-only-input-buffer ?buffer))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: mark a read-only input buffer"
+)
+
+(rule
+  ((= ?boundary (BufferOutputLit ?outputs)))
+  ((index-map-bound-output-list ?outputs))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: mark the bound-output list"
+)
+
+(rule
+  (
+    (index-map-bound-output-list (BufferTensorCons ?head ?tail))
+    (= ?head (BufferTensorLit ?layout-tensor ?buffer))
+    (= ?layout-tensor (LayoutTensorLit ?logical ?layout))
+  )
+  (
+    (index-map-bound-output ?logical)
+    (index-map-bound-output-list ?tail)
+  )
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: mark one bound output and walk the suffix"
+)
+
+; A logical output bound onto the same read-only buffer as an input must be a
+; zero-write alias.  This marker scopes the optional affine-layout proof to the
+; physical boundary case that needs it; unrelated ordinary outputs must not
+; enter that proof stratum.
+(rule
+  (
+    (index-map-bound-output-list (BufferTensorCons ?head ?tail))
+    (= ?head (BufferTensorLit ?layout-tensor ?buffer))
+    (= ?layout-tensor (LayoutTensorLit ?logical ?layout))
+    (index-map-read-only-input-buffer ?buffer)
+  )
+  ((index-map-bound-read-only-alias-output ?logical))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: mark a bound read-only alias output"
+)
+
+(rule
+  ((index-map-entry-subst-demand (IntExprNil) ?map))
+  ((index-map-entry-subst-result (IntExprNil) ?map (IntExprNil))
+   (index-map-entry-subst-complete (IntExprNil) ?map))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: empty entry substitution is complete"
+)
+
+(rule
+  ((index-map-entry-subst-demand (IntExprCons ?head ?tail) ?map))
+  ((int-subst-demand ?head ?map)
+   (index-map-entry-subst-demand ?tail ?map))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: demand one entry and the remaining suffix"
+)
+
+(rule
+  (
+    (index-map-entry-subst-demand (IntExprCons ?head ?tail) ?map)
+    (int-subst-closed ?head ?map)
+    (index-map-entry-subst-complete ?tail ?map)
+    (index-map-entry-subst-result ?tail ?map ?tail-image)
+  )
+  (
+    (index-map-entry-subst-result
+      (IntExprCons ?head ?tail)
+      ?map
+      (IntExprCons (int-subst-of ?head ?map) ?tail-image))
+    (index-map-entry-subst-complete (IntExprCons ?head ?tail) ?map)
+  )
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: complete one substituted entry"
+)
+
+; Seed only from an actually adjacent pair whose outer map states the inner
+; view's output shape as its source domain, and only when the result is a
+; bound output value.  Interior views already compose at the layout level;
+; publishing every logical prefix of every interior chain is quadratic and
+; needlessly expands saturation.  A malformed cross-domain pair therefore
+; never files substitution demands.
+(rule
+  (
+    (= ?inner (LogicalIndexMapApply ?root ?inner-map ?inner-shape))
+    (= ?outer (LogicalIndexMapApply ?inner ?outer-map ?out-shape))
+    (index-map-bound-output ?outer)
+    (= ?inner-map (IndexMapLit ?inner-entries ?root-shape))
+    (= ?outer-map (IndexMapLit ?outer-entries ?inner-shape))
+    (= ?root-shape (shape-of ?root))
+    (= ?inner-shape (shape-of ?inner))
+    (= ?out-shape (shape-of ?outer))
+  )
+  ((index-map-entry-subst-demand ?inner-entries ?outer-map))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: adjacent views demand entry composition"
+)
+
+(rule
+  (
+    (= ?inner (LogicalIndexMapApply ?root ?inner-map ?inner-shape))
+    (= ?outer (LogicalIndexMapApply ?inner ?outer-map ?out-shape))
+    (= ?inner-map (IndexMapLit ?inner-entries ?root-shape))
+    (= ?outer-map (IndexMapLit ?outer-entries ?inner-shape))
+    (= ?root-shape (shape-of ?root))
+    (= ?inner-shape (shape-of ?inner))
+    (= ?out-shape (shape-of ?outer))
+    (index-map-entry-subst-complete ?inner-entries ?outer-map)
+    (index-map-entry-subst-result ?inner-entries ?outer-map ?composed-entries)
+  )
+  ((union
+     ?outer
+     (LogicalIndexMapApply
+       ?root
+       (IndexMapLit ?composed-entries ?root-shape)
+       ?out-shape)))
+  :ruleset main_ruleset
+  :name "index_map_apply/compose: adjacent views equal one composed view"
+)

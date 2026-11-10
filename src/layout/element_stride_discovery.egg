@@ -1,4 +1,5 @@
-; Separately scheduled experiment. No production schedule runs element-stride-discovery.
+; Separately scheduled proof stratum. Production runtimes opt in only after
+; filing narrow demands; CUDA uses it for layouts of model-bound alias outputs.
 ; Whole linear certificates replace independently merged coefficient/constant
 ; cells. Arithmetic stays in BigInt, outside IntExpr ring rewriting, until a
 ; complete nonnegative zero-origin presentation has been proved.

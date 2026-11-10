@@ -51,7 +51,7 @@ impl ComplexTensor {
 
     /// Split PyTorch's interleaved `[..., 2]` real storage into components.
     pub(crate) fn from_interleaved(
-        cx: &mut Graph,
+        _cx: &mut Graph,
         backing: GraphTensor,
         torch_dtype: TorchDType,
     ) -> Result<Self> {
@@ -64,10 +64,8 @@ impl ComplexTensor {
             "complex interleaved storage must end in dimension 2, got {:?}",
             backing.dims()
         );
-        let mut shape = backing.dims();
-        shape.pop();
-        let real = gather_component(cx, backing, &shape, 0);
-        let imag = gather_component(cx, backing, &shape, 1);
+        let real = component_view(backing, axis, 0);
+        let imag = component_view(backing, axis, 1);
         Ok(Self::new(real, imag, torch_dtype).with_backing(backing))
     }
 
@@ -118,20 +116,14 @@ impl ComplexTensor {
     }
 }
 
-/// Gather one component (`offset` 0 = real, 1 = imag) out of interleaved
-/// `[..., 2]` storage. The output shape is `shape`; the trailing component
-/// axis is fixed at `offset` by a constant coordinate.
-fn gather_component(
-    cx: &mut Graph,
-    backing: GraphTensor,
-    shape: &[IntExpr],
-    offset: i32,
-) -> GraphTensor {
-    let mut coords: Vec<GraphTensor> = (0..shape.len())
-        .map(|axis| cx.iota(shape.to_vec(), |coords| coords[axis]))
-        .collect();
-    coords.push(cx.iota(shape.to_vec(), |_| IntExpr::from(offset)));
-    backing.gather(&coords)
+/// Address one component (`offset` 0 = real, 1 = imaginary) as a view of the
+/// interleaved boundary storage. Component access never computes new bytes:
+/// retaining the slice/squeeze view chain lets bufferization prove that every
+/// returned real, imaginary, reshape, or permutation aliases the one authored
+/// complex allocation instead of trying to materialize distinct final values
+/// into it.
+fn component_view(backing: GraphTensor, axis: usize, offset: usize) -> GraphTensor {
+    backing.view().select_axis(axis, offset).finish()
 }
 
 /// Store two equally-shaped tensors in a contiguous final extent-2 axis.
@@ -2421,6 +2413,14 @@ mod tests {
     fn complex_core_ops_record() {
         let parsed = program();
         let t = translate(&parsed).expect("complex graph must translate");
+        assert!(
+            t.graph
+                .logical
+                .petgraph()
+                .node_weights()
+                .all(|node| !matches!(node.op, luminal::graph::LogicalOp::Gather)),
+            "splitting interleaved complex inputs into components must remain a view"
+        );
         // Complex outputs and view_as_real expose their physical trailing
         // component axis to runtimes; real/imag component outputs do not.
         assert_eq!(t.outputs.len(), 5);
