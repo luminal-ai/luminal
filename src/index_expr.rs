@@ -65,32 +65,6 @@ impl IotaExpr {
             IotaExpr::LessThanCast(a, b) => (eval(a) < eval(b)) as i64,
         }
     }
-
-    /// Replace every coordinate (`Coord(k)`, k from the END) by
-    /// `replace(k)`: the beta reduction of a composed map, the inner's
-    /// entries over the intermediate coordinates with the outer's entries
-    /// substituted in. `None` when an axis has no replacement, which is a
-    /// rank disagreement between the two levels — the decoder is
-    /// existential and never loud.
-    pub fn substitute_coords(
-        &self,
-        replace: &dyn Fn(usize) -> Option<IotaExpr>,
-    ) -> Option<IotaExpr> {
-        let go = |e: &IotaExpr| e.substitute_coords(replace).map(Box::new);
-        Some(match self {
-            IotaExpr::Lit(value) => IotaExpr::Lit(*value),
-            IotaExpr::Var(name) => IotaExpr::Var(name.clone()),
-            IotaExpr::Coord(axis_from_end) => return replace(*axis_from_end),
-            IotaExpr::Add(a, b) => IotaExpr::Add(go(a)?, go(b)?),
-            IotaExpr::Mul(a, b) => IotaExpr::Mul(go(a)?, go(b)?),
-            IotaExpr::TruncDiv(a, b) => IotaExpr::TruncDiv(go(a)?, go(b)?),
-            IotaExpr::TruncRem(a, b) => IotaExpr::TruncRem(go(a)?, go(b)?),
-            IotaExpr::CeilDiv(a, b) => IotaExpr::CeilDiv(go(a)?, go(b)?),
-            IotaExpr::Min(a, b) => IotaExpr::Min(go(a)?, go(b)?),
-            IotaExpr::Max(a, b) => IotaExpr::Max(go(a)?, go(b)?),
-            IotaExpr::LessThanCast(a, b) => IotaExpr::LessThanCast(go(a)?, go(b)?),
-        })
-    }
 }
 
 /// Parse one IntExpr class into an [`IotaExpr`], preferring folded literals;
@@ -306,100 +280,16 @@ pub fn parse_index_map_entries(
 ) -> Option<Vec<IotaExpr>> {
     let map_class = site.child_class(map_child);
     let out_shape = site.child_class(shape_child);
-    parse_index_map(site, &map_class, &out_shape, COMPOSITE_DEPTH)
-}
-
-/// How deep a composite may nest. The structural rule composes literal
-/// pairs only, so a composite's children are literals (or opened
-/// composites, which are literals too); the bound guards a hand-built
-/// term, not a path the rules produce.
-const COMPOSITE_DEPTH: usize = 8;
-
-/// Parse an `IndexMap` class into one [`IotaExpr`] per parent axis over
-/// `out_shape`'s coordinates. A literal spelling (`IndexMapLit`) parses
-/// its entries directly. A closed composite spelling
-/// (`IndexMapCompose inner outer`) is the view's lambda left unreduced by
-/// the e-graph — the outer map takes the out coordinates into the
-/// intermediate box (its tag), the inner takes the intermediate box into
-/// the parent — and is BETA-REDUCED HERE, after extraction: the outer's
-/// entries are parsed over `out_shape`, the inner's over the outer's tag,
-/// and every intermediate coordinate in the inner's entries is replaced
-/// by the outer's entry for it. Existential over spellings at every
-/// level; literal spellings first (a class that holds both denotes one
-/// map, and the literal is cheaper). Each level gets its own parse memo:
-/// the memo is keyed by class alone, not by owner shape, and a class
-/// refused under one owner may parse under another.
-pub fn parse_index_map(
-    site: &ExtractionSite<'_>,
-    map_class: &egraph_serialize::ClassId,
-    out_shape: &egraph_serialize::ClassId,
-    depth: usize,
-) -> Option<Vec<IotaExpr>> {
-    if depth == 0 {
-        return None;
-    }
-    for map_node in site.nodes_in_class_value(map_class, "IndexMapLit") {
+    let mut memo = std::collections::HashMap::new();
+    for map_node in site.nodes_in_class_value(&map_class, "IndexMapLit") {
         let Some(head) = site.class_of_child(map_node, 0) else {
             continue;
         };
-        let mut memo = std::collections::HashMap::new();
-        if let Some(entries) = parse_entry_list(site, &head, 64, out_shape, &mut memo) {
-            return Some(entries);
-        }
-    }
-    for composite in site.nodes_in_class_value(map_class, "IndexMapCompose") {
-        let Some(inner) = site.class_of_child(composite, 0) else {
-            continue;
-        };
-        let Some(outer) = site.class_of_child(composite, 1) else {
-            continue;
-        };
-        let Some(outer_entries) = parse_index_map(site, &outer, out_shape, depth - 1) else {
-            continue;
-        };
-        let Some(intermediate) = map_tag_class(site, &outer, depth - 1) else {
-            continue;
-        };
-        let Some(inner_entries) = parse_index_map(site, &inner, &intermediate, depth - 1) else {
-            continue;
-        };
-        let composed: Option<Vec<IotaExpr>> = inner_entries
-            .iter()
-            .map(|entry| {
-                entry.substitute_coords(&|axis_from_end| {
-                    let index = outer_entries.len().checked_sub(axis_from_end + 1)?;
-                    outer_entries.get(index).cloned()
-                })
-            })
-            .collect();
-        if let Some(entries) = composed {
+        if let Some(entries) = parse_entry_list(site, &head, 64, &out_shape, &mut memo) {
             return Some(entries);
         }
     }
     None
-}
-
-/// The source-shape tag of a map class: a literal's `Shape` child, a
-/// composite's inner's (the e-graph's `index-map-tag`, read structurally
-/// so the decoder does not depend on a function row being serialized).
-/// Every spelling of a class carries one tag (the map-tag locks), so the
-/// first found is the answer; the walk stays existential anyway.
-fn map_tag_class(
-    site: &ExtractionSite<'_>,
-    map_class: &egraph_serialize::ClassId,
-    depth: usize,
-) -> Option<egraph_serialize::ClassId> {
-    if depth == 0 {
-        return None;
-    }
-    if let Some(tag) = site
-        .nodes_in_class_value(map_class, "IndexMapLit")
-        .find_map(|node| site.class_of_child(node, 1))
-    {
-        return Some(tag);
-    }
-    site.nodes_in_class_value(map_class, "IndexMapCompose")
-        .find_map(|node| map_tag_class(site, &site.class_of_child(node, 0)?, depth - 1))
 }
 
 fn parse_entry_list(

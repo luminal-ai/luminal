@@ -2785,6 +2785,65 @@
   :ruleset main_ruleset :name "core: small dividend survives IntTruncRem whole"
 )
 
+; NESTED REMAINDERS (the composed-roll family). A view of a view composes by
+; substituting one map's entries into the other's, so a wrap-around index
+; composed with itself is a remainder of a remainder:
+;   roll(i) = (i + 1) % n,   roll(roll(i)) = ((i + 1) % n + 1) % n.
+; Without a fold every nesting depth is a new map, and a class that is its
+; own view through such a map (a constant tensor is its own roll) composes
+; without end although the map has only n distinct powers.
+;
+; Both rules are guarded for the TRUNCATING remainder, which agrees with
+; the mathematical modulus only on nonnegative dividends: the fold is false
+; across zero (x = -8, y = 1, n = 8 is 1 nested and -7 folded).
+;
+; Both RETIRE the spelling they rewrite, and that is load-bearing:
+; - Once roll^n folds to the coordinate itself, the class of `i` holds
+;   `(i + n) % n`, a remainder of a function of itself. A live copy lets the
+;   fold un-nest through it forever (i + n, i + 2n, i + 3n, ...).
+; - A live nested spelling is matched again for every spelling the inner
+;   dividend later gains, minting one sum per spelling.
+;
+; LITERAL ADDEND AND DIVISOR ONLY. The identity holds for any nonnegative
+; addend and any positive divisor, and that general form was tried here
+; first: it hung the Trainium backend's `flux_qk_rope` fixture inside a
+; single iteration (full CPU, no growth, 1.9 s with this form), which was
+; not diagnosed further. A composed wrap-around index only ever needs the
+; literal form; widen it only with that fixture in the measurement.
+(rule
+  (
+    (= ?outer (IntTruncRem (IntAdd (IntTruncRem ?x (IntLit ?divisor)) (IntLit ?addend)) (IntLit ?divisor)))
+    (>= ?divisor 1)
+    (>= ?addend 0)
+    (= ?x_lower (lower-bound-of ?x))
+    (>= ?x_lower (bigint 0))
+  )
+  (
+    (union ?outer (IntTruncRem (IntAdd ?x (IntLit ?addend)) (IntLit ?divisor)))
+    (subsume (IntTruncRem (IntAdd (IntTruncRem ?x (IntLit ?divisor)) (IntLit ?addend)) (IntLit ?divisor)))
+  )
+  :ruleset main_ruleset :name "core: a nested IntTruncRem folds into the outer one"
+)
+; A literal addend at or past a literal divisor reduces modulo it:
+; (x + k) % n = (x + k % n) % n for x >= 0 and k >= n >= 1. The rule above
+; sums the addends of a composed roll; this keeps the sum inside [0, n), so
+; the n-th power's `(i + n) % n` becomes `(i + 0) % n`, which the additive
+; identity and the small-dividend rule finish as `i`.
+(rule
+  (
+    (= ?remainder (IntTruncRem (IntAdd ?x (IntLit ?offset)) (IntLit ?divisor)))
+    (>= ?divisor 1)
+    (>= ?offset ?divisor)
+    (= ?x_lower (lower-bound-of ?x))
+    (>= ?x_lower (bigint 0))
+  )
+  (
+    (union ?remainder (IntTruncRem (IntAdd ?x (IntLit (% ?offset ?divisor))) (IntLit ?divisor)))
+    (subsume (IntTruncRem (IntAdd ?x (IntLit ?offset)) (IntLit ?divisor)))
+  )
+  :ruleset main_ruleset :name "core: a literal addend reduces modulo a literal IntTruncRem divisor"
+)
+
 ; RECOMPOSITION (the pairing law read as a collapse): d*(n tdiv d) plus
 ; (n trem d) IS n — the inverse of the tiled decomposition, and what
 ; makes a decompose-then-recompose view pair compose to the identity.

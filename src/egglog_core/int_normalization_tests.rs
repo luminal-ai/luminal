@@ -234,10 +234,12 @@ fn flatten_unflatten_substitution_reaches_a_fixpoint() {
     graph
         .parse_and_run_program(None, "(run-schedule (saturate (run prop)))")
         .unwrap();
-    // Complete ElementStride certificates retain extra layout-proof rows.
-    // This fixture converges at about 36,400 rows with those proofs present;
-    // retain a bound over every table, including proof metadata.
-    let max_rows = 40_000;
+    // Complete ElementStride certificates retain extra layout-proof rows,
+    // and every view of a view composes to a literal (the fixture has 25
+    // views, reshapes among them). This fixture converges at 53,272 rows
+    // with both present (about 36,400 before views composed without
+    // demand); retain a bound over every table, including proof metadata.
+    let max_rows = 60_000;
     for _ in 0..64 {
         assert!(saturate_main_with_limit(&mut graph, max_rows));
         let report = graph
@@ -251,4 +253,93 @@ fn flatten_unflatten_substitution_reaches_a_fixpoint() {
         }
     }
     panic!("flatten/unflatten substitution did not converge after 64 generations");
+}
+
+/// `depth` wrap-around steps over `seed`: `((seed + 1) % n + 1) % n ...`.
+fn nested_roll(seed: &str, depth: usize, n: i64) -> String {
+    (0..depth).fold(seed.to_owned(), |inner, _| {
+        format!("(IntTruncRem (IntAdd {inner} (IntLit 1)) (IntLit {n}))")
+    })
+}
+
+#[test]
+fn nested_remainders_fold_and_the_full_cycle_is_the_coordinate() {
+    // A wrap-around index composed with itself is a remainder of a
+    // remainder. Each depth folds to one remainder of the summed offset, and
+    // the n-th is the coordinate itself: `(x + 8) % 8` on `[0, 8)`.
+    let mut graph = graph(&format!(
+        "(let shape (ShapeLit (IntExprCons (IntLit 8) (IntExprNil))))
+         (let x (CoordVar shape 0))
+         (let twice {})
+         (let five {})
+         (let eight {})
+         (let nine {})",
+        nested_roll("x", 2, 8),
+        nested_roll("x", 5, 8),
+        nested_roll("x", 8, 8),
+        nested_roll("x", 9, 8),
+    ));
+    assert!(saturate_main(&mut graph), "nested remainders did not converge");
+    graph
+        .parse_and_run_program(
+            None,
+            "(check (= twice (IntTruncRem (IntAdd x (IntLit 2)) (IntLit 8))))
+             (check (= five (IntTruncRem (IntAdd x (IntLit 5)) (IntLit 8))))
+             (check (= eight x))
+             (check (= nine (IntTruncRem (IntAdd x (IntLit 1)) (IntLit 8))))",
+        )
+        .unwrap();
+    // Independent arithmetic check of both identities on their guarded
+    // domain (truncating remainder, as Rust's `%`).
+    for n in 1_i64..=12 {
+        for x in 0_i64..=40 {
+            for y in 0_i64..=40 {
+                assert_eq!((x % n + y) % n, (x + y) % n);
+                assert_eq!((x + (y + n)) % n, (x + (y + n) % n) % n);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_full_cycle_does_not_unroll_the_coordinate() {
+    // Once the n-th power folds to `x`, the class of `x` holds `(x + n) % n`,
+    // a remainder of a function of itself. If that spelling stayed live the
+    // fold would un-nest through it forever (x + n, x + 2n, ...): the rules
+    // retire it, and a further step over the cycle still converges.
+    let mut graph = graph(&format!(
+        "(let shape (ShapeLit (IntExprCons (IntLit 4) (IntExprNil))))
+         (let x (CoordVar shape 0))
+         (let cycle {})
+         (let beyond {})",
+        nested_roll("x", 4, 4),
+        nested_roll("x", 11, 4),
+    ));
+    assert!(saturate_main(&mut graph), "the closed cycle kept unrolling");
+    graph
+        .parse_and_run_program(
+            None,
+            "(check (= cycle x))
+             (check (= beyond (IntTruncRem (IntAdd x (IntLit 3)) (IntLit 4))))",
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_nested_remainder_is_not_folded_across_zero() {
+    // The truncating remainder is not the modulus below zero: at x = -8,
+    // `((x % 8) + 1) % 8` is 1 and `(x + 1) % 8` is -7. A dividend whose
+    // lower bound is negative must keep the two apart.
+    let mut graph = graph(
+        "(let x (IntVar \"x\"))
+         (set (lower-bound-of x) (bigint -8))
+         (set (upper-bound-of x) (bigint 8))
+         (let nested (IntTruncRem (IntAdd (IntTruncRem x (IntLit 8)) (IntLit 1)) (IntLit 8)))
+         (let folded (IntTruncRem (IntAdd x (IntLit 1)) (IntLit 8)))",
+    );
+    assert!(saturate_main(&mut graph));
+    graph
+        .parse_and_run_program(None, "(fail (check (= nested folded)))")
+        .unwrap();
+    assert_ne!(((-8_i64 % 8) + 1) % 8, (-8_i64 + 1) % 8);
 }

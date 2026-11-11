@@ -1,11 +1,7 @@
-//! A kernel elected over a CLOSED composite map (`IndexMapCompose inner
-//! outer`, the view-of-a-view lambda the e-graph leaves unreduced) gets
-//! its entries by beta reduction AFTER extraction: the shared decoder
-//! `parse_index_map_entries` composes the outer literal into the inner.
-//! The fixture is a permute under a shifted slice: the composite is
-//! arithmetic, so nothing opens it in the e-graph and the apply's map
-//! class holds only the composite spelling — the decode arm is the only
-//! way to read it.
+//! A view of a view composes in the e-graph: the window through the permute
+//! is unioned with one view of the input through the composed map, a literal
+//! the shared decoder `parse_index_map_entries` reads directly. The fixture
+//! is a permute under a shifted slice, so the composite is arithmetic.
 
 use luminal::index_expr::parse_index_map_entries;
 use luminal::layout_ir::{ExtractionSite, SerializedIndex};
@@ -30,7 +26,7 @@ const FIXTURE: &str = r#"
 "#;
 
 #[test]
-fn a_closed_composite_is_reduced_by_the_decoder() {
+fn a_composed_view_decodes_to_the_composed_entries() {
     let graph = test_runtime::serialize_fixture(&format!("{FIXTURE}\n{SCHEDULE}\n"));
     let index = SerializedIndex::new(&graph);
     let has = |class: &luminal::prelude::egraph_serialize::ClassId, op: &str| {
@@ -40,27 +36,34 @@ fn a_closed_composite_is_reduced_by_the_decoder() {
             .filter_map(|id| graph.nodes.get(id))
             .any(|node| node.op == op)
     };
-    // The apply whose map class is a closed composite: a composite
-    // spelling and no literal.
+    let operand_is_input = |node: &luminal::prelude::egraph_serialize::Node| {
+        node.children
+            .first()
+            .is_some_and(|child| has(&graph.nodes[child].eclass, "LogicalTensorInputLit"))
+    };
+    // The composed spelling of `window`: a view of the INPUT in the class
+    // that also holds the nested spelling (a view of the permute).
     let (node_id, node) = graph
         .nodes
         .iter()
         .find(|(_, node)| {
             node.op == "LogicalIndexMapApply"
-                && node.children.get(1).is_some_and(|child| {
-                    let map = &graph.nodes[child].eclass;
-                    has(map, "IndexMapCompose") && !has(map, "IndexMapLit")
-                })
+                && operand_is_input(node)
+                && index
+                    .nodes_of(&node.eclass)
+                    .iter()
+                    .filter_map(|id| graph.nodes.get(id))
+                    .any(|other| other.op == "LogicalIndexMapApply" && !operand_is_input(other))
         })
-        .expect("the window through the permute has a closed composite spelling");
+        .expect("the window through the permute has a composed spelling over the input");
     let site = ExtractionSite {
         egraph: &graph,
         node_id,
         node,
         index: &index,
     };
-    let entries = parse_index_map_entries(&site, 1, 2)
-        .expect("the decoder beta-reduces the composite");
+    let entries =
+        parse_index_map_entries(&site, 1, 2).expect("the composed map is a literal the decoder reads");
     assert_eq!(entries.len(), 3, "one entry per parent axis: {entries:?}");
     // Through the permute, x[a][b][c] = permuted[b][c][a] = window[b][c-1][a]:
     // at window coordinates (u, v, w), the parent coordinates are

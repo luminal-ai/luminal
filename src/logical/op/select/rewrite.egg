@@ -5,10 +5,9 @@
 ; chain; a lower bound of 1 is true everywhere the view reads, an upper
 ; bound of 0 false everywhere. Nothing is minted for an undecided
 ; condition. The view of the branch is a view of a view where the branch is
-; one (`cat` and `pad` spell their operands as clamped padding views), a
-; closed composite that is demanded OPEN here: the point of the collapse is
-; a slice reading one operand of a concatenation whole, which the identity
-; fold recognises only on the opened literal.
+; one (`cat` and `pad` spell their operands as clamped padding views), so it
+; composes (index_map_apply/rewrite.egg): a slice reading one operand of a
+; concatenation whole composes to the identity and the fold ends it.
 (rule
   (
     (= ?view (LogicalIndexMapApply ?select ?map ?shape))
@@ -40,32 +39,7 @@
   :ruleset main_ruleset
   :name "select/rewrite: a view of a select false everywhere it reads is the view of the second branch"
 )
-(rule
-  (
-    (= ?view (LogicalIndexMapApply ?select ?map ?shape))
-    (= ?select (LogicalSelect ?condition ?if_true ?if_false))
-    (= ?lower (viewed-lower-bound-of ?condition ?map))
-    (>= ?lower (bigint 1))
-    (= ?if_true (LogicalIndexMapApply ?operand ?branch_map ?branch_shape))
-    (= ?composite (IndexMapCompose ?branch_map ?map))
-  )
-  ((index-map-open-demand ?composite))
-  :ruleset main_ruleset
-  :name "select/rewrite: the view of the decided first branch view opens its composite"
-)
-(rule
-  (
-    (= ?view (LogicalIndexMapApply ?select ?map ?shape))
-    (= ?select (LogicalSelect ?condition ?if_true ?if_false))
-    (= ?upper (viewed-upper-bound-of ?condition ?map))
-    (<= ?upper (bigint 0))
-    (= ?if_false (LogicalIndexMapApply ?operand ?branch_map ?branch_shape))
-    (= ?composite (IndexMapCompose ?branch_map ?map))
-  )
-  ((index-map-open-demand ?composite))
-  :ruleset main_ruleset
-  :name "select/rewrite: the view of the decided second branch view opens its composite"
-)
+
 
 ; Rewrite : a select whose condition is decided everywhere is that branch.
 ; A Bool tensor's value bounds are its truth bounds (less_than/value_bounds

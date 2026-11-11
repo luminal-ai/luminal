@@ -52,29 +52,13 @@
   :name "index_map_apply/rewrite: a view through the identity map is its operand"
 )
 
-; Analysis : the tag of a map (constructor.egg). A composite's is its
-; inner's: the composite reads the parent through the inner map.
-(rule
-  ((= ?map (IndexMapLit ?entries ?tag)))
-  ((set (index-map-tag ?map) ?tag))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: a literal's tag is its source shape"
-)
-(rule
-  ((= ?map (IndexMapCompose ?inner ?outer)) (= ?tag (index-map-tag ?inner)))
-  ((set (index-map-tag ?map) ?tag))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: a composite's tag is its inner's"
-)
-
-; Rewrite : a view of a view is the view through the composite of its
-; maps, the composite held closed (no entry is written). Literal pairs
-; only: the outer map's tag is the inner view's shape (map-tag coherence),
-; so the composite reads the operand through the inner map and an
-; incoherent composite is unrepresentable from here. A closed composite is
-; not a literal, so it composes no further until it is opened — which is
-; what keeps a cyclic class (`out = back(out)`) from enumerating the
-; powers of its map.
+; Rewrite : a view of a view is the view through the composite of its maps.
+; The outer map's tag is the inner view's shape (map-tag coherence), so the
+; composite reads the operand through the inner map, over the inner's tag.
+; Composition is not one step: the pair demands its composite, the walk
+; substitutes the inner's entries under the outer map one entry at a time,
+; and the view is unioned with the composed view once the whole literal
+; exists (so no layout rule ever reads an unresolved image).
 (rule
   (
     (= ?outer_view (LogicalIndexMapApply ?inner_view ?outer_map ?outer_shape))
@@ -82,70 +66,33 @@
     (= ?inner_view (LogicalIndexMapApply ?operand ?inner_map ?inner_shape))
     (= ?inner_map (IndexMapLit ?inner_entries ?operand_shape))
   )
-  ((union ?outer_view (LogicalIndexMapApply ?operand (IndexMapCompose ?inner_map ?outer_map) ?outer_shape)))
+  ((index-map-compose-demand ?inner_map ?outer_map))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: a view of a view demands the composite of its maps"
+)
+(rule
+  (
+    (= ?outer_view (LogicalIndexMapApply ?inner_view ?outer_map ?outer_shape))
+    (= ?inner_view (LogicalIndexMapApply ?operand ?inner_map ?inner_shape))
+    (index-map-composed ?inner_map ?outer_map ?composite)
+  )
+  ((union ?outer_view (LogicalIndexMapApply ?operand ?composite ?outer_shape)))
   :ruleset main_ruleset
   :name "index_map_apply/rewrite: a view of a view is the view through the composite of its maps"
 )
 
-; Analysis : substitution under a composite is sequential — the image of
-; an expression under `inner ∘ outer` is the image under the outer map of
-; its image under the inner — so a layout, an iota or a backend view
-; derived through the composite spelling lands in the class the nested
-; spelling already derived, and nothing is opened for it.
-(rule
-  ((int-subst-demand ?expr ?composite) (= ?composite (IndexMapCompose ?inner ?outer)))
-  ((int-subst-demand ?expr ?inner))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: substitution under a composite demands the image under the inner map"
-)
+; The composite of two literal maps: the inner's entries substituted under
+; the outer map, the composed list rebuilt by the walk below, as a literal
+; over the inner's tag.
 (rule
   (
-    (int-subst-demand ?expr ?composite)
-    (= ?composite (IndexMapCompose ?inner ?outer))
-    (= ?image (int-subst-of ?expr ?inner))
-  )
-  ((int-subst-demand ?image ?outer))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: substitution under a composite demands the outer image of the inner image"
-)
-; The memo node for the composite is minted only once the outer image
-; EXISTS (an `int-subst-of` row exists exactly when some arm or the walk
-; resolved it): minted earlier, a view's layout rule would read an
-; unresolved offset and mint a layout no decoder can read.
-(rule
-  (
-    (int-subst-demand ?expr ?composite)
-    (= ?composite (IndexMapCompose ?inner ?outer))
-    (= ?image (int-subst-of ?expr ?inner))
-    (= ?result (int-subst-of ?image ?outer))
-  )
-  ((union (int-subst-of ?expr ?composite) ?result))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: the image under a composite is the outer image of the inner image"
-)
-
-; Rewrite : an opened composite is its literal, ON DEMAND. Opening a
-; composite opens its parts; once both are literals the inner's entries
-; are substituted under the outer map (`int-subst-of`, one row per entry,
-; the composed list rebuilt by the walk below), and the composite is
-; unioned with the literal over the inner's tag. The literal's apply
-; spelling is then the composed view, and a literal pair again.
-(rule
-  ((index-map-open-demand ?composite) (= ?composite (IndexMapCompose ?inner ?outer)))
-  ((index-map-open-demand ?inner) (index-map-open-demand ?outer))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: opening a composite opens its parts"
-)
-(rule
-  (
-    (index-map-open-demand ?composite)
-    (= ?composite (IndexMapCompose ?inner ?outer))
+    (index-map-compose-demand ?inner ?outer)
     (= ?inner (IndexMapLit ?inner_entries ?inner_tag))
     (= ?outer (IndexMapLit ?outer_entries ?outer_tag))
   )
   ((composed-entries-demand ?inner_entries ?outer))
   :ruleset main_ruleset
-  :name "index_map_apply/rewrite: an opened composite of literals demands its composed entries"
+  :name "index_map_apply/rewrite: a demanded composite of literals demands its composed entries"
 )
 (rule
   ((composed-entries-demand (IntExprNil) ?map))
@@ -171,76 +118,11 @@
 )
 (rule
   (
-    (= ?composite (IndexMapCompose ?inner ?outer))
+    (index-map-compose-demand ?inner ?outer)
     (= ?inner (IndexMapLit ?inner_entries ?inner_tag))
     (composed-entries ?inner_entries ?outer ?composed)
   )
-  ((union ?composite (IndexMapLit ?composed ?inner_tag)))
+  ((index-map-composed ?inner ?outer (IndexMapLit ?composed ?inner_tag)))
   :ruleset main_ruleset
   :name "index_map_apply/rewrite: a composite whose composed entries are known is that literal"
-)
-
-; Analysis : a coordinate-only map (every entry a coordinate or the
-; literal 0: a permute, a squeeze, an expand, a broadcast) composed with
-; another is coordinate-only, and such a composite opens WITHOUT demand:
-; its images are served by the literal and coordinate arms of the
-; substitution road, no arithmetic is minted, and there are finitely many
-; such maps over fixed shapes, so a chain of them flattens to one literal
-; and a round trip reaches the identity fold. The question is asked per
-; literal so the walk does not visit every entry list in the graph.
-(rule
-  ((= ?map (IndexMapLit ?entries ?tag)))
-  ((coordinate-only-entries-demand ?entries))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: every literal asks whether it is coordinate-only"
-)
-(rule
-  ((coordinate-only-entries-demand (IntExprCons ?entry ?tail)))
-  ((coordinate-only-entries-demand ?tail))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: the coordinate-only question descends the entries"
-)
-(rule
-  ((coordinate-only-entries-demand ?list) (= ?list (IntExprNil)))
-  ((coordinate-only-entries ?list))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: no entries are coordinate-only"
-)
-(rule
-  (
-    (coordinate-only-entries-demand ?list)
-    (= ?list (IntExprCons ?entry ?tail))
-    (= ?entry (CoordVar ?shape ?axis))
-    (coordinate-only-entries ?tail)
-  )
-  ((coordinate-only-entries ?list))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: a coordinate entry over coordinate-only entries"
-)
-(rule
-  (
-    (coordinate-only-entries-demand ?list)
-    (= ?list (IntExprCons ?entry ?tail))
-    (= ?entry (IntLit 0))
-    (coordinate-only-entries ?tail)
-  )
-  ((coordinate-only-entries ?list))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: a literal-0 entry over coordinate-only entries"
-)
-(rule
-  ((= ?map (IndexMapLit ?entries ?tag)) (coordinate-only-entries ?entries))
-  ((index-map-coordinate-only ?map))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: a literal of coordinates and zeros is coordinate-only"
-)
-(rule
-  (
-    (= ?composite (IndexMapCompose ?inner ?outer))
-    (index-map-coordinate-only ?inner)
-    (index-map-coordinate-only ?outer)
-  )
-  ((index-map-coordinate-only ?composite) (index-map-open-demand ?composite))
-  :ruleset main_ruleset
-  :name "index_map_apply/rewrite: a composite of coordinate-only maps opens without demand"
 )

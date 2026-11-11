@@ -159,10 +159,9 @@ mod tests {
 (let m_e (IndexMapLit (IntExprCons (CoordVar nchw 2) (IntExprCons (CoordVar nchw 1) (IntExprCons (CoordVar nchw 0) (IntExprNil)))) chw))
 "#;
 
-    /// A view of a view is the view through the closed composite of its
-    /// maps, and a composite of coordinate-only maps (a squeeze then a
-    /// permute) opens without demand to the literal with the composed
-    /// entries, tagged with the operand's shape.
+    /// A view of a view is the view through the composite of its maps: the
+    /// literal with the composed entries (a squeeze then a permute), tagged
+    /// with the operand's shape.
     #[test]
     fn a_view_of_a_view_is_the_view_through_the_composite() {
         run(&format!(
@@ -172,18 +171,16 @@ mod tests {
 (let squeezed (LogicalIndexMapApply x m_s chw))
 (let permuted (LogicalIndexMapApply squeezed m_p1 hwc))
 {SCHEDULE}
-(check (= permuted (LogicalIndexMapApply x (IndexMapCompose m_s m_p1) hwc)))
-(check (= (index-map-tag (IndexMapCompose m_s m_p1)) nchw))
-(check (index-map-coordinate-only (IndexMapCompose m_s m_p1)))
-(check (= (IndexMapCompose m_s m_p1)
-  (IndexMapLit (IntExprCons (IntLit 0) (IntExprCons (CoordVar hwc 0) (IntExprCons (CoordVar hwc 2) (IntExprCons (CoordVar hwc 1) (IntExprNil))))) nchw)))
+(check (= permuted (LogicalIndexMapApply x
+  (IndexMapLit (IntExprCons (IntLit 0) (IntExprCons (CoordVar hwc 0) (IntExprCons (CoordVar hwc 2) (IntExprCons (CoordVar hwc 1) (IntExprNil))))) nchw)
+  hwc)))
 "#
         ));
     }
 
     /// The channels-last round trip (squeeze, permute, permute back,
-    /// expand) is its operand: the coordinate-only composites open, the
-    /// chain flattens to the identity literal over `[1,C,H,W]` (the batch
+    /// expand) is its operand: each view of a view composes, the chain
+    /// flattens to the identity literal over `[1,C,H,W]` (the batch
     /// entry is the literal 0 on a unit axis), and the identity fold ends
     /// it.
     #[test]
@@ -227,82 +224,117 @@ mod tests {
         ));
     }
 
-    /// Two flips of the outer axis (`i -> 3 - i`) are arithmetic maps: their
-    /// composite is named, tagged, and not coordinate-only, and it opens
-    /// (composing to the identity) only under `index-map-open-demand`.
+    /// Two flips of the outer axis (`i -> 3 - i`) are arithmetic maps, and
+    /// they compose like any other: the composite's entry `3 - (3 - i)` is
+    /// `i`, so the pair is the identity and the fold unions it with the
+    /// operand. One flip is not.
     #[test]
-    fn an_arithmetic_composite_opens_only_on_demand() {
-        let script = |demand: &str| {
-            format!(
-                r#"
+    fn two_arithmetic_flips_compose_to_the_operand() {
+        run(&format!(
+            r#"
 (let shape (ShapeLit (IntExprCons (IntLit 4) (IntExprCons (IntLit 4) (IntExprNil)))))
 (let x (LogicalTensorInputLit (LogicalIdLit "x") shape (F32)))
 (let flip (IndexMapLit (IntExprCons (IntAdd (IntLit 3) (IntMul (CoordVar shape 1) (IntLit -1))) (IntExprCons (CoordVar shape 0) (IntExprNil))) shape))
 (let once (LogicalIndexMapApply x flip shape))
 (let twice (LogicalIndexMapApply once flip shape))
-{demand}
 {SCHEDULE}
-(check (= twice (LogicalIndexMapApply x (IndexMapCompose flip flip) shape)))
-(check (= (index-map-tag (IndexMapCompose flip flip)) shape))
+(check (= twice x))
 (fail (check (= once x)))
 "#
-            )
-        };
-        run(&format!(
-            "{}\n(check (= twice x))",
-            script("(index-map-open-demand (IndexMapCompose flip flip))")
-        ));
-        // Undemanded, the composite stays closed: not coordinate-only (its
-        // entries are arithmetic), so nothing opens it, and the pair stays
-        // two views.
-        run(&format!(
-            "{}\n(fail (check (index-map-coordinate-only (IndexMapCompose flip flip))))\n(fail (check (= twice x)))",
-            script("")
         ));
     }
 
-    /// Substitution under a composite is sequential: the parent's offset
-    /// substituted under the composite is its image under the inner map
-    /// substituted under the outer, so the composite spelling's layout is
-    /// the nested spelling's.
-    #[test]
-    fn substitution_under_a_composite_is_the_nested_substitution() {
-        run(&format!(
-            r#"
-{ROUND_TRIP}
-(let x (LogicalTensorInputLit (LogicalIdLit "x") nchw (F32)))
-(let offset (IntAdd (IntMul (CoordVar nchw 2) (IntLit 12)) (IntAdd (IntMul (CoordVar nchw 1) (IntLit 4)) (CoordVar nchw 0))))
-(let x_lt (LayoutTensorLit x (BitOffsetExpressionLayoutLit (IntMul offset (IntLit 32)) nchw (bits-of (F32)))))
-(let squeezed (LogicalIndexMapApply x m_s chw))
-(let permuted (LogicalIndexMapApply squeezed m_p1 hwc))
-{SCHEDULE}
-(check (= (int-subst-of (IntMul offset (IntLit 32)) (IndexMapCompose m_s m_p1))
-          (int-subst-of (int-subst-of (IntMul offset (IntLit 32)) m_s) m_p1)))
-"#
-        ));
+    /// The wrap-around shift by one over `[8]`: `roll(x)[i] = x[(i + 1) % 8]`.
+    const ROLL: &str = r#"
+(let s1 (ShapeLit (IntExprCons (IntLit 1) (IntExprNil))))
+(let s8 (ShapeLit (IntExprCons (IntLit 8) (IntExprNil))))
+(let roll (IndexMapLit (IntExprCons (IntTruncRem (IntAdd (CoordVar s8 0) (IntLit 1)) (IntLit 8)) (IntExprNil)) s8))
+"#;
+
+    /// Run `script` under the schedule's saturating stratum for at most
+    /// `rounds` rounds, then `checks`. A run that has not reached a fixpoint
+    /// by then fails here instead of hanging the suite.
+    fn run_bounded(script: &str, rounds: usize, checks: &str) {
+        let mut graph = new_egraph();
+        graph
+            .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
+            .unwrap();
+        graph
+            .parse_and_run_program(None, "(run-schedule (saturate (run prop)))")
+            .unwrap();
+        let converged = (0..rounds).any(|_| {
+            let report = graph
+                .parse_and_run_program(
+                    None,
+                    "(run-schedule (run main_ruleset) (run prop) (run subst-walk))",
+                )
+                .unwrap();
+            !report.iter().any(|output| {
+                matches!(output, egglog::CommandOutput::RunSchedule(report) if report.updated)
+            })
+        });
+        assert!(converged, "no fixpoint within {rounds} rounds");
+        graph.parse_and_run_program(None, checks).unwrap();
     }
 
-    /// A composite reads its operand through its inner map, so its tag (the
-    /// inner's) must be the operand's shape: a hand-seeded closed composite
-    /// (two flips of a `[4,4]` box, arithmetic, so nothing opens it) over an
-    /// operand of another shape is caught by the fixpoint lock.
+    /// An arithmetic map composed with itself: two rolls are the roll by
+    /// two, one literal with the folded entry `(i + 2) % 8`, and eight are
+    /// the operand (the entry folds to the coordinate and the identity fold
+    /// ends it).
     #[test]
-    fn a_composite_over_the_wrong_operand_is_caught_by_the_lock() {
-        let result = try_run(&format!(
-            r#"
-{ROUND_TRIP}
-(let shape (ShapeLit (IntExprCons (IntLit 4) (IntExprCons (IntLit 4) (IntExprNil)))))
-(let flip (IndexMapLit (IntExprCons (IntAdd (IntLit 3) (IntMul (CoordVar shape 1) (IntLit -1))) (IntExprCons (CoordVar shape 0) (IntExprNil))) shape))
-(let x (LogicalTensorInputLit (LogicalIdLit "x") nchw (F32)))
-(let bad (LogicalIndexMapApply x (IndexMapCompose flip flip) shape))
-{SCHEDULE}
-(run-schedule (saturate (run fixpoint-invariants)))
+    fn rolls_compose_and_the_full_cycle_is_the_operand() {
+        let chain: String = (1..=8)
+            .map(|k| format!("(let r{k} (LogicalIndexMapApply r{} roll s8))\n", k - 1))
+            .collect();
+        run_bounded(
+            &format!(
+                r#"
+{ROLL}
+(let r0 (LogicalTensorInputLit (LogicalIdLit "x") s8 (F32)))
+{chain}
 "#
-        ));
-        let message = result.expect_err("the composite's tag is [4,4], the operand's shape is [1,2,3,4]");
-        assert!(
-            message.contains("IndexMapCompose tag"),
-            "the failure must name the composite lock: {message}"
+            ),
+            200,
+            r#"
+(check (= r2 (LogicalIndexMapApply r0
+  (IndexMapLit (IntExprCons (IntTruncRem (IntAdd (CoordVar s8 0) (IntLit 2)) (IntLit 8)) (IntExprNil)) s8)
+  s8)))
+(check (= r8 r0))
+(fail (check (= r1 r0)))
+(fail (check (= r4 r0)))
+"#,
+        );
+    }
+
+    /// A tensor that is its own view through an arithmetic map. `t`
+    /// broadcasts one element to eight, so every roll of it is `t`; the
+    /// union below states that, and the class of `t` then holds a view of
+    /// itself. Every view of a view composes, so the class collects the
+    /// powers of the roll: it saturates because the nested remainders fold
+    /// (`core: a nested IntTruncRem folds into the outer one`) and the roll
+    /// has eight powers, the eighth the identity. Without the fold each
+    /// power is a new map and this never ends.
+    #[test]
+    fn a_tensor_that_is_its_own_roll_saturates() {
+        run_bounded(
+            &format!(
+                r#"
+{ROLL}
+(let b (LogicalTensorInputLit (LogicalIdLit "b") s1 (F32)))
+(let t (LogicalIndexMapApply b (IndexMapLit (IntExprCons (IntLit 0) (IntExprNil)) s1) s8))
+(let v (LogicalIndexMapApply t roll s8))
+(union t v)
+"#
+            ),
+            200,
+            r#"
+(check (= t (LogicalIndexMapApply t
+  (IndexMapLit (IntExprCons (IntTruncRem (IntAdd (CoordVar s8 0) (IntLit 3)) (IntLit 8)) (IntExprNil)) s8)
+  s8)))
+(check (= t (LogicalIndexMapApply t
+  (IndexMapLit (IntExprCons (IntTruncRem (IntAdd (CoordVar s8 0) (IntLit 7)) (IntLit 8)) (IntExprNil)) s8)
+  s8)))
+"#,
         );
     }
 
