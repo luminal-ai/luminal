@@ -1273,7 +1273,7 @@ impl<'a> Extractor<'a> {
             .filter(|(op_class, _)| matched(op_class))
             .flat_map(|(_, specs)| specs.iter())
             .collect();
-        let mut consumers: HashMap<&ClassId, Vec<usize>> = HashMap::new();
+        let mut consumers: HashMap<&ClassId, Vec<usize>> = HashMap::default();
         let mut missing: Vec<usize> = Vec::with_capacity(specs.len());
         for (i, spec) in specs.iter().enumerate() {
             let mut inputs: Vec<&ClassId> = spec.inputs.iter().collect();
@@ -1287,7 +1287,7 @@ impl<'a> Extractor<'a> {
         // the classes viable once `root` is: a worklist over the counts
         let unblocked = |root: &ClassId, dead: &ClassId| -> bool {
             let mut missing = missing.clone();
-            let mut reached: HashSet<&ClassId> = HashSet::new();
+            let mut reached: HashSet<&ClassId> = HashSet::default();
             let mut work: Vec<&ClassId> = vec![root];
             reached.insert(root);
             while let Some(class) = work.pop() {
@@ -1310,10 +1310,10 @@ impl<'a> Extractor<'a> {
         let mut chains = Vec::new();
         for dead in &self.no_candidates {
             let mut steps = Vec::new();
-            explain(dead, 0, &mut HashSet::new(), &waits, &op_of, &mut steps);
-            let mut parent: HashMap<ClassId, (ClassId, ClassId)> = HashMap::new();
+            explain(dead, 0, &mut HashSet::default(), &waits, &op_of, &mut steps);
+            let mut parent: HashMap<ClassId, (ClassId, ClassId)> = HashMap::default();
             let mut cone: Vec<ClassId> = vec![dead.clone()];
-            let mut visited: HashSet<ClassId> = HashSet::from([dead.clone()]);
+            let mut visited: HashSet<ClassId> = std::iter::once(dead.clone()).collect();
             let mut roots: Vec<ClassId> = Vec::new();
             let mut head = 0;
             while head < cone.len() && cone.len() < 200_000 {

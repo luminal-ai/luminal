@@ -26,6 +26,7 @@ use rustc_hash::FxHashMap;
 mod add_sub_tests;
 #[cfg(test)]
 mod all_gather_tests;
+#[cfg(test)]
 mod all_reduce_tests;
 mod array_extra;
 mod attention;
