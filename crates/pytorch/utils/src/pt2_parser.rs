@@ -1,45 +1,31 @@
-//! PT2 ZIP + JSON parser.
+//! PT2 program JSON parser.
 //!
-//! Opens a .pt2 file (ZIP archive), reads the model JSON, and extracts
-//! the graph structure, weight mapping, and symbolic shape info.
+//! Reads the program a frontend hands over in process (the `model.json`
+//! document of a PT2 archive, without the archive) and extracts the graph
+//! structure, input classification, and symbolic shape info.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
 
-use anyhow::{Context, Result, anyhow};
-use zip::ZipArchive;
+use anyhow::{Context, Result};
 
 use luminal::prelude::Symbol;
 use luminal::prelude::tracing::warn;
 
 use crate::pt2_schema::*;
 
-/// Parsed PT2 file contents — everything needed for graph translation.
+/// A parsed program — everything needed for graph translation.
 #[derive(Debug)]
 pub struct ParsedPT2 {
     /// The exported program (graph, signature, etc.)
     pub program: ExportedProgram,
-    /// Constants config: tensor constant name -> (file path in zip, tensor metadata)
-    pub constants_config: Option<WeightsConfig>,
-    /// Weights config: parameter name -> (file path in zip, tensor metadata).
-    /// Written by `torch.export.save` (torch 2.13+ layout).
-    pub weights_config: Option<WeightsConfig>,
-    /// Archive name prefix (e.g., "luminal_mlp")
-    pub archive_prefix: String,
-    /// Path to the original .pt2 file (for re-reading constants)
-    pub pt2_path: String,
 }
 
 /// Classification of a graph input.
 #[derive(Debug, Clone)]
 pub enum InputKind {
-    /// A model parameter (e.g., "fc1.weight")
-    Parameter {
-        graph_name: String,
-        original_name: String,
-    },
-    /// A model buffer (e.g., "running_mean")
+    /// A tensor the program holds: a lifted tensor constant, whose bytes the
+    /// caller stages. `original_name` is the constant's own name. Reported
+    /// to Python as kind `"buffer"`.
     Buffer {
         graph_name: String,
         original_name: String,
@@ -61,7 +47,9 @@ pub struct SymDimMap {
 }
 
 impl ParsedPT2 {
-    /// Classify all graph inputs into parameters, buffers, and user inputs.
+    /// Classify the graph inputs the signature names: held tensor constants
+    /// and user input tensors. A user input that is not a tensor (a
+    /// symbolic or constant scalar) has no storage and is not listed.
     pub fn classify_inputs(&self) -> Vec<InputKind> {
         self.program
             .graph_module
@@ -69,96 +57,15 @@ impl ParsedPT2 {
             .input_specs
             .iter()
             .filter_map(|spec| match spec {
-                InputSpec::Parameter(p) => Some(InputKind::Parameter {
-                    graph_name: p.parameter.arg.name.clone(),
-                    original_name: p.parameter.parameter_name.clone(),
-                }),
-                InputSpec::Buffer(b) => Some(InputKind::Buffer {
-                    graph_name: b.buffer.arg.name.clone(),
-                    original_name: b.buffer.buffer_name.clone(),
-                }),
                 InputSpec::TensorConstant(tc) => Some(InputKind::Buffer {
-                    graph_name: tc.tensor_constant.arg.name.clone(),
-                    original_name: tc.tensor_constant.tensor_constant_name.clone(),
+                    graph_name: tc.arg.name.clone(),
+                    original_name: tc.tensor_constant_name.clone(),
                 }),
                 InputSpec::UserInput(u) => {
-                    u.user_input
-                        .arg
-                        .as_tensor_name()
-                        .map(|name| InputKind::UserInput {
-                            graph_name: name.to_string(),
-                        })
-                }
-                InputSpec::Other(_) => None,
-            })
-            .collect()
-    }
-
-    /// Get the output tensor names.
-    pub fn output_names(&self) -> Vec<String> {
-        self.program
-            .graph_module
-            .graph
-            .outputs
-            .iter()
-            .filter_map(|o| o.as_tensor.as_ref().map(|t| t.name.clone()))
-            .collect()
-    }
-
-    /// (output position, mutated graph-input name) for every output the
-    /// export signature declares as an in-place mutation — the extra outputs
-    /// functionalization appends for `index_put_`/`copy_`/`add_` on graph
-    /// inputs and module buffers (e.g. HF StaticCache updates). Keyed by
-    /// position, not name: a model that mutates an input *and* returns it
-    /// yields two outputs with the same tensor name.
-    ///
-    /// A `buffer_mutation` names the buffer by its module FQN; the writeback
-    /// binds by graph input name, so the FQN is resolved through the input
-    /// specs here. A buffer with no graph input is an error, not a skip:
-    /// dropping it would silently lose the mutation.
-    ///
-    /// Positions index the same tensor-only output list `output_names()`
-    /// returns: output_specs is parallel to graph.outputs, but non-tensor
-    /// user outputs (e.g. a returned `None` serializes as `as_none`) are
-    /// filtered out of `output_names()`, so counting raw spec positions
-    /// would skew everything after one.
-    pub fn writeback_outputs(&self) -> Result<Vec<(usize, String)>> {
-        let kinds = self.classify_inputs();
-        let buffer_graph_names: HashMap<&str, &str> = kinds
-            .iter()
-            .filter_map(|kind| match kind {
-                InputKind::Buffer {
-                    graph_name,
-                    original_name,
-                } => Some((original_name.as_str(), graph_name.as_str())),
-                _ => None,
-            })
-            .collect();
-
-        let outputs = &self.program.graph_module.graph.outputs;
-        self.program
-            .graph_module
-            .signature
-            .output_specs
-            .iter()
-            .zip(outputs)
-            .filter(|(_, output)| output.as_tensor.is_some())
-            .enumerate()
-            .filter_map(|(position, (spec, _))| match spec {
-                OutputSpec::UserInputMutation {
-                    user_input_mutation,
-                } => Some(Ok((position, user_input_mutation.user_input_name.clone()))),
-                OutputSpec::BufferMutation { buffer_mutation } => {
-                    let name = buffer_mutation.buffer_name.as_str();
-                    Some(match buffer_graph_names.get(name) {
-                        Some(graph_name) => Ok((position, (*graph_name).to_string())),
-                        None => Err(anyhow!(
-                            "buffer mutation output targets buffer {name:?}, \
-                             which has no graph input"
-                        )),
+                    u.arg.as_tensor_name().map(|name| InputKind::UserInput {
+                        graph_name: name.to_string(),
                     })
                 }
-                OutputSpec::Other(_) => None,
             })
             .collect()
     }
@@ -349,113 +256,15 @@ fn extract_symbol_name(expr_str: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Parse a .pt2 file from disk.
-pub fn parse_pt2(path: &str) -> Result<ParsedPT2> {
-    let file = File::open(path).with_context(|| format!("Failed to open PT2 file: {path}"))?;
-    let mut archive = ZipArchive::new(file).context("Failed to read PT2 ZIP archive")?;
-
-    // Determine archive prefix from the first entry
-    let archive_prefix = {
-        let first = archive
-            .file_names()
-            .next()
-            .context("Empty PT2 archive")?
-            .to_string();
-        first.split('/').next().unwrap_or(&first).to_string()
-    };
-
-    // Read model.json
-    let model_json_path = format!("{archive_prefix}/models/model.json");
-    let program: ExportedProgram = {
-        let mut entry = archive
-            .by_name(&model_json_path)
-            .with_context(|| format!("Missing {model_json_path} in PT2 archive"))?;
-        let mut buf = String::new();
-        entry.read_to_string(&mut buf)?;
-        serde_json::from_str(&buf).with_context(|| "Failed to parse model.json")?
-    };
-
-    // Read constants config (optional — not all models have constants)
-    let constants_config_path =
-        format!("{archive_prefix}/data/constants/model_constants_config.json");
-    let constants_config: Option<WeightsConfig> = archive
-        .by_name(&constants_config_path)
-        .ok()
-        .and_then(|mut entry| {
-            let mut buf = String::new();
-            entry.read_to_string(&mut buf).ok()?;
-            serde_json::from_str(&buf).ok()
-        });
-
-    // Read weights config (optional — parameters live here when the export
-    // was saved through `torch.export.save`).
-    let weights_config_path = format!("{archive_prefix}/data/weights/model_weights_config.json");
-    let weights_config: Option<WeightsConfig> = archive
-        .by_name(&weights_config_path)
-        .ok()
-        .and_then(|mut entry| {
-            let mut buf = String::new();
-            entry.read_to_string(&mut buf).ok()?;
-            serde_json::from_str(&buf).ok()
-        });
-
-    Ok(ParsedPT2 {
-        program,
-        constants_config,
-        weights_config,
-        archive_prefix,
-        pt2_path: path.to_string(),
-    })
-}
-
 /// Parse a program handed over in process: the `model.json` document of a
 /// PT2 archive, without the archive. Constant data does not travel with it;
-/// the caller stages every held tensor itself.
+/// the caller stages every held tensor itself. A signature naming an input
+/// or output kind the in-process hand-off never writes is refused here, by
+/// that kind's name.
 pub fn parse_program(json: &[u8]) -> Result<ParsedPT2> {
     let program: ExportedProgram =
         serde_json::from_slice(json).context("Failed to parse the serialized program")?;
-    Ok(ParsedPT2 {
-        program,
-        constants_config: None,
-        weights_config: None,
-        archive_prefix: String::new(),
-        pt2_path: String::new(),
-    })
-}
-
-/// Read raw constant bytes from the PT2 archive for a given constant entry.
-pub fn read_constant_bytes(
-    pt2_path: &str,
-    archive_prefix: &str,
-    entry: &WeightEntry,
-) -> Result<Vec<u8>> {
-    read_zip_entry(
-        pt2_path,
-        &format!("{archive_prefix}/data/constants/{}", entry.path_name),
-    )
-}
-
-/// Read raw weight bytes from the PT2 archive for a given weight entry.
-pub fn read_weight_bytes(
-    pt2_path: &str,
-    archive_prefix: &str,
-    entry: &WeightEntry,
-) -> Result<Vec<u8>> {
-    read_zip_entry(
-        pt2_path,
-        &format!("{archive_prefix}/data/weights/{}", entry.path_name),
-    )
-}
-
-fn read_zip_entry(pt2_path: &str, path: &str) -> Result<Vec<u8>> {
-    let file = File::open(pt2_path)?;
-    let mut archive = ZipArchive::new(file)?;
-    let mut zip_entry = archive
-        .by_name(path)
-        .with_context(|| format!("Missing constant file: {path}"))?;
-    let mut buf = Vec::new();
-    zip_entry.read_to_end(&mut buf)?;
-    Ok(buf)
+    Ok(ParsedPT2 { program })
 }
 
 #[cfg(test)]
@@ -493,87 +302,92 @@ mod tests {
         );
         ParsedPT2 {
             program: serde_json::from_str(&json).expect("fixture must parse"),
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: String::new(),
-            pt2_path: String::new(),
         }
     }
 
-    /// Builds a program whose signature carries the given specs and whose
-    /// graph returns one tensor per name in `outputs`.
-    fn program_with_signature(
-        input_specs: &str,
-        outputs: &[&str],
-        output_specs: &str,
-    ) -> ParsedPT2 {
-        let graph_outputs = outputs
-            .iter()
-            .map(|name| format!(r#"{{"as_tensor":{{"name":"{name}"}}}}"#))
-            .collect::<Vec<_>>()
-            .join(",");
+    /// A program whose signature carries the given specs, read the way the
+    /// in-process hand-off reads it.
+    fn program_with_signature(input_specs: &str, output_specs: &str) -> Result<ParsedPT2> {
         let json = format!(
-            r#"{{"graph_module":{{"graph":{{"inputs":[],"outputs":[{graph_outputs}],
+            r#"{{"graph_module":{{"graph":{{"inputs":[],"outputs":[],
                "nodes":[],"tensor_values":{{}}}},
                "signature":{{"input_specs":[{input_specs}],
                "output_specs":[{output_specs}]}}}}}}"#
         );
-        ParsedPT2 {
-            program: serde_json::from_str(&json).expect("fixture must parse"),
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: String::new(),
-            pt2_path: String::new(),
+        parse_program(json.as_bytes())
+    }
+
+    /// The signature kinds the in-process hand-off writes are read; a lifted
+    /// tensor constant is the one input the program holds, classified as a
+    /// buffer under its constant name.
+    #[test]
+    fn the_in_process_signature_kinds_are_read() {
+        let parsed = program_with_signature(
+            r#"{"user_input":{"arg":{"as_tensor":{"name":"x"}}}},
+               {"user_input":{"arg":{"as_sym_int":{"as_name":"n"}}}},
+               {"tensor_constant":{"arg":{"name":"c_lifted_tensor_0"},
+                                   "tensor_constant_name":"lifted_tensor_0"}}"#,
+            r#"{"user_input_mutation":{"arg":{"name":"add"},"user_input_name":"x"}},
+               {"user_output":{"arg":{"as_tensor":{"name":"add"}}}},
+               {"user_output":{"arg":{"as_none":true}}}"#,
+        )
+        .expect("every kind here is one the hand-off writes");
+        let kinds: Vec<_> = parsed
+            .classify_inputs()
+            .into_iter()
+            .map(|kind| match kind {
+                InputKind::Buffer {
+                    graph_name,
+                    original_name,
+                } => format!("buffer {graph_name} {original_name}"),
+                InputKind::UserInput { graph_name } => format!("user_input {graph_name}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["user_input x", "buffer c_lifted_tensor_0 lifted_tensor_0"],
+            "a scalar user input has no storage and is not classified"
+        );
+    }
+
+    /// An input kind the in-process hand-off never writes is refused by
+    /// name, never read as a user input: a `torch.export` parameter or
+    /// buffer is held state this path has no storage for.
+    #[test]
+    fn an_unknown_input_spec_kind_is_refused_by_name() {
+        for (kind, spec) in [
+            (
+                "parameter",
+                r#"{"parameter":{"arg":{"name":"p_w"},"parameter_name":"w"}}"#,
+            ),
+            (
+                "buffer",
+                r#"{"buffer":{"arg":{"name":"b_cache"},"buffer_name":"cache"}}"#,
+            ),
+            ("custom_obj", r#"{"custom_obj":{"arg":{"name":"obj"}}}"#),
+        ] {
+            let error = program_with_signature(spec, "").expect_err(kind);
+            let text = format!("{error:#}");
+            assert!(text.contains(&format!("`{kind}`")), "{kind}: {text}");
         }
     }
 
-    /// A `buffer_mutation` names its target by module FQN ("cache"), but the
-    /// writeback binds by graph input name ("b_cache"). Position is counted
-    /// over tensor outputs, so the user output ahead of it shifts it to 1.
+    /// An output kind the in-process hand-off never writes is refused by
+    /// name, never read as a user output: a mutation of some other kind
+    /// would otherwise be returned instead of written back.
     #[test]
-    fn buffer_mutation_writes_back_to_the_buffers_graph_input() {
-        let parsed = program_with_signature(
-            r#"{"buffer":{"arg":{"name":"b_cache"},"buffer_name":"cache",
-               "persistent":true}}"#,
-            &["mul", "add_1"],
-            r#"{"user_output":{"arg":{"as_tensor":{"name":"mul"}}}},
-               {"buffer_mutation":{"arg":{"name":"add_1"},"buffer_name":"cache"}}"#,
-        );
-        assert_eq!(
-            parsed.writeback_outputs().expect("buffer resolves"),
-            vec![(1, "b_cache".to_string())]
-        );
-    }
-
-    /// A buffer the signature never declares as an input has no storage to
-    /// write back into; dropping it would silently lose the mutation.
-    #[test]
-    fn buffer_mutation_naming_an_unknown_buffer_is_an_error() {
-        let parsed = program_with_signature(
-            r#"{"buffer":{"arg":{"name":"b_cache"},"buffer_name":"cache"}}"#,
-            &["add_1"],
-            r#"{"buffer_mutation":{"arg":{"name":"add_1"},"buffer_name":"other_cache"}}"#,
-        );
-        let error = parsed
-            .writeback_outputs()
-            .expect_err("unknown buffer must refuse")
-            .to_string();
-        assert!(error.contains("other_cache"), "{error}");
-    }
-
-    /// The user-input mutation path is unchanged: its target is already a
-    /// graph input name and is passed through as written.
-    #[test]
-    fn user_input_mutation_still_yields_its_user_input_name() {
-        let parsed = program_with_signature(
-            r#"{"user_input":{"arg":{"as_tensor":{"name":"x"}}}}"#,
-            &["add_1"],
-            r#"{"user_input_mutation":{"arg":{"name":"add_1"},"user_input_name":"x"}}"#,
-        );
-        assert_eq!(
-            parsed.writeback_outputs().expect("user input resolves"),
-            vec![(0, "x".to_string())]
-        );
+    fn an_unknown_output_spec_kind_is_refused_by_name() {
+        for (kind, spec) in [
+            (
+                "buffer_mutation",
+                r#"{"buffer_mutation":{"arg":{"name":"add"},"buffer_name":"cache"}}"#,
+            ),
+            ("loss_output", r#"{"loss_output":{"arg":{"name":"loss"}}}"#),
+        ] {
+            let error = program_with_signature("", spec).expect_err(kind);
+            let text = format!("{error:#}");
+            assert!(text.contains(&format!("`{kind}`")), "{kind}: {text}");
+        }
     }
 
     /// torch lets a user write `Dim("_batch")`, `Dim("a__b")` or any other
@@ -645,10 +459,6 @@ mod tests {
             "signature":{"input_specs":[]}}}"#;
         let parsed = ParsedPT2 {
             program: serde_json::from_str(json).expect("fixture must parse"),
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: String::new(),
-            pt2_path: String::new(),
         };
         let map = parsed.build_sym_dim_map();
         let mut symbols: Vec<_> = map.sym_to_symbol.keys().cloned().collect();

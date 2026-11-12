@@ -693,13 +693,7 @@ mod tests {
             },
             range_constraints: HashMap::new(),
         };
-        ParsedPT2 {
-            program,
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: "test".to_string(),
-            pt2_path: String::new(),
-        }
+        ParsedPT2 { program }
     }
 
     /// Translate a single node with input `x` and output `y`, returning

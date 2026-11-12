@@ -3,9 +3,9 @@
 //! SSA values stay SSA; the model says nothing about boundary storage.
 //! Which values leave, and through whose storage, is a table here, read
 //! from the export's output specs: a functionalized mutation (PT2
-//! `user_input_mutation` or `buffer_mutation`) records the mutated graph
-//! input's name as the output's `mutation_target`, and the backend binds
-//! that output on that input's buffer. One row per output spec, keyed by
+//! `user_input_mutation`) records the mutated graph input's name as the
+//! output's `mutation_target`, and the backend binds that output on that
+//! input's buffer. One row per output spec, keyed by
 //! the export's node: two nodes with equal values (a clone and what it
 //! copies) are two rows, and the same node as writeback and user output
 //! is one row, returned. The program must be functionalised before it
@@ -93,7 +93,8 @@ use crate::pt2_schema::{Argument, DimSize, Node, NodeInput, RangeConstraint, Ten
 /// One bound graph input, in export order.
 pub struct TranslatedInput {
     pub graph_name: String,
-    /// The original checkpoint name for parameters/buffers (e.g. "0.weight").
+    /// The constant's own name for a held tensor constant; `None` for a
+    /// user input.
     pub parameter_name: Option<String>,
     pub kind: InputKind,
     pub tensor: NodeIndex,
@@ -110,9 +111,8 @@ pub struct TranslatedOutput {
     pub dtype: DType,
     /// Symbolic dims (see [`TranslatedInput::shape`]).
     pub shape: Vec<IntExpr>,
-    /// For a mutation output: the graph name of the graph input (user input
-    /// or module buffer) it writes into. These are writebacks, not returned
-    /// tensors.
+    /// For a mutation output: the graph name of the user input it writes
+    /// into. These are writebacks, not returned tensors.
     pub mutation_target: Option<String>,
     /// Whether this output is part of the caller's returned pytree. A
     /// mutation-only sink is `false`; a mutated input that the model also
@@ -124,7 +124,7 @@ pub struct TranslatedOutput {
 pub struct Translation {
     pub graph: Graph,
     /// The tensors the program reads, each with storage: the arguments it
-    /// reads and every parameter, buffer and constant it holds.
+    /// reads and every tensor constant it holds.
     pub inputs: Vec<TranslatedInput>,
     /// The tensors the program writes. See [`OutputRow`](crate::boundary::OutputRow).
     pub outputs: Vec<TranslatedOutput>,
@@ -280,9 +280,9 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         .into_iter()
         .map(|kind| {
             let name = match &kind {
-                InputKind::Parameter { graph_name, .. }
-                | InputKind::Buffer { graph_name, .. }
-                | InputKind::UserInput { graph_name } => graph_name.clone(),
+                InputKind::Buffer { graph_name, .. } | InputKind::UserInput { graph_name } => {
+                    graph_name.clone()
+                }
             };
             (name, kind)
         })
@@ -337,7 +337,6 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
             graph_name: name.clone(),
         });
         let parameter_name = match &kind {
-            InputKind::Parameter { original_name, .. } => Some(original_name.clone()),
             InputKind::Buffer { original_name, .. } => Some(original_name.clone()),
             InputKind::UserInput { .. } => None,
         };

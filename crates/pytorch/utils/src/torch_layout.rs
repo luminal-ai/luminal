@@ -147,13 +147,7 @@ mod tests {
             },
             range_constraints: HashMap::new(),
         };
-        let parsed = crate::pt2_parser::ParsedPT2 {
-            program,
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: "test".to_string(),
-            pt2_path: String::new(),
-        };
+        let parsed = crate::pt2_parser::ParsedPT2 { program };
         let err = match crate::translate::translate(&parsed) {
             Ok(_) => panic!("a sparse tensor must refuse"),
             Err(err) => err.to_string(),

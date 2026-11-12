@@ -44,7 +44,6 @@ fn to_py(err: anyhow::Error) -> PyErr {
 
 fn kind_name(kind: &InputKind) -> &'static str {
     match kind {
-        InputKind::Parameter { .. } => "parameter",
         InputKind::Buffer { .. } => "buffer",
         InputKind::UserInput { .. } => "user_input",
     }
@@ -66,7 +65,7 @@ pub struct ExecutionStaging {
 /// A compiled CUDA-lite graph with its boundary tables.
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
-    translation: std::rc::Rc<Translation>,
+    translation: Translation,
     runtime: CudaRuntime,
     /// The buffer each translation input was bound on, by input index.
     input_buffers: Vec<i64>,
@@ -100,23 +99,6 @@ fn resolve_shape(shape: &[IntExpr], dims: &DynMap) -> Vec<usize> {
 
 #[pymethods]
 impl CompiledGraph {
-    /// A new binding of the selected program, with no native compilation.
-    fn fork(&self) -> PyResult<Self> {
-        if !self.searched {
-            return Err(PyRuntimeError::new_err("search before fork"));
-        }
-        Ok(Self {
-            translation: self.translation.clone(),
-            runtime: self.runtime.fork().map_err(to_py)?,
-            input_buffers: self.input_buffers.clone(),
-            output_buffers: self.output_buffers.clone(),
-            output_layouts: self.output_layouts.clone(),
-            dims: self.dims.clone(),
-            bounds: self.bounds.clone(),
-            searched: true,
-        })
-    }
-
     #[getter]
     fn input_names(&self) -> Vec<String> {
         self.translation
@@ -458,37 +440,6 @@ impl CompiledGraph {
         {
             // Another workspace crate may enable the runtime's device feature
             // without enabling this wrapper's feature or staging storage.
-            Err(PyRuntimeError::new_err(
-                "CUDA execution requires the Python wrapper's `device` feature",
-            ))
-        }
-    }
-
-    #[cfg_attr(not(feature = "device"), allow(unused_variables, unused_mut))]
-    fn execute_async(
-        &mut self,
-        arena_ptr: u64,
-        arena_bytes: usize,
-        mut staging: PyRefMut<'_, ExecutionStaging>,
-    ) -> PyResult<()> {
-        if !self.searched {
-            return Err(PyRuntimeError::new_err(
-                "search() must run before execute_async()",
-            ));
-        }
-        #[cfg(feature = "device")]
-        {
-            // SAFETY: the capture wrapper owns the arena until its GPU work completes.
-            unsafe {
-                self.runtime.execute_async(
-                    luminal_cuda_lite::CudaArena::from_raw(arena_ptr, arena_bytes),
-                    &mut staging.inner,
-                )
-            }
-            .map_err(to_py)
-        }
-        #[cfg(not(feature = "device"))]
-        {
             Err(PyRuntimeError::new_err(
                 "CUDA execution requires the Python wrapper's `device` feature",
             ))
@@ -899,7 +850,8 @@ fn bind(
     })
 }
 
-/// Parse, translate, and load a `.pt2` on the CUDA-lite runtime under the
+/// Translate and load a program handed over in process (the JSON document
+/// of a PT2 archive, without the archive) on the CUDA-lite runtime under the
 /// caller's boundary layouts: one `(graph name, layout tag, element strides)`
 /// row per graph input and per user-visible graph output, the tag being
 /// `row_major`, `column_major` or `strided`, and each stride a sympy `srepr`
@@ -907,21 +859,6 @@ fn bind(
 /// it writes the storage of the input it mutates, at that input's layout.
 /// `output_aliases` names each output that shares its storage with an earlier
 /// boundary tensor (`(output, owner)`); it is bound on the owner's buffer.
-#[pyfunction]
-fn compile(
-    pt2_path: &str,
-    input_layouts: Vec<(String, String, Vec<String>)>,
-    output_layouts: Vec<(String, String, Vec<String>)>,
-    output_aliases: Vec<(String, String)>,
-) -> PyResult<CompiledGraph> {
-    let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
-        .with_context(|| format!("parsing {pt2_path}"))
-        .map_err(to_py)?;
-    load(&parsed, input_layouts, output_layouts, output_aliases)
-}
-
-/// The same for a program handed over in process: the JSON document of a
-/// PT2 archive, without the archive.
 #[pyfunction]
 fn compile_graph(
     program: &[u8],
@@ -976,7 +913,7 @@ fn load(
     .context("loading the translated graph on the cuda-lite runtime")
     .map_err(to_py)?;
     Ok(CompiledGraph {
-        translation: std::rc::Rc::new(translation),
+        translation,
         runtime,
         input_buffers: boundary.input_buffers,
         output_buffers: boundary.output_buffers,
@@ -991,7 +928,6 @@ fn load(
 fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledGraph>()?;
     m.add_class::<ExecutionStaging>()?;
-    m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(compile_graph, m)?)?;
     m.add_function(wrap_pyfunction!(boundary_plan, m)?)?;
     Ok(())
@@ -1139,7 +1075,7 @@ mod tests {
             .collect()
     }
 
-    /// The object `compile` hands back, built from a synthetic
+    /// The object `compile_graph` hands back, built from a synthetic
     /// translation. `bind_dims` reads the declared input shapes and
     /// nothing else, so the loaded program's own structure is immaterial.
     fn compiled(translation: Translation) -> CompiledGraph {
@@ -1169,7 +1105,7 @@ mod tests {
         )
         .expect("the synthetic program loads");
         CompiledGraph {
-            translation: std::rc::Rc::new(translation),
+            translation,
             runtime,
             input_buffers: boundary.input_buffers,
             output_buffers: boundary.output_buffers,

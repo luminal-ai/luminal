@@ -1917,10 +1917,6 @@ mod tests {
         }"#;
         ParsedPT2 {
             program: serde_json::from_str(json).expect("complex fixture must parse"),
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: String::new(),
-            pt2_path: String::new(),
         }
     }
 

@@ -361,13 +361,7 @@ mod tests {
             },
             range_constraints,
         };
-        crate::pt2_parser::ParsedPT2 {
-            program,
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: "test".to_string(),
-            pt2_path: String::new(),
-        }
+        crate::pt2_parser::ParsedPT2 { program }
     }
 
     #[test]

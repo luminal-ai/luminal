@@ -162,10 +162,6 @@ mod tests {
                 },
                 range_constraints: std::collections::HashMap::new(),
             },
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: "test".to_string(),
-            pt2_path: String::new(),
         }
     }
 

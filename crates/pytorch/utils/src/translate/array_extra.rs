@@ -744,10 +744,6 @@ impl Translator<'_> {
                 },
                 range_constraints: std::collections::HashMap::new(),
             },
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: String::new(),
-            pt2_path: String::new(),
         };
         let leaked: &'static ParsedPT2 = Box::leak(Box::new(merged));
         let previous = std::mem::replace(&mut self.parsed, leaked);
@@ -881,13 +877,7 @@ mod tests {
             },
             range_constraints: HashMap::new(),
         };
-        ParsedPT2 {
-            program,
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: "test".to_string(),
-            pt2_path: String::new(),
-        }
+        ParsedPT2 { program }
     }
 
     fn node(target: &str, inputs: Vec<NodeInput>) -> Node {

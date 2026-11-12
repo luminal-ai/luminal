@@ -28,7 +28,6 @@ fn to_py(err: anyhow::Error) -> PyErr {
 
 fn kind_name(kind: &InputKind) -> &'static str {
     match kind {
-        InputKind::Parameter { .. } => "parameter",
         InputKind::Buffer { .. } => "buffer",
         InputKind::UserInput { .. } => "user_input",
     }
@@ -129,7 +128,7 @@ fn typed_buffer(dtype: DType, bytes: &[u8]) -> Result<TypedBuffer> {
 /// A compiled reference-backend graph with its boundary tables.
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
-    translation: std::rc::Rc<Translation>,
+    translation: Translation,
     runtime: ReferenceRuntime,
     /// The buffer each output was bound on, parallel to
     /// `translation.outputs`.
@@ -215,24 +214,6 @@ fn resolve_shape(shape: &[IntExpr], dims: &DynMap) -> Vec<usize> {
 
 #[pymethods]
 impl CompiledGraph {
-    /// A new binding of the selected program, with no native compilation.
-    fn fork(&self) -> PyResult<Self> {
-        if !self.searched {
-            return Err(PyRuntimeError::new_err("search before fork"));
-        }
-        Ok(Self {
-            translation: self.translation.clone(),
-            runtime: self.runtime.fork().map_err(to_py)?,
-            output_buffers: self.output_buffers.clone(),
-            shared_outputs: self.shared_outputs.clone(),
-            staged: HashMap::new(),
-            dirty: HashSet::new(),
-            dims: self.dims.clone(),
-            bounds: self.bounds.clone(),
-            searched: true,
-        })
-    }
-
     #[getter]
     fn input_names(&self) -> Vec<String> {
         self.translation
@@ -710,15 +691,6 @@ fn bind(translation: &Translation) -> Result<(ReferenceBindings, Vec<i64>)> {
     Ok((bindings, output_buffers))
 }
 
-/// Parse, translate, and load a `.pt2` on the reference runtime.
-#[pyfunction]
-fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
-    let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
-        .with_context(|| format!("parsing {pt2_path}"))
-        .map_err(to_py)?;
-    load(&parsed)
-}
-
 /// Translate and load a program handed over in process: the JSON document
 /// of a PT2 archive, without the archive.
 #[pyfunction]
@@ -766,7 +738,7 @@ fn load(parsed: &luminal_pytorch_utils::ParsedPT2) -> PyResult<CompiledGraph> {
         .context("loading the translated graph on the reference runtime")
         .map_err(to_py)?;
     Ok(CompiledGraph {
-        translation: std::rc::Rc::new(translation),
+        translation,
         runtime,
         output_buffers,
         shared_outputs,
@@ -790,7 +762,6 @@ fn _torch_dtype_codes() -> HashMap<&'static str, u32> {
 fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledGraph>()?;
     m.add_function(wrap_pyfunction!(_torch_dtype_codes, m)?)?;
-    m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(compile_graph, m)?)?;
     m.add_function(wrap_pyfunction!(boundary_plan, m)?)?;
     Ok(())

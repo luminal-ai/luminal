@@ -630,13 +630,7 @@ mod tests {
             },
             range_constraints: HashMap::new(),
         };
-        let parsed = ParsedPT2 {
-            program,
-            constants_config: None,
-            weights_config: None,
-            archive_prefix: "test".to_string(),
-            pt2_path: String::new(),
-        };
+        let parsed = ParsedPT2 { program };
         crate::translate::translate(&parsed).is_ok()
     }
 

@@ -1,7 +1,8 @@
 //! PT2 serialized model JSON schema types (torch 2.10+ format).
 //!
-//! The .pt2 ZIP archive contains `{name}/models/model.json` with this structure.
-//! We only model the subset needed for graph translation.
+//! The program a frontend hands over in process is the `model.json`
+//! document of a PT2 archive, without the archive. We only model the subset
+//! needed for graph translation.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -502,32 +503,38 @@ impl DimSize {
     }
 }
 
-/// Signature describing which inputs are parameters vs user inputs.
+/// What each graph input and each graph output is, positionally parallel
+/// to `graph.inputs` and `graph.outputs`.
 #[derive(Debug, Deserialize)]
 pub struct Signature {
     pub input_specs: Vec<InputSpec>,
     /// Output specs — distinguish real user outputs from the extra outputs
-    /// torch.export's functionalization appends for in-place input mutations
-    /// (e.g. HF StaticCache k/v updates, cumulative_length counters).
+    /// functionalization appends for in-place input mutations (e.g. HF
+    /// StaticCache k/v updates, cumulative_length counters).
     #[serde(default)]
     pub output_specs: Vec<OutputSpec>,
 }
 
-/// An output spec — tagged enum via JSON key. Both mutation kinds are
-/// modeled; user outputs (and anything else) fall through to `Other`.
-/// `{"user_input_mutation": {"arg": {...}, "user_input_name": "cache"}}`
-/// `{"buffer_mutation": {"arg": {...}, "buffer_name": "cache"}}`
+/// An output spec, keyed by its kind:
+/// `{"user_output": {"arg": {...}}}` or
+/// `{"user_input_mutation": {"arg": {...}, "user_input_name": "cache"}}`.
+///
+/// These are the only kinds a program handed over in process has. Any other
+/// kind is refused by name when the program is read, never read as a user
+/// output: a mutation of some other kind would otherwise be returned to the
+/// caller instead of written back.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputSpec {
-    UserInputMutation {
-        user_input_mutation: UserInputMutation,
-    },
-    BufferMutation {
-        buffer_mutation: BufferMutation,
-    },
-    #[allow(dead_code)] // Serde catch-all for untagged enum
-    Other(serde_json::Value),
+    UserOutput(UserOutput),
+    UserInputMutation(UserInputMutation),
+}
+
+/// A leaf the caller receives. `arg` is the leaf as torch spelled it: a
+/// tensor, a symbolic scalar, or a literal (`as_none`, `as_int`, ...).
+#[derive(Debug, Deserialize)]
+pub struct UserOutput {
+    pub arg: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -535,55 +542,26 @@ pub struct UserInputMutation {
     pub user_input_name: String,
 }
 
-/// A mutated module buffer, named by its FQN — the same name the matching
-/// `InputSpec::Buffer` carries, not the buffer's graph input name.
+/// An input spec, keyed by its kind:
+/// `{"user_input": {"arg": {...}}}` or
+/// `{"tensor_constant": {"arg": {"name": ...}, "tensor_constant_name": ...}}`.
+///
+/// These are the only kinds a program handed over in process has:
+/// AOTAutograd lifts a module's parameters and buffers into user inputs, so
+/// a lifted tensor constant is the only input the program holds. Any other
+/// kind is refused by name when the program is read, never read as a user
+/// input.
 #[derive(Debug, Deserialize)]
-pub struct BufferMutation {
-    pub buffer_name: String,
-}
-
-/// An input spec — tagged enum via JSON key.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(rename_all = "snake_case")]
 pub enum InputSpec {
-    Parameter(ParameterInput),
-    Buffer(BufferInput),
-    TensorConstant(TensorConstantInput),
-    UserInput(UserInputSpec),
-    #[allow(dead_code)] // Serde catch-all for untagged enum
-    Other(serde_json::Value),
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ParameterInput {
-    pub parameter: ParameterDetail,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ParameterDetail {
-    pub arg: ParameterArg,
-    pub parameter_name: String,
+    /// Boxed: an `Argument` is several times the size of the other variant.
+    UserInput(Box<UserInputDetail>),
+    TensorConstant(TensorConstantDetail),
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ParameterArg {
     pub name: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BufferInput {
-    pub buffer: BufferDetail,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BufferDetail {
-    pub arg: ParameterArg,
-    pub buffer_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TensorConstantInput {
-    pub tensor_constant: TensorConstantDetail,
 }
 
 #[derive(Debug, Deserialize)]
@@ -593,23 +571,6 @@ pub struct TensorConstantDetail {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct UserInputSpec {
-    pub user_input: UserInputDetail,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct UserInputDetail {
     pub arg: Argument,
-}
-
-/// Weights configuration from model_weights_config.json.
-#[derive(Debug, Deserialize)]
-pub struct WeightsConfig {
-    pub config: HashMap<String, WeightEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct WeightEntry {
-    pub path_name: String,
-    pub tensor_meta: TensorMeta,
 }

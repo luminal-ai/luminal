@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use luminal::prelude::{DynMap, IntExpr};
 
 use crate::pt2_parser::{InputKind, ParsedPT2};
@@ -48,9 +48,8 @@ impl SlotKind {
     }
 }
 
-/// One argument of the program: one placeholder, in call order. Parameters,
-/// buffers and constants a program holds are not arguments and have no
-/// slot.
+/// One argument of the program: one placeholder, in call order. A tensor
+/// constant the program holds is not an argument and has no slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputSlot {
     /// The placeholder's name; empty for a constant argument, which has
@@ -244,36 +243,22 @@ pub fn plan(parsed: &ParsedPT2) -> Result<BoundaryPlan> {
     let operands = parsed.operand_names();
     let definitions = parsed.integer_symbol_definitions();
 
-    // Held inputs (parameters, buffers, constants) are not arguments. A
-    // buffer mutation names its target by module FQN; the boundary binds
-    // by graph input name.
-    let mut held: HashSet<String> = HashSet::new();
-    let mut buffer_graph_names: HashMap<String, String> = HashMap::new();
-    for kind in parsed.classify_inputs() {
-        match kind {
-            InputKind::Parameter { graph_name, .. } => {
-                held.insert(graph_name);
-            }
-            InputKind::Buffer {
-                graph_name,
-                original_name,
-            } => {
-                buffer_graph_names.insert(original_name, graph_name.clone());
-                held.insert(graph_name);
-            }
-            InputKind::UserInput { .. } => {}
-        }
-    }
+    // Held inputs (lifted tensor constants) are not arguments.
+    let held: HashSet<String> = parsed
+        .classify_inputs()
+        .into_iter()
+        .filter_map(|kind| match kind {
+            InputKind::Buffer { graph_name, .. } => Some(graph_name),
+            InputKind::UserInput { .. } => None,
+        })
+        .collect();
 
     // The inputs a mutation writes into are read: the program binds their
     // storage.
     let mut written: HashSet<&str> = HashSet::new();
     for spec in &signature.output_specs {
-        if let OutputSpec::UserInputMutation {
-            user_input_mutation,
-        } = spec
-        {
-            written.insert(user_input_mutation.user_input_name.as_str());
+        if let OutputSpec::UserInputMutation(mutation) = spec {
+            written.insert(mutation.user_input_name.as_str());
         }
     }
 
@@ -294,11 +279,7 @@ pub fn plan(parsed: &ParsedPT2) -> Result<BoundaryPlan> {
         } else {
             // A constant argument: the signature states what it is.
             let kind = match signature.input_specs.get(position) {
-                Some(InputSpec::UserInput(spec)) => constant_kind(&spec.user_input.arg),
-                Some(InputSpec::Other(value)) => value
-                    .get("user_input")
-                    .and_then(|input| input.get("arg"))
-                    .and_then(constant_kind_of_json),
+                Some(InputSpec::UserInput(spec)) => constant_kind(&spec.arg),
                 _ => None,
             };
             (kind.unwrap_or(SlotKind::Object), None)
@@ -321,19 +302,7 @@ pub fn plan(parsed: &ParsedPT2) -> Result<BoundaryPlan> {
     for (position, tref) in graph.outputs.iter().enumerate() {
         let spec = signature.output_specs.get(position);
         let mutation_target = match spec {
-            Some(OutputSpec::UserInputMutation {
-                user_input_mutation,
-            }) => Some(user_input_mutation.user_input_name.clone()),
-            Some(OutputSpec::BufferMutation { buffer_mutation }) => {
-                let buffer_name = &buffer_mutation.buffer_name;
-                let Some(target) = buffer_graph_names.get(buffer_name) else {
-                    bail!(
-                        "mutation output {} targets unknown buffer {buffer_name:?}",
-                        tref.value_name().unwrap_or("?")
-                    );
-                };
-                Some(target.clone())
-            }
+            Some(OutputSpec::UserInputMutation(mutation)) => Some(mutation.user_input_name.clone()),
             _ => None,
         };
 
@@ -355,11 +324,8 @@ pub fn plan(parsed: &ParsedPT2) -> Result<BoundaryPlan> {
         }
 
         // A literal leaf has no value name: the signature states it.
-        if let Some(OutputSpec::Other(spec)) = spec
-            && let Some(kind) = spec
-                .get("user_output")
-                .and_then(|output| output.get("arg"))
-                .and_then(constant_kind_of_json)
+        if let Some(OutputSpec::UserOutput(output)) = spec
+            && let Some(kind) = constant_kind_of_json(&output.arg)
         {
             plan.outputs.push(OutputSlot {
                 graph_name: String::new(),
