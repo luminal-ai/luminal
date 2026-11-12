@@ -148,20 +148,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ),
     ),
     KnownFailure(
-        ticket="LUM-1102",
-        url="https://linear.app/luminalai/issue/LUM-1102/referenceaotbackend-does-not-accept-the-export-mode-option-used-by",
-        reason=("ReferenceAOTBackend does not accept the export_mode option"),
-        tests=(
-            "test_hlir_ops.py::test_conv1d_floor_div_positional_pt2",
-            "test_hlir_ops.py::test_conv1d_no_pad_pt2",
-            "test_hlir_ops.py::test_conv2d_dilation_pt2",
-            "test_hlir_ops.py::test_conv2d_no_pad_pt2",
-            "test_hlir_ops.py::test_conv3d_same_pad_pt2",
-            "test_hlir_ops.py::test_depthwise_multiplier_conv2d_pt2",
-            "test_hlir_ops.py::test_grouped_conv2d_groups3_batch4_pt2",
-        ),
-    ),
-    KnownFailure(
         ticket="LUM-1103",
         url="https://linear.app/luminalai/issue/LUM-1103/runtime-scalar-outputs-item-local-scalar-dense-unbacked-symints",
         reason=(

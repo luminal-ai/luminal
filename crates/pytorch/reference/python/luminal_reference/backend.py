@@ -94,16 +94,6 @@ class CompiledModel:
             model._graph.set_input(name, _tensor_bytes(value), list(value.shape))
         return model
 
-    @property
-    def writeback_inputs(self):
-        return {
-            name: mutation
-            for name, mutation in zip(
-                self._graph.output_names, self._graph.output_mutations
-            )
-            if mutation is not None
-        }
-
     def _bind(self, args: Sequence[Any]) -> list:
         """Bind one call's arguments, one per slot, and return the tensors
         the program reads. Nothing is filtered: an argument the program

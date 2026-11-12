@@ -534,16 +534,6 @@ class CompiledModel:
         self._region_mutations = {}
         self._region_arena = None
 
-    @property
-    def writeback_inputs(self):
-        return {
-            name: mutation
-            for name, mutation in zip(
-                self._graph.output_names, self._graph.output_mutations
-            )
-            if mutation is not None
-        }
-
     def __call__(self, *args: Any) -> Any:
         """The program's output leaves that are tensors or forwarded
         arguments, in order."""

@@ -1,29 +1,14 @@
-"""PT2 export-preparation helpers ported from the legacy luminal_python pipeline.
+"""Graph-preparation helpers for the PyTorch backends.
 
-The reference backend self-exports a Dynamo GraphModule with
-``torch.export.export``.  The legacy backend ran a small set of preprocessing
-passes around that export so the resulting ExportedProgram only contains ops
-the translator lowers (and survives ``torch.export.save``).  This module is the
-new home of those passes:
+AOTAutograd hands a backend functional ATen graphs. These helpers prepare
+one for the Rust translator:
 
-  - DynamicCache <> pytree registration, so ``use_cache=True`` HF models export
-  - scalar graph outputs boxed as rank-zero tensors
-  - the SDPA-preserving decomposition table
-  - the ``sym_sum`` serde workaround
-  - the input-guard / dead data-dependent-op cleanups
+  - a private copy of a graph module that shares its parameters
+  - the decomposition tables: which composites are decomposed while
+    AOTAutograd traces, and which the translator lowers itself
+  - the ``sym_sum`` serializer workaround
+  - the input-guard and dead data-dependent-op cleanups
 """
-
-# ---------------------------------------------------------------------------
-# DynamicCache <> pytree registration
-#
-# Without this, torch.export.export raises when handed an HF model that
-# returns CausalLMOutputWithPast(past_key_values=DynamicCache(...)), which
-# is every model with use_cache=True. The registration mirrors the one in
-# transformers.integrations.executorch.register_dynamic_cache_export_support
-# — same dict-based flatten (key_cache / value_cache lists), same replay via
-# cache.update(k, v, idx), and the matching torch.fx._pytree spec for FX
-# graphs. Done lazily by luminal_reference() so both entry points get it.
-# ---------------------------------------------------------------------------
 
 
 def private_graph_copy(gm):
@@ -47,158 +32,6 @@ def private_graph_copy(gm):
     private = copy.copy(gm)
     private.graph = copy.deepcopy(gm.graph)
     return private
-
-
-def _get_cache_dict(cache):
-    """Flatten a DynamicCache to a dict of parallel key/value lists."""
-    return {
-        "key_cache": [layer.keys for layer in cache.layers if layer.keys is not None],
-        "value_cache": [
-            layer.values for layer in cache.layers if layer.values is not None
-        ],
-    }
-
-
-def flatten_dynamic_cache(cache):
-    """Pytree flatten function for DynamicCache."""
-    import torch
-
-    return torch.utils._pytree._dict_flatten(_get_cache_dict(cache))
-
-
-def unflatten_dynamic_cache(values, context):
-    """Pytree unflatten function for DynamicCache."""
-    import torch
-    from transformers.cache_utils import DynamicCache
-
-    dictionary = torch.utils._pytree._dict_unflatten(values, context)
-    cache = DynamicCache()
-    key_list = dictionary.get("key_cache", [])
-    value_list = dictionary.get("value_cache", [])
-    for idx in range(max(len(key_list), len(value_list))):
-        key = key_list[idx] if idx < len(key_list) else None
-        value = value_list[idx] if idx < len(value_list) else None
-        cache.update(key, value, idx)
-    return cache
-
-
-def flatten_with_keys_dynamic_cache(cache):
-    """Pytree flatten-with-keys function for DynamicCache."""
-    import torch
-
-    return torch.utils._pytree._dict_flatten_with_keys(_get_cache_dict(cache))
-
-
-def _register_cache_serialization():
-    """Register DynamicCache with both torch.utils._pytree and torch.fx._pytree.
-
-    Idempotent: a second call is a no-op. Silently skipped if transformers is
-    not installed.
-    """
-    import torch
-
-    try:
-        from transformers.cache_utils import DynamicCache
-    except ImportError:
-        return
-
-    if DynamicCache in torch.utils._pytree.SUPPORTED_NODES:
-        return
-
-    torch.utils._pytree.register_pytree_node(
-        DynamicCache,
-        flatten_dynamic_cache,
-        unflatten_dynamic_cache,
-        serialized_type_name=f"{DynamicCache.__module__}.{DynamicCache.__name__}",
-        flatten_with_keys_fn=flatten_with_keys_dynamic_cache,
-    )
-    torch.fx._pytree.register_pytree_flatten_spec(
-        DynamicCache,
-        lambda cache, spec: torch.fx._pytree._dict_flatten_spec(
-            _get_cache_dict(cache), spec
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Output-boundary canonicalization
-# ---------------------------------------------------------------------------
-
-
-def _box_scalar_graph_outputs(gm):
-    """Represent backend scalar outputs as typed zero-dimensional tensors.
-
-    Dynamo's backend graph may return SymInt/SymFloat/SymBool values even
-    though Luminal's HLIR is tensor-only. Box those output leaves before the
-    second torch.export capture and remember their flattened output positions;
-    CompiledModel calls ``.item()`` at those positions after execution to
-    restore the backend contract.
-
-    This is an output-boundary canonicalization, not a symbolic-scalar IR:
-    inside Luminal the values remain ordinary typed rank-zero tensors.
-    """
-    import torch
-    from torch._guards import detect_fake_mode
-
-    output = next(node for node in gm.graph.nodes if node.op == "output")
-    flat_outputs, output_spec = torch.utils._pytree.tree_flatten(output.args[0])
-    scalar_output_positions = []
-    compiled_position = 0
-
-    def scalar_dtype(value):
-        if isinstance(value, (torch.SymBool, bool)):
-            return torch.bool
-        if isinstance(value, (torch.SymInt, int)):
-            return torch.int64
-        if isinstance(value, (torch.SymFloat, float)):
-            return torch.float64
-        return None
-
-    boxed_outputs = []
-    for value in flat_outputs:
-        example = (
-            value.meta.get("example_value", value.meta.get("val"))
-            if isinstance(value, torch.fx.Node)
-            else value
-        )
-        if isinstance(example, torch.Tensor):
-            boxed_outputs.append(value)
-            compiled_position += 1
-            continue
-
-        dtype = scalar_dtype(example)
-        if dtype is None:
-            # Non-value outputs such as None remain outside the compiled tensor
-            # output list, matching the existing PT2 parser behavior.
-            boxed_outputs.append(value)
-            continue
-
-        with gm.graph.inserting_before(output):
-            boxed = gm.graph.call_function(
-                torch.ops.aten.scalar_tensor.default, (value,), {"dtype": dtype}
-            )
-        # A graph that is serialized without re-tracing needs the node's
-        # value metadata; a graph that is re-exported regenerates it.
-        fake_mode = detect_fake_mode(
-            [
-                node.meta.get("val")
-                for node in gm.graph.nodes
-                if node.op == "placeholder"
-            ]
-        )
-        if fake_mode is not None:
-            with fake_mode:
-                boxed.meta["val"] = torch.empty((), dtype=dtype)
-        boxed_outputs.append(boxed)
-        scalar_output_positions.append(compiled_position)
-        compiled_position += 1
-
-    if scalar_output_positions:
-        output.args = (torch.utils._pytree.tree_unflatten(boxed_outputs, output_spec),)
-        gm.graph.lint()
-        gm.recompile()
-
-    return tuple(scalar_output_positions)
 
 
 # ---------------------------------------------------------------------------
@@ -493,14 +326,9 @@ def _drop_dead_data_dependent_ops(gm):
 
 __all__ = [
     "_aot_decomposition_table",
-    "_box_scalar_graph_outputs",
     "_decomp_table",
     "_drop_dead_data_dependent_ops",
     "_drop_input_guards",
-    "_get_cache_dict",
     "_lower_sym_sum",
-    "_register_cache_serialization",
-    "flatten_dynamic_cache",
-    "flatten_with_keys_dynamic_cache",
-    "unflatten_dynamic_cache",
+    "private_graph_copy",
 ]

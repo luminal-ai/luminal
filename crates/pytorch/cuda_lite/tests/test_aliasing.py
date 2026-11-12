@@ -222,26 +222,3 @@ def test_returned_view_at_a_storage_offset_is_refused_by_name():
 
     with pytest.raises(Exception, match="storage offset"):
         torch.compile(fn, backend=luminal_cuda_lite.Compiler())(_x())
-
-
-def test_functionalising_without_decomposing_keeps_linear():
-    """The backend relies on ``run_decompositions({})`` functionalising the
-    export while leaving composites such as ``aten.linear`` in place; a torch
-    release that decomposes them anyway changes which programs the translator
-    sees first."""
-
-    class M(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lin = torch.nn.Linear(4, 3)
-
-        def forward(self, x):
-            x.add_(1)
-            return self.lin(x)
-
-    ep = torch.export.export(M(), (torch.zeros(2, 4),)).run_decompositions({})
-    targets = {str(n.target) for n in ep.graph.nodes if n.op == "call_function"}
-    assert "aten.linear.default" in targets
-    kinds = [s.kind.name for s in ep.graph_signature.output_specs]
-    assert "USER_INPUT_MUTATION" in kinds
-    assert not any(t.split(".")[0].endswith("_") for t in targets), targets
