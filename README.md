@@ -11,27 +11,47 @@ Luminal is a high-performance general-purpose inference compiler.
 
 ## Usage
 
+Clone the repo and run a small matrix multiplication on the reference runtime:
+
+```bash
+git clone https://github.com/luminal-ai/luminal
+cd luminal
+cargo run --release -p luminal_reference --example simple
+# Result: [1.0, 2.0, 3.0, 3.0, 2.0, 4.0, 6.0, 6.0, 3.0, 6.0, 9.0, 9.0]
+```
+
+This is the code it runs ([`crates/luminal_reference/examples/simple.rs`](crates/luminal_reference/examples/simple.rs)):
+
 ```rust
+use anyhow::Result;
 use luminal::prelude::*;
-// Create compute graph
-let mut cx = Graph::new();
-let a = cx.tensor(vec![3, 1], DType::F32);
-let b = cx.tensor(vec![1, 4], DType::F32);
+use luminal_reference::ReferenceRuntime;
 
-let c = a.matmul(b).output();
+fn main() -> Result<()> {
+    let mut cx = Graph::new();
+    let a = cx.tensor(vec![3, 1], DType::F32);
+    let b = cx.tensor(vec![1, 4], DType::F32);
+    let c = a.matmul(b);
 
-// Compile
-let mut rt = cx.compile(ReferenceRuntime::default(), CompileOptions::default());
+    // Compile the graph. `runtime.search` instead autotunes it against sample inputs.
+    let mut runtime = ReferenceRuntime::load(&cx)?;
+    runtime.compile(&Default::default(), &Default::default())?;
+    runtime.set_data(a.id, vec![1.0f32, 2.0, 3.0]);
+    runtime.set_data(b.id, vec![1.0f32, 2.0, 3.0, 3.0]);
+    runtime.execute()?;
 
-// Set input tensors
-rt.set_data(a, vec![1.0, 2.0, 3.0]);
-rt.set_data(b, vec![1.0, 2.0, 3.0, 3.0]);
+    println!("Result: {:?}", runtime.get_f32(c.id)?);
+    Ok(())
+}
+```
 
-// Run
-rt.execute(&cx.dyn_map);
+To use Luminal in your own project, depend on it from git. The version on crates.io is out of date and does not match this API.
 
-// Get output tensor
-println!("Result: {:?}", rt.get_f32(c));
+```toml
+[dependencies]
+luminal = { git = "https://github.com/luminal-ai/luminal" }
+luminal_reference = { git = "https://github.com/luminal-ai/luminal" }
+anyhow = "1"
 ```
 
 ## Getting Started
