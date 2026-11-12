@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from luminal_reference import _torch_version
+from luminal_torch_common import _torch_version
 
 
 @pytest.fixture
@@ -34,6 +34,7 @@ def test_accepts_supported_torch(monkeypatch, version, guard_path):
 def test_package_imports_enforce_minimum_before_native_loading():
     root = Path(__file__).resolve().parents[4]
     paths = [
+        root / "crates/pytorch/utils/python",
         root / "crates/pytorch/reference/python",
         root / "crates/pytorch/cuda_lite/python",
     ]

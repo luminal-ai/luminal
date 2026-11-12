@@ -8,9 +8,17 @@ variant, this test fails loudly at CI time — better than a silent
 miscompile at runtime.
 """
 
-# `_torch_dtype_codes` is the pyo3-exported map `{variant_name: pt2_code}`.
-from luminal_reference._luminal import _torch_dtype_codes
+import pytest
 from torch._export.serde.schema import ScalarType
+
+# `_torch_dtype_codes` is the pyo3-exported map `{variant_name: pt2_code}`.
+# The enum lives in the shared Rust crate and the reference extension is the
+# one that exports the map, so the check runs wherever that extension is
+# installed.
+_torch_dtype_codes = pytest.importorskip(
+    "luminal_reference._luminal",
+    reason="the dtype code map is exported by the reference extension",
+)._torch_dtype_codes
 
 
 def test_rust_variants_match_pytorch():

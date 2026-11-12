@@ -80,26 +80,21 @@ def test_static_cache_prefill_smoke(device):
 
 
 def test_writeback_metadata_exposed(device):
-    """The compiled artifact names its write-back outputs and their inputs."""
+    """The compiled program names its write-back outputs and their inputs."""
     config, model = tiny_llama()
     model = model.to(device)
     input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
 
-    captured = []
-
-    def capturing_backend(gm, example_inputs, options=None):
-        compiled = luminal_backend(gm, example_inputs)
-        captured.append(compiled)
-        return compiled
-
+    compiler = Compiler()
     cache = make_static_cache(config, 16, device)
-    compiled_model = torch.compile(model, backend=capturing_backend, fullgraph=True)
+    compiled_model = torch.compile(model, backend=compiler, fullgraph=True)
     with torch.inference_mode():
         static_cache_forward(compiled_model, cache, input_ids)
 
-    (compiled,) = captured
-    writebacks = compiled.writeback_inputs
+    (record,) = compiler.graphs
+    # Each output row names the input it writes back to, or nothing.
+    writebacks = [target for target in record.program._graph.output_mutations if target]
     # 2 layers x (keys, values) index_put mutations + 2 cumulative_length
     # counters = 6 write-back outputs, each bound to a distinct input.
     assert len(writebacks) == 2 * config.num_hidden_layers + config.num_hidden_layers
-    assert len(set(writebacks.values())) == len(writebacks)
+    assert len(set(writebacks)) == len(writebacks)

@@ -4,7 +4,7 @@ from luminal_cuda_lite import Compiler
 compiled = torch.compile(model, backend=Compiler())
 """
 
-from luminal_reference import _torch_version as _torch_version
+from luminal_torch_common import _torch_version as _torch_version
 
 # Validate PyTorch before importing the native extension.
 # isort: split

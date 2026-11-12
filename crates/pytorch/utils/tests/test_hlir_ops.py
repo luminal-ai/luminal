@@ -3,7 +3,7 @@ from collections.abc import Callable
 import pytest
 import torch
 import torch._dynamo
-from backend_test_utils import luminal_backend
+from backend_test_utils import luminal_backend, selected_backend
 from test_models import (
     AcoshTestModel,
     AcosTestModel,
@@ -3161,56 +3161,40 @@ def test_scatter_nd(device: torch.device):
     assert torch.allclose(output, original)
 
 
-def test_input_backed_index_put_mutates_caller_tensor(tmp_path):
+def test_input_backed_index_put_mutates_caller_tensor(device: torch.device):
     """In-place mutation of a graph input is applied back to the caller's
-    tensor and reported in `writeback_inputs`, and only the real user outputs
-    are returned.
+    tensor, and the program's outputs come back in their own positions.
 
     `cache[:, positions] = values; return cache, None` is the sharpest case:
-    the functionalized graph has TWO outputs with the same tensor name — the
-    mutation write-back and the returned user output — so the write-back
-    bookkeeping must key on output position, not name; and the `None` user
-    output (serialized as `as_none`, filtered out of the translator's output
-    list) checks that write-back positions index the tensor-only output
-    space, not raw signature-spec order.
+    the functionalized graph writes the mutated value back into the input
+    and also returns it, so the returned leaf and the write-back are one
+    value; and the `None` leaf has no storage at all, so it must not shift
+    the position of the leaf before it.
     """
-    from luminal_reference.frontend import compile_exported
 
     class InputBackedIndexPut(torch.nn.Module):
         def forward(self, cache, positions, values):
             cache[:, positions] = values
             return cache, None
 
-    exported = torch.export.export(
-        InputBackedIndexPut(),
-        (
-            torch.zeros(2, 4),
-            torch.tensor([1], dtype=torch.int64),
-            torch.ones(2, 1),
-        ),
-        strict=False,
+    compiled = torch.compile(
+        InputBackedIndexPut(), backend=luminal_backend, fullgraph=True
     )
-    # Both real compile paths (pt2.compile and pt2_backend) decompose before
-    # saving; decomposition is also what functionalizes the in-place
-    # `index_put_` into a write-back output declared by the graph signature.
-    exported = exported.run_decompositions()
-    pt2_path = tmp_path / "input_backed_index_put.pt2"
-    torch.export.save(exported, pt2_path)
-    model = compile_exported(torch.export.load(pt2_path))
+    cache = torch.zeros(2, 4, device=device)
+    returned, nothing = compiled(
+        cache,
+        torch.tensor([1], dtype=torch.int64, device=device),
+        torch.ones(2, 1, device=device),
+    )
 
-    assert model.writeback_inputs == {"index_put": "cache"}
-
-    cache = torch.zeros(2, 4)
-    outs = model(cache, torch.tensor([1], dtype=torch.int64), torch.ones(2, 1))
-
-    expected = torch.zeros(2, 4)
+    expected = torch.zeros(2, 4, device=device)
     expected[:, 1] = 1.0
     # The caller's tensor was mutated in place, eager-style.
     assert torch.equal(cache, expected)
-    # Only the user output (the returned cache) comes back — the write-back
-    # output is consumed by the mutation, not returned.
-    assert len(outs) == 1
-    assert torch.equal(outs[0], expected)
+    # The returned cache is the caller's own tensor, and the `None` leaf
+    # stays in its position.
+    assert returned is cache
+    assert nothing is None
 
 
 # ========== Bool-mask index_put correctness tests ==========
@@ -3534,6 +3518,15 @@ def test_conv1d_bias(device: torch.device):
     assert torch.allclose(output, original, atol=1e-4)
 
 
+@pytest.mark.xfail(
+    selected_backend() == "cuda_lite",
+    reason=(
+        "LUM-830: the output is `x.transpose(0, 1) + position`, which eager "
+        "lays out column-major like its first operand; the CUDA backend "
+        "returns eager's layout and has no strided-destination write yet"
+    ),
+    strict=True,
+)
 def test_conv1d_floor_div_positional(device: torch.device):
     """Conv1d stride output uses floor division before positional add."""
     model: torch.nn.Module = Conv1dFloorDivPositionalModel().to(device)

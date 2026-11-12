@@ -1,5 +1,6 @@
 """AOT contract tests: gradients, saved tensors, and runtime parameter binding."""
 
+import luminal_reference
 import pytest
 import torch
 from luminal_reference import Compiler
@@ -217,13 +218,18 @@ def test_symbolic_scalar_outputs_keep_their_python_type():
     The tensor leaves here come from running the graph in eager torch, so
     the test covers the adapter alone, whatever the translator lowers."""
     from functorch.compile import make_boxed_func
-    from luminal_reference.aot_graph import prepare_local_graph
+    from luminal_torch_common.aot_graph import prepare_local_graph
     from torch._dynamo.backends.common import aot_autograd
     from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
 
     def through_adapter(seen):
         def forward(gm, inputs):
-            local = prepare_local_graph(gm, inputs, device_type="cpu")
+            local = prepare_local_graph(
+                gm,
+                inputs,
+                device_type="cpu",
+                boundary_plan=luminal_reference._luminal.boundary_plan,
+            )
 
             def run(*args):
                 # The rows the program would write, taken from eager.
@@ -303,14 +309,19 @@ def test_every_placeholder_and_output_leaf_has_a_slot():
     for it, so its slot is stated and the call's value is never read.
     """
     from functorch.compile import make_boxed_func
-    from luminal_reference.aot_graph import prepare_local_graph
+    from luminal_torch_common.aot_graph import prepare_local_graph
     from torch._dynamo.backends.common import aot_autograd
     from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
 
     def recording(seen):
         def compiler(phase):
             def compile_graph(gm, inputs):
-                seen[phase] = prepare_local_graph(gm, inputs, device_type="cpu")
+                seen[phase] = prepare_local_graph(
+                    gm,
+                    inputs,
+                    device_type="cpu",
+                    boundary_plan=luminal_reference._luminal.boundary_plan,
+                )
                 return make_boxed_func(gm.forward)
 
             return compile_graph
@@ -406,3 +417,32 @@ def test_a_symbolic_float_is_refused_where_a_tensor_op_reads_it():
     )
     with pytest.raises(Exception, match=r"pow\.Tensor_Scalar.*truediv.*FloatTrueDiv"):
         compiled(torch.rand(4, 3, requires_grad=True))
+
+
+def test_search_stand_in_data_is_inside_every_indexed_extent():
+    """AOTAutograd compiles before the first call, so the search executes
+    every candidate on stand-in data, and the reference runtime refuses a
+    read outside a tensor's extent. An integer or boolean argument stands
+    in as zeros: index zero is inside every extent that has an element and
+    an all-false mask selects nothing. A one-row embedding, and a masked
+    scatter whose source is shorter than its mask, compile and match eager.
+    """
+
+    def embed(table, tokens):
+        return torch.nn.functional.embedding(tokens, table)
+
+    table = torch.randn(1, 4)
+    tokens = torch.zeros(3, dtype=torch.int64)
+    compiled = torch.compile(embed, backend=Compiler(), fullgraph=True)
+    torch.testing.assert_close(compiled(table, tokens), embed(table, tokens))
+
+    def scatter(value, mask, source):
+        return torch.masked_scatter(value, mask, source)
+
+    value = torch.tensor([0.0, 1.0, 0.0, 2.0, 3.0, 0.0])
+    mask = torch.tensor([False, True, False, True, True, False])
+    source = torch.tensor([9.0, 8.0, 7.0])
+    compiled = torch.compile(scatter, backend=Compiler(), fullgraph=True)
+    torch.testing.assert_close(
+        compiled(value, mask, source), scatter(value, mask, source)
+    )

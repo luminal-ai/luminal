@@ -1,11 +1,10 @@
 """AOTAutograd graph preparation shared by the PyTorch backends.
 
 AOTAutograd owns differentiation and hands a backend one functional ATen graph
-per phase: forward, backward, or inference. The reference and CUDA backends
-feed each graph through the same two steps here before their native runtimes
-see it.
+per phase: forward, backward, or inference. Every backend feeds each graph
+through the same two steps here before its native runtime sees it.
 
-1. ``export_local_graph`` writes the whole graph, in process, as the JSON
+1. ``lower_local_graph`` writes the whole graph, in process, as the JSON
    document the Rust translator reads: the graph module of a PT2 program,
    with every placeholder and every output leaf. No ``ExportedProgram`` is
    built and nothing is saved to disk. torch's own serializer writes the
@@ -15,8 +14,9 @@ see it.
    (AOTAutograd's trailing ``copy_`` when a backend asks for
    ``keep_inference_input_mutations``) becomes the ``user_input_mutation``
    output spec ``torch.export`` would have written.
-2. ``prepare_local_graph`` asks the Rust side for the graph's boundary and
-   keeps it as slots. torch calls a compiled graph with one value per
+2. ``prepare_local_graph`` asks the Rust side for the graph's boundary,
+   through the ``boundary_plan`` function of the backend's own extension,
+   and keeps it as slots. torch calls a compiled graph with one value per
    placeholder and expects one value per output leaf, in order; a slot is
    one of those positions, and its kind is the type of that value: a
    tensor, an ``int``, a ``float``, a ``bool``, or any other object. Which
@@ -29,13 +29,14 @@ split by the application so that each compiled graph is collective-free.
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
-from .export_utils import (
+from .graph_prep import (
     _drop_dead_data_dependent_ops,
     _lower_sym_sum,
     private_graph_copy,
@@ -210,12 +211,12 @@ class LocalGraph:
     ``input_slots`` has one entry per placeholder and ``output_slots`` one
     per output leaf, in torch's order; ``written`` has one row per tensor
     the program writes, ``(name, mutation target, returned)``. All three are
-    the Rust plan's. ``export_inputs`` holds the example value of every
+    the Rust plan's. ``example_inputs`` holds the example value of every
     placeholder and ``leaf_values`` the traced value of every output leaf.
     """
 
     program: Any
-    export_inputs: list
+    example_inputs: list
     input_slots: tuple
     output_slots: tuple
     leaf_values: list
@@ -230,7 +231,7 @@ class LocalGraph:
         """The example value of each argument the program reads."""
         return [
             value
-            for slot, value in zip(self.input_slots, self.export_inputs)
+            for slot, value in zip(self.input_slots, self.example_inputs)
             if slot.read or slot.symbol is not None
         ]
 
@@ -257,7 +258,7 @@ class LocalGraph:
         a call needs beside the compiled program."""
         return LocalGraph(
             program=None,
-            export_inputs=[],
+            example_inputs=[],
             input_slots=self.input_slots,
             output_slots=self.output_slots,
             leaf_values=[],
@@ -314,8 +315,15 @@ class LocalGraph:
         return tree_unflatten(result, self.spec)
 
 
-def prepare_local_graph(gm, inputs, *, device_type: str) -> LocalGraph:
+def prepare_local_graph(
+    gm, inputs, *, device_type: str, boundary_plan: Callable[[bytes], tuple]
+) -> LocalGraph:
     """Lower one AOTAutograd graph and state its boundary as slots.
+
+    ``boundary_plan`` is the backend extension's function of that name: it
+    reads the lowered program and returns its argument slots, output leaves
+    and written rows. Every backend's extension builds it from the same
+    Rust code, so the slots do not depend on the backend.
 
     The graph is written whole, and the Rust side reads its boundary off
     that: one slot per placeholder and per output leaf. Nothing here decides
@@ -323,10 +331,8 @@ def prepare_local_graph(gm, inputs, *, device_type: str) -> LocalGraph:
     nothing is read from it; an argument the program does not read is not
     looked at.
     """
-    from . import _luminal
-
-    program, export_inputs, scalar_leaves = export_local_graph(gm, inputs)
-    arguments, leaves, written = _luminal.boundary_plan(program.program_json())
+    program, example_inputs, scalar_leaves = lower_local_graph(gm, inputs)
+    arguments, leaves, written = boundary_plan(program.program_json())
     slots = input_slots(arguments)
     if len(slots) != len(inputs):
         raise RuntimeError(
@@ -367,7 +373,7 @@ def prepare_local_graph(gm, inputs, *, device_type: str) -> LocalGraph:
 
     return LocalGraph(
         program=program,
-        export_inputs=export_inputs,
+        example_inputs=example_inputs,
         input_slots=slots,
         output_slots=tuple(output_slots),
         leaf_values=[
@@ -614,15 +620,13 @@ class LoweredGraph:
     placeholders, input mutations as outputs. ``graph_signature`` is torch's
     signature object used as plain data; ``constants`` holds each lifted
     tensor constant by name. The fields carry the names an
-    ``ExportedProgram`` gives them, so the backends' boundary code reads
-    either.
+    ``ExportedProgram`` gives the same things.
     """
 
     graph_module: torch.fx.GraphModule
     graph_signature: Any
     constants: dict
     range_constraints: dict
-    state_dict: dict = field(default_factory=dict)
     _json: bytes | None = field(default=None, repr=False)
 
     def program_json(self) -> bytes:
@@ -685,7 +689,7 @@ def _lift_input_mutations(gm) -> list:
     return mutations
 
 
-def export_local_graph(gm, example_inputs) -> tuple:
+def lower_local_graph(gm, example_inputs) -> tuple:
     """Lower one AOTAutograd graph to the form the Rust translator reads,
     without re-tracing and without an ``ExportedProgram``.
 

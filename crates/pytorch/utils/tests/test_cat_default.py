@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from backend_test_utils import compile_for_test, selected_backend
+from backend_test_utils import _shapes_spec, compile_for_test, selected_backend
 
 
 @pytest.mark.parametrize("sizes", [(3, 2), (0, 2), (3, 0), (0, 0)])
@@ -19,23 +19,30 @@ def test_cat_omitted_default_dimension(sizes):
 
 
 def _compile_cat(model, inputs, *, dynamic_shapes=None):
-    # Default decompositions can remove empty operands and insert promotion casts.
-    # Keep aten.cat intact so these cases actually reach our translator.
+    """Compile through the backend's own path, where ``aten.cat`` reaches
+    the translator whole. Every core decomposition would remove empty
+    operands and insert promotion casts first, and these cases are about
+    what the translator does with them."""
     import importlib
 
-    from backend_test_utils import selected_backend
-    from luminal_reference.export_utils import _drop_input_guards
+    compiler = importlib.import_module(f"luminal_{selected_backend()}").Compiler()
+    shapes = (
+        {"dynamic_shapes": _shapes_spec(model, inputs, dynamic_shapes)}
+        if dynamic_shapes
+        else {"dynamic": False}
+    )
+    compiled = torch.compile(
+        model, backend=compiler, fullgraph=True, isolate_recompiles=True, **shapes
+    )
 
-    program = torch.export.export(
-        model, inputs, dynamic_shapes=dynamic_shapes, strict=False
-    )
-    _drop_input_guards(program)
-    program = program.run_decompositions({})
-    assert any(
-        node.target == torch.ops.aten.cat.default for node in program.graph.nodes
-    )
-    backend = importlib.import_module(f"luminal_{selected_backend()}.backend")
-    return backend.compile_exported(program, inputs, search_iterations=1)
+    def run(*args):
+        result = compiled(*args)
+        assert any(
+            "aten.cat.default" in record.targets for record in compiler.graphs
+        ), "aten.cat was decomposed before it reached the translator"
+        return (result,)
+
+    return run
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.complex64])

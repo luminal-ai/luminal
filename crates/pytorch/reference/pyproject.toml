@@ -3,8 +3,9 @@ name = "luminal_reference"
 version = "0.1.0"
 description = "Luminal reference (CPU) torch.compile backend"
 requires-python = ">=3.10"
+# luminal_torch_common: the torch.compile frontend every backend shares.
 # numpy: `_tensor_bytes` stages a tensor through `.numpy().tobytes()`.
-dependencies = ["torch>=2.14.0", "numpy>=2.0.2", "packaging>=23"]
+dependencies = ["torch>=2.14.0", "numpy>=2.0.2", "luminal_torch_common"]
 
 # PyTorch 2.14 wheels require the CUDA 13.0 index; cu128 stops before 2.14.
 [[tool.uv.index]]
@@ -16,6 +17,7 @@ explicit = true
 torch = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
+luminal_torch_common = { path = "../utils", editable = true }
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

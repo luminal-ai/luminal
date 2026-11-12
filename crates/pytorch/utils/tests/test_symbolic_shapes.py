@@ -26,40 +26,52 @@ def test_symbolic_shape_expressions(slice_output):
         torch.testing.assert_close(actual, model(x))
 
 
-def test_unknown_symbolic_expression_does_not_freeze_hint(tmp_path):
+def test_unknown_symbolic_expression_does_not_freeze_hint(device, monkeypatch):
+    """A dimension written with a sympy function the translator does not
+    read must fail translation. Falling back to the size the example call
+    happened to have would freeze a dynamic dimension."""
     import importlib
     import json
-    import zipfile
 
-    from backend_test_utils import selected_backend
-
-    class Model(torch.nn.Module):
-        def forward(self, x):
-            return x + 1
-
-    program = torch.export.export(
-        Model(),
-        (torch.ones(8, 4),),
-        dynamic_shapes=({0: torch.export.Dim("rows", min=6, max=24)},),
+    from backend_test_utils import (
+        luminal_backend,
+        record_lowered_graphs,
+        selected_backend,
     )
-    original, altered = tmp_path / "original.pt2", tmp_path / "altered.pt2"
-    torch.export.save(program, original)
+    from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
+
+    def model(x):
+        return x + 1
+
+    lowered = record_lowered_graphs(monkeypatch)
+    rows = ShapeVar("rows", min=6, max=24, optimization_hint=8)
+    compiled = torch.compile(
+        model,
+        backend=luminal_backend,
+        dynamic_shapes=ShapesSpec(params={"x": TensorSpec([rows, 4])}),
+    )
+    x = torch.ones(8, 4, device=device)
+    torch.testing.assert_close(compiled(x), model(x))
+
+    # The program as it was handed to the translator, with the dynamic
+    # extent rewritten into a function the translator does not know.
+    (program,) = lowered
+    payload = json.loads(program.program_json())
     changed = False
-    with zipfile.ZipFile(original) as source, zipfile.ZipFile(altered, "w") as target:
-        for entry in source.infolist():
-            data = source.read(entry.filename)
-            if entry.filename.endswith(".json"):
-                payload = json.loads(data)
-                if isinstance(payload, dict) and "graph_module" in payload:
-                    metadata = payload["graph_module"]["graph"]["tensor_values"]
-                    expression = metadata["x"]["sizes"][0]["as_expr"]
-                    expression["expr_str"] = (
-                        "UnsupportedShapeFunction(" + expression["expr_str"] + ")"
-                    )
-                    changed = True
-                    data = json.dumps(payload).encode()
-            target.writestr(entry, data)
-    assert changed
+    for meta in payload["graph_module"]["graph"]["tensor_values"].values():
+        for size in meta["sizes"]:
+            if "as_expr" in size:
+                expression = size["as_expr"]
+                expression["expr_str"] = (
+                    "UnsupportedShapeFunction(" + expression["expr_str"] + ")"
+                )
+                changed = True
+    assert changed, "the program states no dynamic extent"
+    altered = json.dumps(payload).encode()
+
     native = importlib.import_module(f"luminal_{selected_backend()}._luminal")
+    # The CUDA entry also takes the boundary layouts, which translation
+    # never reaches here.
+    layouts = ([], [], []) if selected_backend() == "cuda_lite" else ()
     with pytest.raises(RuntimeError, match="cannot resolve"):
-        native.compile(str(altered))
+        native.compile_graph(altered, *layouts)

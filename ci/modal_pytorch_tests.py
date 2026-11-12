@@ -26,7 +26,7 @@ def create_app(backend: str, local_project_dir: Path):
     LOCAL_PROJECT_DIR = Path(local_project_dir).resolve()
     PROJECT_DIR = "/root/luminal/crates/pytorch"
     VENV_PATH = f"/root/.cache/luminal/uv-project-environments/luminal-{backend}"
-    SRC_PATH = f"{PROJECT_DIR}/reference/python:{PROJECT_DIR}/cuda_lite/python:{PROJECT_DIR}/utils/tests:{PROJECT_DIR}"
+    SRC_PATH = f"{PROJECT_DIR}/utils/python:{PROJECT_DIR}/reference/python:{PROJECT_DIR}/cuda_lite/python:{PROJECT_DIR}/utils/tests:{PROJECT_DIR}"
     PROFILE_VOLUME_NAME = "luminal-pytest-profiling"
     PROFILE_VOLUME_PATH = "/root/pytest-profile-artifacts"
     PROFILE_LOCAL_DEFAULT_ROOT = "luminal_artifacts/pytest-profiling"
@@ -155,24 +155,22 @@ def create_app(backend: str, local_project_dir: Path):
             return
 
     def _build_extensions(env: dict[str, str]) -> None:
-        for extension in (
-            ("reference", "cuda_lite") if backend == "cuda_lite" else ("reference",)
-        ):
-            cmd = [
-                "uv",
-                "run",
-                "--project",
-                f"{PROJECT_DIR}/{backend}",
-                "--group",
-                "dev",
-                "maturin",
-                "develop",
-                "--manifest-path",
-                f"{PROJECT_DIR}/{extension}/Cargo.toml",
-                "--profile",
-                "release",
-            ]
-            subprocess.run(cmd, env=env, cwd=PROJECT_DIR, check=True)
+        # A backend needs its own extension and nothing from another one.
+        cmd = [
+            "uv",
+            "run",
+            "--project",
+            f"{PROJECT_DIR}/{backend}",
+            "--group",
+            "dev",
+            "maturin",
+            "develop",
+            "--manifest-path",
+            f"{PROJECT_DIR}/{backend}/Cargo.toml",
+            "--profile",
+            "release",
+        ]
+        subprocess.run(cmd, env=env, cwd=PROJECT_DIR, check=True)
 
     def _effective_timeout(timeout: int) -> int:
         if os.environ.get("GITHUB_ACTIONS") == "true" and timeout < DEFAULT_TIMEOUT:

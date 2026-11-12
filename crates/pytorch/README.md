@@ -1,8 +1,10 @@
 # PyTorch backends
 
-This directory contains backend-specific Python packages and shared validation.
-There is no `luminal` Python package. `utils/` is a Rust crate used to translate
-PT2 exports; Python does not import it.
+This directory contains backend-specific Python packages and what they share.
+There is no `luminal` Python package. `utils/` holds the shared parts: a Rust
+crate that translates the program a backend hands it, the Python package
+`luminal_torch_common` with the `torch.compile` frontend, and the shared
+tests. A backend depends on `utils/`, never on another backend.
 
 ```python
 import torch
@@ -35,8 +37,7 @@ uv run --project reference --group dev pytest -c reference/pyproject.toml refere
 
 Test ownership:
 
-- `reference/tests`: CPU runtime, host-buffer boundaries, export/region APIs,
-  and AOTAutograd.
+- `reference/tests`: CPU runtime, host-buffer boundaries, and AOTAutograd.
 - `cuda_lite/tests`: CUDA runtime, layouts, streams, capture, and CUDA-specific
   model regressions.
 - `utils/tests`: PT2 translator operation, dtype, shape, and composite-lowering
@@ -46,7 +47,7 @@ Test ownership:
   executes them on CPU; the CUDA runner explicitly includes them on CUDA.
 
 `./reference/run_tests.sh` builds reference and runs its tests plus translator
-parity. `./cuda_lite/run_tests.sh` builds both extensions and runs CUDA tests,
+parity. `./cuda_lite/run_tests.sh` builds CUDA and runs CUDA tests,
 translator parity, and shared model cases. Extra pytest arguments are forwarded,
 for example `-m 'not slow'`.
 
@@ -100,9 +101,32 @@ PT2 test harness does not currently supply. Their dtype contracts can still be
 checked during translation and saturation. PyTorch CPU also rejects non-scalar
 Boolean scans with explicit `dtype=torch.bool`.
 
-## Internal region artifacts
+## Adding a backend
 
-Region export, compilation, serialization, and artifact caching are internal
-implementation helpers tested by the backend suites. Users compile models with
-`torch.compile(model, backend=Compiler(...))`, which preserves PyTorch output
-structures.
+Every backend enters through the same point: it is a `torch.compile` backend
+built on AOTAutograd, and it compiles one functional ATen graph per phase.
+The frontend is shared and the rest is the backend's own.
+
+Shared, in `utils/`:
+
+- `luminal_torch_common.aot_graph` lowers a graph in process to the program
+  the translator reads, and states its boundary as slots: one per placeholder
+  and one per output leaf, as PyTorch calls it.
+- `luminal_torch_common.graph_prep` holds the decomposition table AOTAutograd
+  applies while it traces.
+- The Rust crate `luminal_pytorch_utils` translates that program to a Luminal
+  graph and computes the boundary plan.
+
+Owned by each backend, with no shared base class:
+
+- A native extension that exposes `compile_graph` and `boundary_plan`, both
+  built on `luminal_pytorch_utils`.
+- `backend.py`: the compiled-model class, which binds a call's arguments to
+  the runtime and returns the rows the program wrote.
+- `aot.py`: the AOTAutograd backend and its `OutputCode`, which says how a
+  compiled graph is called, saved and loaded. Saving is the backend's own
+  format.
+
+`reference/python/luminal_reference` is the smallest complete example. A
+backend passes its extension's `boundary_plan` to
+`aot_graph.prepare_local_graph`; nothing in `utils/` imports a backend.

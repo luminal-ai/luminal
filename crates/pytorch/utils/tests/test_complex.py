@@ -549,9 +549,7 @@ def _assert_parts_close(actual, expected, *, zero_signs):
 
 
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float64), ids=str)
-def test_sqrt_angle_and_log_take_the_side_of_the_cut_from_a_signed_zero(
-    stage_one_only, dtype
-):
+def test_sqrt_angle_and_log_take_the_side_of_the_cut_from_a_signed_zero(dtype):
     """On the negative real axis the sign of a zero imaginary part picks the
     side of the branch cut: sqrt(-4 +- 0j) = +-2j, and angle and log's
     imaginary part are +-pi. These copy the sign of `imag` onto a magnitude;
@@ -576,9 +574,7 @@ class InverseCosines(torch.nn.Module):
 
 
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float64), ids=str)
-def test_acos_and_acosh_take_the_side_of_the_cut_from_a_signed_zero(
-    stage_one_only, dtype
-):
+def test_acos_and_acosh_take_the_side_of_the_cut_from_a_signed_zero(dtype):
     """acos(+-2 +- 0j) has imaginary part -+acosh(2), and acosh's imaginary
     part copies the sign of the zero onto acos(beta). Both are copysign onto
     a nonzero magnitude, which the old `|m| * sign(+-0)` flattened to 0."""

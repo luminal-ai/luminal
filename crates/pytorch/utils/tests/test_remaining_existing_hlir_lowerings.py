@@ -1497,7 +1497,6 @@ class PoolingAndResize(torch.nn.Module):
             adaptive_values,
             adaptive_indices,
             max_backward,
-            torch.ops.aten.upsample_bilinear2d.vec(value, [7, 5], False, None),
             torch.ops.aten._upsample_bilinear2d_aa.default(
                 value, [2, 3], False, None, None
             ),
@@ -1512,6 +1511,20 @@ def test_pooling_and_bilinear_resize_composites() -> None:
     value = torch.randn(1, 2, 4, 5)
     module = PoolingAndResize()
     _check(module, value)
+
+
+class BilinearResize(torch.nn.Module):
+    def forward(self, value):
+        return torch.ops.aten.upsample_bilinear2d.vec(value, [7, 5], False, None)
+
+
+def test_bilinear_resize_composite() -> None:
+    # torch decomposes this op before any backend sees it, into two gathers
+    # per axis whose upper index is `floor(coordinate) + 1`: an Int64 add on
+    # a value cast from a float.
+    torch.manual_seed(1)
+    value = torch.randn(1, 2, 4, 5)
+    _check(BilinearResize(), value)
 
 
 class MaxPoolBackward(torch.nn.Module):

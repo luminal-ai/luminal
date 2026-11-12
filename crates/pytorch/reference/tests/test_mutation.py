@@ -5,14 +5,11 @@ tensor, and a model that returns the mutated input returns the SAME storage
 (``data_ptr`` unchanged).
 """
 
-import os
-import tempfile
 from typing import Any, Tuple
 
 import luminal_reference
 import torch
 import torch.nn as nn
-from luminal_reference.backend import CompiledModel, _tensor_bytes
 
 
 class InPlaceAdd(nn.Module):
@@ -140,57 +137,4 @@ def test_buffer_mutation() -> None:
     assert torch.allclose(out, eager, atol=1e-5)
     assert torch.allclose(model.cache, eager_model.cache, atol=1e-5), (
         f"buffer not mutated: {model.cache} != {eager_model.cache}"
-    )
-
-
-def test_buffer_mutation_spec_writes_back() -> None:
-    """The functionalized export: the mutation leaves as an extra output tagged
-    ``buffer_mutation``, which is written back into the buffer, not returned."""
-    torch.manual_seed(0)
-    x = torch.randn(4)
-
-    eager_model = BufferAdd()
-    eager = eager_model(x.clone())
-
-    # The training IR keeps `aten.add_`; decomposing functionalizes it into the
-    # extra output this test is about.
-    ep = torch.export.export(BufferAdd(), (x.clone(),)).run_decompositions()
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "model.pt2")
-        torch.export.save(ep, path)
-        graph = luminal_reference._luminal.compile(path)
-
-    names = list(graph.input_names)
-    kinds = list(graph.input_kinds)
-    parameter_names = list(graph.parameter_names)
-    buffers = [name for name, kind in zip(names, kinds) if kind == "buffer"]
-    assert len(buffers) == 1, f"expected one buffer input, got {buffers}"
-    buffer_input = buffers[0]
-
-    mutations = list(graph.output_mutations)
-    assert buffer_input in mutations, f"no output writes the buffer: {mutations}"
-    assert not graph.output_returns[mutations.index(buffer_input)], (
-        "a writeback is not part of the returned pytree"
-    )
-
-    # Stage the boundary the way the torch.compile entry point does.
-    user_inputs = [x.clone()]
-    held: dict = {}
-    user_index = 0
-    for name, kind, parameter_name in zip(names, kinds, parameter_names):
-        if kind == "user_input":
-            value = user_inputs[user_index]
-            user_index += 1
-        else:
-            value = ep.state_dict[parameter_name]
-            held[name] = value
-        graph.set_input(name, _tensor_bytes(value), list(value.shape))
-    graph.search(None)
-
-    out = CompiledModel(graph, ep, held=held)(*user_inputs)
-
-    assert len(out) == 1, f"the model returns one tensor, got {len(out)}"
-    assert torch.allclose(out[0], eager, atol=1e-5)
-    assert torch.allclose(ep.state_dict["cache"], eager_model.cache, atol=1e-5), (
-        f"buffer not written back: {ep.state_dict['cache']} != {eager_model.cache}"
     )

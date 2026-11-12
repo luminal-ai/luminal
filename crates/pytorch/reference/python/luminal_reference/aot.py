@@ -16,18 +16,19 @@ from functools import partial
 from typing import Any
 
 import torch
-from torch._dynamo.backends.common import aot_autograd
-from torch._inductor.output_code import OutputCode
-
-from .aot_graph import (
+from luminal_torch_common.aot_graph import (
     GraphRecord,
     LocalGraph,
     prepare_local_graph,
     refuse_collectives,
 )
+from luminal_torch_common.dimensions import profile_value
+from luminal_torch_common.graph_prep import _aot_decomposition_table
+from torch._dynamo.backends.common import aot_autograd
+from torch._inductor.output_code import OutputCode
+
+from . import _luminal
 from .backend import _compile_local_graph, load_compiled, save_compiled
-from .dimensions import profile_value
-from .export_utils import _aot_decomposition_table
 
 __all__ = ["GraphRecord", "ReferenceAOTBackend", "ReferenceOutputCode"]
 
@@ -91,6 +92,28 @@ class ReferenceOutputCode(OutputCode):
         """Part of the ``OutputCode`` interface; there is nothing to bundle."""
 
 
+def _stand_in(value: torch.Tensor) -> torch.Tensor:
+    """The data the search executes candidates on in place of an argument
+    torch describes without data.
+
+    AOTAutograd compiles ahead of the first call, so an argument has a
+    shape, strides and a dtype, and no values. The search still executes
+    every candidate, and the reference runtime refuses a read outside a
+    tensor's extent, so the stand-in has to be data the program accepts.
+    Integer and boolean tensors are the ones that index and select: zero
+    is inside every extent that has an element, and an all-false mask
+    selects nothing. A floating-point tensor is ones.
+    """
+    stand_in = torch.empty_strided(
+        tuple(profile_value(d) for d in value.shape),
+        tuple(profile_value(d) for d in value.stride()),
+        dtype=value.dtype,
+        device="cpu",
+    )
+    indexes_or_selects = not (value.dtype.is_floating_point or value.dtype.is_complex)
+    return stand_in.fill_(0 if indexes_or_selects else 1)
+
+
 def _compile_graph(
     gm,
     inputs,
@@ -100,7 +123,9 @@ def _compile_graph(
     max_intermediate_bytes=None,
     memory_budget_bytes=None,
 ):
-    local = prepare_local_graph(gm, inputs, device_type="cpu")
+    local = prepare_local_graph(
+        gm, inputs, device_type="cpu", boundary_plan=_luminal.boundary_plan
+    )
 
     compiled = None
     if local.computes:
@@ -121,17 +146,12 @@ def _compile_graph(
             # staged: a tensor at its profiling shape, an integer at its
             # traced value.
             examples = [
-                torch.empty_strided(
-                    tuple(profile_value(d) for d in v.shape),
-                    tuple(profile_value(d) for d in v.stride()),
-                    dtype=v.dtype,
-                    device="cpu",
-                ).fill_(1)
+                _stand_in(v)
                 if slot.kind == "tensor" and slot.read
                 else profile_value(v)
                 if slot.symbol is not None
                 else None
-                for slot, v in zip(local.input_slots, local.export_inputs)
+                for slot, v in zip(local.input_slots, local.example_inputs)
             ]
             compiled = _compile_local_graph(
                 local.program,
@@ -154,6 +174,11 @@ class ReferenceAOTBackend:
     inference. No local computation falls back to eager PyTorch, and a graph
     that contains collective operations is refused.
     """
+
+    # The decomposition table AOTAutograd applies while it traces: the
+    # translator's own vocabulary. A test that wants every core
+    # decomposition applied overrides this on a subclass.
+    decompositions = staticmethod(_aot_decomposition_table)
 
     def __init__(
         self,
@@ -186,7 +211,7 @@ class ReferenceAOTBackend:
             inference_compiler=partial(self._compile, phase="inference"),
             # Decompose once, while AOTAutograd traces: the graph the local
             # compiler receives is already in the translator's vocabulary.
-            decompositions=_aot_decomposition_table,
+            decompositions=self.decompositions,
             # An input mutation stays in the graph as a trailing ``copy_``
             # and becomes a mutation output the runtime writes in place;
             # AOTAutograd's epilogue then has nothing to copy back.

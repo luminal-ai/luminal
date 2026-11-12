@@ -285,7 +285,7 @@ def test_sign_and_sgn_are_exact_at_ieee_edges(device, op, dtype):
     (torch.erf, torch.erfc, torch.nn.functional.gelu),
     ids=("erf", "erfc", "gelu"),
 )
-def test_erf_family_is_odd_through_an_exact_sign(stage_one_only, device, op):
+def test_erf_family_is_odd_through_an_exact_sign(device, op):
     """erf multiplies its magnitude by the core `sign()`, and gelu is built
     on erf. The old `x / (|x| + 1e-10)` was NaN at +-inf (inf / inf), so
     erf(+-inf), erfc(+-inf) and gelu(inf) were NaN."""
@@ -298,9 +298,7 @@ def test_erf_family_is_odd_through_an_exact_sign(stage_one_only, device, op):
 @pytest.mark.parametrize(
     "op", (torch.atan, torch.asinh, torch.asin), ids=("atan", "asinh", "asin")
 )
-def test_odd_inverse_functions_carry_the_input_sign_at_ieee_edges(
-    stage_one_only, device, op
-):
+def test_odd_inverse_functions_carry_the_input_sign_at_ieee_edges(device, op):
     """These lowerings compute a magnitude from |x| and copy the sign of x
     back on. Multiplying by an approximate sign gave NaN at +-inf and lost
     a tiny input (atan(1e-30) was ~1e-50)."""
@@ -325,9 +323,7 @@ def test_odd_inverse_functions_carry_the_input_sign_at_ieee_edges(
     ),
     ids=("float32", "float64", "int64", "empty"),
 )
-def test_angle_of_a_real_input_is_pi_below_zero_and_plus_zero_otherwise(
-    stage_one_only, device, x
-):
+def test_angle_of_a_real_input_is_pi_below_zero_and_plus_zero_otherwise(device, x):
     """Real torch.angle is pi for x < 0 (-inf and negative subnormals
     included), +0 for every other ordered value (both zeros: unlike
     atan2(0, -0.0) = pi), and NaN for NaN. It used to be 0 everywhere."""

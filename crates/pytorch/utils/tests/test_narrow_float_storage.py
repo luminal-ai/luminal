@@ -79,7 +79,7 @@ EXACT_OPS = (
 
 @pytest.mark.parametrize("dtype", NARROW)
 @pytest.mark.parametrize("fn", EXACT_OPS)
-def test_exact_ops_on_narrow_storage_match_bitwise(stage_one_only, fn, dtype):
+def test_exact_ops_on_narrow_storage_match_bitwise(fn, dtype):
     model = Unary(fn)
     x = _values(dtype)
     compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
@@ -90,9 +90,7 @@ def test_exact_ops_on_narrow_storage_match_bitwise(stage_one_only, fn, dtype):
 @pytest.mark.parametrize(
     "target", (torch.int8, torch.int16, torch.uint8, torch.int32, torch.int64)
 )
-def test_narrow_float_to_integer_truncates_the_stored_value(
-    stage_one_only, dtype, target
-):
+def test_narrow_float_to_integer_truncates_the_stored_value(dtype, target):
     model = Unary(lambda x: x.to(target))
     finite = _values(dtype)
     finite = finite[torch.isfinite(finite) & (finite.abs() < 100)]
@@ -112,7 +110,7 @@ def test_narrow_float_to_integer_truncates_the_stored_value(
         pytest.param(torch.float64, id="float64"),
     ),
 )
-def test_abs_clears_the_sign_of_negative_zero(stage_one_only, dtype):
+def test_abs_clears_the_sign_of_negative_zero(dtype):
     """A float's magnitude clears its sign bit at every width."""
     model = Unary(torch.abs)
     x = torch.tensor([-0.0, 0.0, -1.5, float("-inf")], dtype=dtype)
@@ -152,7 +150,7 @@ ORDERING_OPS = (
 
 @pytest.mark.parametrize("dtype", NARROW)
 @pytest.mark.parametrize("fn", ORDERING_OPS)
-def test_ordering_ops_on_narrow_storage_match_bitwise(stage_one_only, fn, dtype):
+def test_ordering_ops_on_narrow_storage_match_bitwise(fn, dtype):
     """Sorting, selecting and comparing are exact: the widened graph returns
     torch's values and indices bit for bit."""
     model = Unary(fn)
@@ -204,7 +202,7 @@ ACCUMULATING_OPS = (
 
 @pytest.mark.parametrize("dtype", NARROW)
 @pytest.mark.parametrize("fn", ACCUMULATING_OPS)
-def test_accumulations_into_narrow_storage_round_each_step(stage_one_only, fn, dtype):
+def test_accumulations_into_narrow_storage_round_each_step(fn, dtype):
     """Each accumulation step computes in F32 and rounds to the storage
     dtype, as torch's sequential CPU kernels do."""
     model = Accumulate(fn)
@@ -217,7 +215,7 @@ def test_accumulations_into_narrow_storage_round_each_step(stage_one_only, fn, d
 
 
 @pytest.mark.parametrize("dtype", NARROW)
-def test_histc_counts_into_narrow_storage(stage_one_only, dtype):
+def test_histc_counts_into_narrow_storage(dtype):
     model = Unary(lambda x: torch.histc(x, bins=4, min=0, max=3))
     x = torch.tensor([0.0, 1.0, 1.0, 3.0, 2.0, 1.0, 0.0], dtype=dtype)
     compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)

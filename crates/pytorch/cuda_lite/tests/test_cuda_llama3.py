@@ -4,8 +4,6 @@ import torch._dynamo
 from luminal_cuda_lite import Compiler
 from reference.tests.models.test_llama3 import _assert_bf16_logits_match
 
-luminal_backend = Compiler()
-
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -72,31 +70,34 @@ def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
     """Explicitly marking the token sequence dim dynamic should be honored end to end.
 
     This exercises the real user path:
-      1. wrap the pretrained 8B model with ``torch.compile(..., backend=luminal_backend)``
+      1. wrap the pretrained 8B model with ``torch.compile(..., backend=Compiler())``
       2. mark ``input_ids.shape[1]`` dynamic before the first invocation
       3. verify the first backend trace is already dynamic on that axis
       4. reuse the same compiled graph for multiple sequence lengths
     """
-    import copy
-
-    from luminal_reference.export_helpers import (
-        _build_dynamic_shapes_from_gm,
-        _strip_symint_placeholders,
-    )
     from transformers import AutoConfig, LlamaForCausalLM
 
+    compiler = Compiler()
     backend_invocations = []
-    capture = {}
+    first_trace_axes = []
 
     def inspector_backend(gm, example_inputs, **kwargs):
         backend_invocations.append((gm, example_inputs, kwargs))
         if len(backend_invocations) == 1:
-            capture["gm"] = copy.deepcopy(gm).eval()
-            capture["example_inputs"] = example_inputs
-        compiled_impl = luminal_backend(gm, example_inputs, **kwargs)
-        if len(backend_invocations) == 1:
-            capture["compiled_impl"] = compiled_impl
-        return compiled_impl
+            # The symbolic axes of each tensor argument of the first graph
+            # Dynamo traced, read off the graph itself.
+            for node in gm.graph.nodes:
+                value = node.meta.get("example_value")
+                if node.op != "placeholder" or not isinstance(value, torch.Tensor):
+                    continue
+                symbolic = {
+                    axis
+                    for axis, size in enumerate(value.shape)
+                    if not isinstance(size, int)
+                }
+                if symbolic:
+                    first_trace_axes.append(symbolic)
+        return compiler(gm, example_inputs, **kwargs)
 
     prev_auto = torch._dynamo.config.automatic_dynamic_shapes
     prev_cache_limit = torch._dynamo.config.cache_size_limit
@@ -132,35 +133,17 @@ def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
             first_ref = model(first_input_ids)
             first_out = compiled(first_input_ids)
 
-        compiled_impl = capture["compiled_impl"]
-        assert compiled_impl.has_dynamic_dims, (
-            "explicit mark_dynamic on input_ids[:, 1] should produce a dynamic Luminal graph"
-        )
-        assert len(compiled_impl.dim_params) == 1, (
-            f"expected exactly one dynamic dim param, got {compiled_impl.dim_params}"
-        )
-
-        gm = capture["gm"]
-        example_inputs = capture["example_inputs"]
-        user_inputs = list(example_inputs)
-        user_inputs, _, strip_ok = _strip_symint_placeholders(gm, user_inputs)
-        dynamic_shapes = _build_dynamic_shapes_from_gm(gm) if strip_ok else None
-
-        assert strip_ok, "Expected explicit mark_dynamic SymInts to be rewritten"
-        assert dynamic_shapes is not None, (
-            "Expected the first backend trace to preserve a dynamic shape spec"
-        )
-        args_spec = dynamic_shapes.get("args")
-        assert args_spec is not None, f"expected an args spec, got {dynamic_shapes}"
-        # Weights flow as inputs, so the spec covers every arg; exactly one
-        # (input_ids) may be dynamic, and only on its sequence axis.
-        dyn_specs = [spec for spec in args_spec if spec is not None]
-        assert len(dyn_specs) == 1, (
-            f"expected exactly one dynamic input, got {dynamic_shapes}"
-        )
-        assert set(dyn_specs[0].keys()) == {1}, (
+        # Exactly one argument (input_ids) is dynamic, and only on its
+        # sequence axis, from the first trace on.
+        assert first_trace_axes == [{1}], (
             "Expected only the token sequence axis (dim=1) to be dynamic, "
-            f"got {dyn_specs[0]}"
+            f"got {first_trace_axes}"
+        )
+        # The compiled program carries that one dimension over its
+        # declared range.
+        assert list(compiler.graphs[0].bounds.values()) == [(2, 16)], (
+            f"expected one dynamic dimension over [2, 16], got "
+            f"{compiler.graphs[0].bounds}"
         )
 
         _assert_bf16_logits_match(

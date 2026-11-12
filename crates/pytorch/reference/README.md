@@ -37,9 +37,8 @@ FX source, local input shapes, ATen targets, execution count, and dimension boun
 AOTAutograd traces each graph once with a fixed decomposition table: the core
 ATen decompositions, minus the composites the translator lowers directly (for
 example `native_layer_norm`, `silu`, SDPA). The functional graph it produces is
-wrapped as a PT2 `ExportedProgram` from its own metadata, with no second
-`torch.export` capture; an operator outside both the table and the translator
-fails compilation by name.
+handed to the translator as it is; an operator outside both the table and the
+translator fails compilation by name.
 One compiler instance can compile multiple graphs. `Compiler` is the only public
 compilation entry point; pass it to `torch.compile`.
 
@@ -53,7 +52,7 @@ Each local program compiles over its PyTorch-declared bounds. Reuse `ShapeVar`
 objects to tie input axes together; the name is only diagnostic. Profiling uses
 the tracing or optimization hint, or a small valid size if neither exists.
 There is no implicit 4096 limit. `compiler.graphs[i].bounds` reports the local
-exported symbol intervals. Data-dependent sizes remain unsupported.
+symbol intervals. Data-dependent sizes remain unsupported.
 
 Applications can compile separate domains with isolated Dynamo caches and
 choose which callable to invoke:
@@ -100,10 +99,13 @@ that communicate must be split by the application so that each
 `torch.compile` region is collective-free; PyTorch then executes the
 collectives between compiled regions. Unsupported local operations also fail
 compilation; there is no eager compute fallback. The same rules apply to the
-CUDA backend, which shares this adapter (`luminal_reference.aot_graph`).
+CUDA backend, which shares this adapter (`luminal_torch_common.aot_graph`).
 
 Compilation uses synthetic tensors derived from local FakeTensor metadata and
-never reads fake storage. Real parameters bind on every invocation.
+never reads fake storage. The search executes candidates on them, so they are
+data every program accepts: a floating-point tensor is ones, and an integer
+or boolean tensor is zeros, which is inside every indexed extent and selects
+nothing as a mask. Real parameters bind on every invocation.
 
 Each graph is handed to the Rust translator in process, as the JSON document
 of a PT2 program. No `ExportedProgram` is built and nothing is written to

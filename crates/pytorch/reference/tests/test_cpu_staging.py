@@ -55,11 +55,11 @@ def test_empty_cpu_weight_preserves_shape_and_dtype() -> None:
 
 def test_cpu_input_rejects_non_bytes_payload():
     """The native boundary accepts owned bytes, never arbitrary host pointers."""
-    from luminal_reference.backend import compile_exported
+    compiler = Compiler()
+    compiled = torch.compile(BoundaryNoopModel(), backend=compiler, fullgraph=True)
+    compiled(torch.ones(1))
 
-    example = torch.ones(1)
-    model = compile_exported(
-        torch.export.export(BoundaryNoopModel(), (example,)), [example]
-    )
+    (record,) = compiler.graphs
+    graph = record.program._graph
     with pytest.raises(TypeError):
-        model._graph.set_input(model._graph.input_names[0], None, [1])
+        graph.set_input(graph.input_names[0], None, [1])

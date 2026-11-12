@@ -20,16 +20,17 @@ from functools import partial
 from typing import Any
 
 import torch
-from luminal_reference.aot_graph import (
+from luminal_torch_common.aot_graph import (
     GraphRecord,
     LocalGraph,
     prepare_local_graph,
     refuse_collectives,
 )
-from luminal_reference.export_utils import _aot_decomposition_table, private_graph_copy
+from luminal_torch_common.graph_prep import _aot_decomposition_table, private_graph_copy
 from torch._dynamo.backends.common import aot_autograd
 from torch._inductor.output_code import OutputCode
 
+from . import _luminal
 from .backend import _compile_local_graph
 
 __all__ = ["CudaAOTBackend", "CudaOutputCode", "GraphRecord"]
@@ -190,7 +191,9 @@ def _compile_graph(
     phase="inference",
 ):
     gm, inputs = _rebase_saved_activations(gm, inputs, phase)
-    local = prepare_local_graph(gm, inputs, device_type="cuda")
+    local = prepare_local_graph(
+        gm, inputs, device_type="cuda", boundary_plan=_luminal.boundary_plan
+    )
 
     compiled = None
     if local.computes:
@@ -212,7 +215,7 @@ def _compile_graph(
         with unset_fake_temporarily(), tracing(None):
             compiled = _compile_local_graph(
                 local.program,
-                local.export_inputs,
+                local.example_inputs,
                 search_iterations=search_iterations,
                 search_log=search_log,
                 device_budget_bytes=device_budget_bytes,
@@ -233,6 +236,11 @@ class CudaAOTBackend:
     inference. No local computation falls back to eager PyTorch, and a graph
     that contains collective operations is refused.
     """
+
+    # The decomposition table AOTAutograd applies while it traces: the
+    # translator's own vocabulary. A test that wants every core
+    # decomposition applied overrides this on a subclass.
+    decompositions = staticmethod(_aot_decomposition_table)
 
     def __init__(
         self,
@@ -255,7 +263,7 @@ class CudaAOTBackend:
             inference_compiler=partial(self._compile, phase="inference"),
             # Decompose once, while AOTAutograd traces: the graph the local
             # compiler receives is already in the translator's vocabulary.
-            decompositions=_aot_decomposition_table,
+            decompositions=self.decompositions,
             keep_inference_input_mutations=True,
         )
 

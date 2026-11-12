@@ -270,15 +270,11 @@ different concrete shapes. Nesting `torch.compile` around an opaque custom
 backend is not a general arena-ownership API. See [CUDA semantics](https://docs.pytorch.org/docs/2.14/notes/cuda.html#graph-memory-management)
 and [CUDA graph trees](https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/torch.compiler_cudagraph_trees.html).
 
-Region artifacts cache compilation but `RegionModel` copies now fork native
-execution state. Bound callables share neither runtime input/output state nor
-CUDA capture state. Domain bounds remain part of the artifact cache key, so equal
-profiling shapes with different domains do not collide.
-
-Distributed reference compilation hashes/transfers the exported program,
-profiling specs, and options without bucket policies. The exported program
-already carries the domain. The leader searches one program; followers install
-its native reference artifact and rebind local boundary slots without search.
+The region path this section described (region artifacts, `RegionModel`, the
+artifact cache, and leader/follower installation of a searched program) was
+removed in November 2026 together with the `torch.export` entry point. A
+compiled graph is now saved and installed without search through
+`torch.compile(...).aot_compile()`; see `crates/pytorch/reference/README.md`.
 
 ## Serialization scope
 
@@ -292,10 +288,9 @@ foundation is Rust serialization of completed plans and compiled kernels, plus
 library-call descriptors for operations such as cuBLASLt. Loading should restore
 a ready-to-run program, with external libraries available as required.
 
-The existing Python region wire format still stores an exported program and
-recompiles on load. This is an existing limitation, not the target contract and
-not an implementation requirement added by bucketing. This refactor does not
-create a new CUDA/Metal binary artifact format or broaden recompile-on-load.
+The Python region wire format, which stored an exported program and
+recompiled on load, was removed with the region path. This refactor does not
+create a new CUDA/Metal binary artifact format.
 
 ## Validation
 

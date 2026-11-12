@@ -29,51 +29,161 @@ def luminal_backend(gm, example_inputs, options=None):
     return _backend(example_inputs).Compiler(**(options or {}))(gm, example_inputs)
 
 
-def record_translated_targets(monkeypatch) -> list:
+def record_lowered_graphs(monkeypatch) -> list:
+    """Record every graph the backend hands to the translator from here on,
+    one ``LoweredGraph`` per compiled graph.
+
+    The backend lowers each AOTAutograd graph once, in process, and hands
+    the result to the translator. This observes that hand-off.
+    """
+    from luminal_torch_common import aot_graph
+
+    lowered: list = []
+    lower = aot_graph.lower_local_graph
+
+    def recording_lower(gm, example_inputs):
+        result = lower(gm, example_inputs)
+        lowered.append(result[0])
+        return result
+
+    monkeypatch.setattr(aot_graph, "lower_local_graph", recording_lower)
+    return lowered
+
+
+class _Targets:
+    """The ATen targets of each recorded graph, read when asked for."""
+
+    def __init__(self, lowered):
+        self._lowered = lowered
+
+    def _sets(self):
+        return [
+            {
+                str(node.target)
+                for node in program.graph_module.graph.nodes
+                if node.op == "call_function"
+            }
+            for program in self._lowered
+        ]
+
+    def __len__(self):
+        return len(self._lowered)
+
+    def __getitem__(self, index):
+        return self._sets()[index]
+
+    def __iter__(self):
+        return iter(self._sets())
+
+    def __eq__(self, other):
+        return self._sets() == other
+
+    def __repr__(self):
+        return repr(self._sets())
+
+
+def record_translated_targets(monkeypatch):
     """Record the ATen targets of every graph the backend hands to the
     translator from here on, one set per compiled graph.
 
-    The backend lowers each AOTAutograd graph once, in process, and hands
-    the result to the translator. This observes that hand-off, so a test
-    can require that an op reached the translator itself rather than a
-    decomposition of it, and that a call compiled exactly once.
+    A test uses this to require that an op reached the translator itself
+    rather than a decomposition of it, and that a call compiled exactly
+    once.
     """
-    from luminal_reference import aot_graph
+    return _Targets(record_lowered_graphs(monkeypatch))
 
-    translated: list[set[str]] = []
-    lower = aot_graph.export_local_graph
 
-    def recording_lower(gm, example_inputs):
-        lowered = lower(gm, example_inputs)
-        translated.append(
-            {
-                str(node.target)
-                for node in lowered[0].graph_module.graph.nodes
-                if node.op == "call_function"
-            }
-        )
-        return lowered
+def _fully_decomposed_backend(**options):
+    """The selected backend's AOT compiler with every core decomposition
+    applied, instead of the table that leaves the composites the translator
+    lowers itself. The translator then sees only primitive ops."""
+    name = selected_backend()
+    aot = importlib.import_module(f"luminal_{name}.aot")
+    base = aot.ReferenceAOTBackend if name == "reference" else aot.CudaAOTBackend
 
-    monkeypatch.setattr(aot_graph, "export_local_graph", recording_lower)
-    return translated
+    def every_core_decomposition():
+        return torch.export.default_decompositions().materialize()
+
+    class FullyDecomposed(base):
+        decompositions = staticmethod(every_core_decomposition)
+
+    return FullyDecomposed(**options)
+
+
+def _shapes_spec(model, inputs, dynamic_shapes):
+    """``torch.compile``'s shape spec for dynamic dimensions written the way
+    ``torch.export`` takes them: one ``{axis: Dim}`` mapping per positional
+    input, or ``None`` for a static input."""
+    import inspect
+
+    from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
+
+    forward = model.forward if isinstance(model, torch.nn.Module) else model
+    names = list(inspect.signature(forward).parameters)
+    variables: dict[str, ShapeVar] = {}
+    params = {}
+    for name, value, axes in zip(names, inputs, dynamic_shapes):
+        if not axes:
+            continue
+        sizes = []
+        for axis, size in enumerate(value.shape):
+            dim = axes.get(axis)
+            if dim is None:
+                sizes.append(size)
+                continue
+            # One Dim shared by two inputs is one dimension.
+            sizes.append(
+                variables.setdefault(
+                    dim.__name__,
+                    ShapeVar(
+                        dim.__name__, min=dim.min, max=dim.max, optimization_hint=size
+                    ),
+                )
+            )
+        params[name] = TensorSpec(sizes)
+    return ShapesSpec(params=params)
 
 
 def compile_for_test(model, examples, *, dynamic_shapes=None, **options):
-    """Internal PT2 translator harness; public API coverage uses Compiler directly."""
-    from luminal_reference.export_utils import _drop_input_guards
+    """Compile ``model`` through the selected backend with every core
+    decomposition applied, and return a callable that gives its outputs as
+    one flat tuple.
 
+    This is the translator harness for lowerings of primitive ops: the
+    graph the translator sees has no composites left. Tests of the
+    backend's own path, where composites reach the translator whole, use
+    ``torch.compile(..., backend=luminal_backend)``.
+
+    ``dynamic_shapes`` is written the way ``torch.export`` takes it: one
+    ``{axis: Dim}`` mapping per positional input. Without one, every shape
+    is static.
+    """
     inputs = tuple(examples) if isinstance(examples, (tuple, list)) else (examples,)
-    program = torch.export.export(
-        model,
-        inputs,
-        dynamic_shapes=dynamic_shapes,
-        strict=False,
-        prefer_deferred_runtime_asserts_over_guards=True,
-    )
-    _drop_input_guards(program)
-    program = program.run_decompositions()
-    native = importlib.import_module(f"luminal_{selected_backend()}.backend")
-    return native.compile_exported(program, inputs, **options)
+    backend = _fully_decomposed_backend(**options)
+    # A test may compile one module several times. Each compilation is its
+    # own callable with its own recompile budget.
+    if dynamic_shapes:
+        compiled = torch.compile(
+            model,
+            backend=backend,
+            fullgraph=True,
+            isolate_recompiles=True,
+            dynamic_shapes=_shapes_spec(model, inputs, dynamic_shapes),
+        )
+    else:
+        compiled = torch.compile(
+            model,
+            backend=backend,
+            fullgraph=True,
+            isolate_recompiles=True,
+            dynamic=False,
+        )
+
+    def run(*args):
+        leaves = torch.utils._pytree.tree_leaves(compiled(*args))
+        return tuple(leaf for leaf in leaves if leaf is not None)
+
+    return run
 
 
 @pytest.fixture
@@ -90,20 +200,6 @@ def execution_device(device):
     # rather than quietly exercising the reference runtime in a CUDA run.
     with torch.device(device):
         yield
-
-
-@pytest.fixture
-def stage_one_only(monkeypatch):
-    """The real backend path, pinned to its first stage: the undecomposed
-    graph must translate as it is. Re-decomposing the whole graph (the
-    fallback for an unsupported op) fails the test instead of hiding a
-    missing arm."""
-    native = importlib.import_module(f"luminal_{selected_backend()}.backend")
-
-    def refuse_decomposition():
-        raise AssertionError("stage 1 refused the graph; it was re-decomposed")
-
-    monkeypatch.setattr(native, "_decomp_table", refuse_decomposition)
 
 
 @pytest.fixture(autouse=True)

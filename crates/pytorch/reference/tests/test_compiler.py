@@ -3,7 +3,6 @@
 import pytest
 import torch
 from luminal_reference import Compiler
-from luminal_reference.artifact_cache import clear_artifact_cache
 
 
 class Model(torch.nn.Module):
@@ -16,10 +15,8 @@ def isolated_compiler(monkeypatch):
     monkeypatch.delenv("SEARCH_LOG", raising=False)
     monkeypatch.delenv("LUMINAL_LOG", raising=False)
     torch._dynamo.reset()
-    clear_artifact_cache()
     yield
     torch._dynamo.reset()
-    clear_artifact_cache()
 
 
 @pytest.mark.parametrize("logging", [None, False, True])

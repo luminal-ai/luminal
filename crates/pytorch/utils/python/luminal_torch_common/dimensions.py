@@ -4,7 +4,26 @@ import sys
 
 import torch
 
-from .export_helpers import _safe_int_bound
+
+def _safe_int_bound(value):
+    """Coerce a sympy/symbolic-shape range bound to a finite int, or None.
+
+    Range bounds returned by ShapeEnv can be sympy `Infinity` / `-Infinity`
+    (as well as the internal `int_oo` sentinel), which both raise on `int(...)`.
+    Treat anything non-finite — and anything that simply doesn't coerce — as
+    "no bound."
+    """
+    if value is None:
+        return None
+    # Stringify is robust against the various sentinel types: sympy.Infinity,
+    # torch.utils._sympy.numbers.IntInfinity, etc. all stringify to "oo"/"-oo".
+    s = str(value)
+    if "oo" in s or "inf" in s.lower():
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return None
 
 
 def bounds(env, symbol):

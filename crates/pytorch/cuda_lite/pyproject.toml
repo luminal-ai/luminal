@@ -3,10 +3,8 @@ name = "luminal_cuda_lite"
 version = "0.1.0"
 description = "Luminal CUDA-lite torch.compile backend"
 requires-python = ">=3.10"
-# The PT2 export-preparation helpers are shared with the reference backend;
-# `luminal_reference` is a build-time/runtime dependency until they are lifted
-# into a backend-neutral package.
-dependencies = ["torch>=2.14.0", "luminal_reference"]
+# luminal_torch_common: the torch.compile frontend every backend shares.
+dependencies = ["torch>=2.14.0", "luminal_torch_common"]
 
 # PyTorch 2.14 wheels require the CUDA 13.0 index; cu128 stops before 2.14.
 [[tool.uv.index]]
@@ -18,7 +16,7 @@ explicit = true
 torch = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
-luminal_reference = { path = "../reference", editable = true }
+luminal_torch_common = { path = "../utils", editable = true }
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

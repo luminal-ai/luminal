@@ -63,9 +63,7 @@ def test_copysign_infinite_sign_operand():
     (torch.float16, torch.bfloat16, torch.float32, torch.float64),
     ids=str,
 )
-def test_copysign_takes_only_the_sign_bit_of_zero_tiny_and_infinite_signs(
-    stage_one_only, dtype
-):
+def test_copysign_takes_only_the_sign_bit_of_zero_tiny_and_infinite_signs(dtype):
     """copysign is |magnitude| with the sign BIT of `sign`. A zero magnitude
     becomes a signed zero, an infinite or subnormal `sign` is only a sign,
     and a `-0.0` magnitude loses its own sign. Multiplying by `sign(s)` gave
@@ -196,7 +194,7 @@ def _bounded(x):
 
 @pytest.mark.parametrize("scalar", [1, 2.5], ids=["int", "float"])
 @pytest.mark.parametrize("dtype", list(SCALAR_FIRST_INPUTS), ids=str)
-def test_scalar_minus_tensor_real_path(stage_one_only, dtype, scalar):
+def test_scalar_minus_tensor_real_path(dtype, scalar):
     model = Unary(lambda x: scalar - _bounded(x))
     x = SCALAR_FIRST_INPUTS[dtype]()
     expected = model(x)
@@ -216,7 +214,7 @@ def test_scalar_minus_tensor_decomposed(dtype, scalar):
     _assert_same(actual, expected)
 
 
-def test_float64_scalar_first_keeps_the_double(stage_one_only):
+def test_float64_scalar_first_keeps_the_double():
     # 0.1 read at F32 and widened would be off by ~1.5e-9.
     model = Unary(lambda x: 0.1 - x)
     x = torch.tensor([0.0, 1e-17, -0.2], dtype=torch.float64)
@@ -244,7 +242,7 @@ def test_float64_scalar_first_keeps_the_double(stage_one_only):
         "mask-idiom",
     ],
 )
-def test_reverse_subtraction_real_path(stage_one_only, fn):
+def test_reverse_subtraction_real_path(fn):
     model = Lambda(fn)
     x = torch.tensor([[0.25, -1.5, 3.0], [8.0, 0.0, -0.75]])
     y = torch.tensor([0.0, 1.0, 0.5])
@@ -255,7 +253,7 @@ def test_reverse_subtraction_real_path(stage_one_only, fn):
     _assert_same(actual, expected, exact=False)
 
 
-def test_reverse_subtraction_of_half_rounds_once(stage_one_only):
+def test_reverse_subtraction_of_half_rounds_once():
     model = Unary(lambda x: torch.rsub(x, 1.0))
     x = torch.tensor([0.25, 2.0, -4.5, 1e-3, 65504.0], dtype=torch.float16)
     expected = model(x)
@@ -280,7 +278,7 @@ SYMBOLIC_SCALAR_OPS = {
 
 
 @pytest.mark.parametrize("name", list(SYMBOLIC_SCALAR_OPS))
-def test_symbolic_scalar_operand_real_path(stage_one_only, name):
+def test_symbolic_scalar_operand_real_path(name):
     fn, exact = SYMBOLIC_SCALAR_OPS[name]
     model = Unary(fn)
     compiled = torch.compile(model, backend=luminal_backend, dynamic=True)
@@ -551,7 +549,7 @@ EMPTY_BINARY_OPS = {
 
 @pytest.mark.parametrize("shape", EMPTY_SHAPES, ids=str)
 @pytest.mark.parametrize("name", list(EMPTY_UNARY_OPS))
-def test_zero_element_unary_float_ops(stage_one_only, name, shape):
+def test_zero_element_unary_float_ops(name, shape):
     model = Unary(EMPTY_UNARY_OPS[name])
     x = torch.zeros(shape)
     _assert_outputs_bitwise(_compile_real(model)(x), model(x))
@@ -559,21 +557,21 @@ def test_zero_element_unary_float_ops(stage_one_only, name, shape):
 
 @pytest.mark.parametrize("shape", EMPTY_SHAPES, ids=str)
 @pytest.mark.parametrize("name", list(EMPTY_BINARY_OPS))
-def test_zero_element_binary_float_ops(stage_one_only, name, shape):
+def test_zero_element_binary_float_ops(name, shape):
     model = Lambda(EMPTY_BINARY_OPS[name])
     a, b = torch.zeros(shape), torch.zeros(shape)
     _assert_outputs_bitwise(_compile_real(model)(a, b), model(a, b))
 
 
 @pytest.mark.parametrize("name", ["clamp_min", "clamp_max"])
-def test_zero_element_tensor_bound_broadcasts(stage_one_only, name):
+def test_zero_element_tensor_bound_broadcasts(name):
     # OpInfo's sample: an empty (0, 1, 3) input against a (0, 10, 3) bound.
     model = Lambda(EMPTY_BINARY_OPS[name])
     x, bound = torch.zeros(0, 1, 3), torch.zeros(0, 10, 3)
     _assert_outputs_bitwise(_compile_real(model)(x, bound), model(x, bound))
 
 
-def test_searchsorted_and_bucketize_of_an_empty_float_query(stage_one_only):
+def test_searchsorted_and_bucketize_of_an_empty_float_query():
     model = Lambda(
         lambda sorted_, query: (
             torch.searchsorted(sorted_, query),
@@ -606,7 +604,7 @@ SMALLEST_SUBNORMAL = {
 
 
 @pytest.mark.parametrize("dtype", list(SMALLEST_SUBNORMAL), ids=str)
-def test_isnan_and_truthiness_are_ieee(stage_one_only, dtype):
+def test_isnan_and_truthiness_are_ieee(dtype):
     # bool(nan) is True: logical_not(nan) is False and logical_and(nan, 1) is
     # True. Both signed zeros are the only falsy codes; subnormals are truthy.
     tiny = SMALLEST_SUBNORMAL[dtype]
@@ -629,7 +627,7 @@ def test_isnan_and_truthiness_are_ieee(stage_one_only, dtype):
     ],
     ids=str,
 )
-def test_isnan_of_fp8_storage_formats(stage_one_only, dtype):
+def test_isnan_of_fp8_storage_formats(dtype):
     # The fp8 formats have NaN codes that do not follow the IEEE encoding rule;
     # they are classified on their exact F32 widening.
     model = Unary(torch.isnan)

@@ -464,39 +464,6 @@ def test_stride_zero_mutation_target_is_refused_as_eager_refuses_it():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_a_held_buffer_is_bound_on_the_modules_own_storage():
-    """A parameter or buffer is the CALLER's memory too: it is bound at the
-    address the module's own tensor has, never at a copy the backend made
-    while preparing the graph. Compile the export directly so its buffer
-    remains held state instead of being lifted into a Dynamo call argument."""
-    from luminal_cuda_lite.backend import compile_exported
-
-    class Counter(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.register_buffer("state", torch.zeros(4, device="cuda"))
-
-        def forward(self, x):
-            self.state.add_(1)
-            return x + self.state
-
-    module = Counter()
-    before = module.state.clone()
-    inputs = (torch.zeros(4, device="cuda"),)
-    program = torch.export.export(module, inputs).run_decompositions({})
-    compiled = compile_exported(program, inputs)
-    (out,) = compiled(*inputs)
-
-    torch.testing.assert_close(module.state, before + 1)
-    torch.testing.assert_close(out, module.state)
-    assert compiled._held, "the backend bound no held tensor"
-    for name, tensor in compiled._held.items():
-        assert tensor.data_ptr() == module.state.data_ptr(), (
-            f"{name} is bound on a copy of the module's storage"
-        )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_a_parameter_whose_storage_moved_is_read_at_its_new_address():
     """``p.data = p.data.clone()`` changes no metadata Dynamo guards on, so
     the compiled frame is re-entered with the parameter living somewhere

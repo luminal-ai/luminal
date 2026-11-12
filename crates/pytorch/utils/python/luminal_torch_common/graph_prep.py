@@ -7,7 +7,7 @@ one for the Rust translator:
   - the decomposition tables: which composites are decomposed while
     AOTAutograd traces, and which the translator lowers itself
   - the ``sym_sum`` serializer workaround
-  - the input-guard and dead data-dependent-op cleanups
+  - the dead data-dependent-op cleanup
 """
 
 
@@ -15,7 +15,7 @@ def private_graph_copy(gm):
     """A private copy of `gm` that SHARES its parameters and buffers.
 
     Dynamo keeps the original GraphModule and re-checks its guards against it
-    after the backend returns, so the export passes need a module of their own
+    after the backend returns, so the lowering passes need a module of their own
     to edit and recompile. They only ever edit the GRAPH, so only the graph has
     to be private. `copy.deepcopy(gm)` deep-copies the module's own dict, which
     clones every parameter and buffer on the device; a writeback then lands in
@@ -199,16 +199,16 @@ def _aot_decomposition_table():
 
 
 def _lower_sym_sum(ep) -> None:
-    """Rewrite `torch.sym_sum` nodes into chains of `operator.add` so the
-    ExportedProgram survives `torch.export.save`.
+    """Rewrite `torch.sym_sum` nodes into chains of `operator.add` so
+    torch's node serializer can write the graph.
 
-    WORKAROUND for a torch.export inconsistency: the export VERIFIER allows
-    sym_sum in graphs (pytorch#159111, landed 2025-07), but the PT2 serde's
-    `_SYM_OPS` table never got the matching entry, so `torch.export.save`
-    raises `AssertionError: op sym_sum is not in _SYM_OPS` on any graph the
-    verifier just blessed. sym_sum appears whenever shape arithmetic sums
-    three or more SymInts (sympy's Add is n-ary) — e.g. HF llama under
-    attn_implementation="sdpa" with a growing KV cache.
+    WORKAROUND for a torch inconsistency: graphs may contain sym_sum
+    (pytorch#159111, landed 2025-07), but the PT2 serde's `_SYM_OPS` table
+    never got the matching entry, so its serializer raises
+    `AssertionError: op sym_sum is not in _SYM_OPS` on such a graph. sym_sum
+    appears whenever shape arithmetic sums three or more SymInts (sympy's
+    Add is n-ary) — e.g. HF llama under attn_implementation="sdpa" with a
+    growing KV cache.
 
     The upstream one-line fix exists inside the (larger, still-open)
     duck-sizing PR: https://github.com/pytorch/pytorch/pull/186373
@@ -246,7 +246,7 @@ def _lower_sym_sum(ep) -> None:
             acc_val = _val(acc)
             for term in terms[1:]:
                 acc = gm.graph.call_function(operator.add, (acc, term))
-                # Every ExportedProgram node must carry meta["val"] (the
+                # Every node the serializer writes must carry meta["val"] (the
                 # verifier's _check_val rejects the graph otherwise). The
                 # partial sums are real SymInt arithmetic over the terms'
                 # vals; the FINAL node inherits the original node's meta
@@ -263,36 +263,8 @@ def _lower_sym_sum(ep) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Input-guard / dead data-dependent-op cleanups
+# Dead data-dependent-op cleanup
 # ---------------------------------------------------------------------------
-
-
-def _drop_input_guards(ep):
-    """Discard ``ep._guards_code`` so unlift does not emit a ``_guards_fn``.
-
-    LUM-499: When a 0-d int tensor flows into a tensor index (``x[i]`` with
-    ``i = torch.tensor(2)``), torch.export records two equivalent input
-    guards: ``L['i'].item() == 2`` (referencing the original local source)
-    and ``L['args'][1].item() == 2`` (referencing the rewrapped flat args).
-    Two failures stack on top of each other:
-
-    1. ``ep.module()`` (invoked inside ``run_decompositions``) rewrites
-       ``L['args'][1]`` → ``args[1]`` but cannot resolve ``L['i']``, leaving
-       a literal ``L`` reference in the generated ``_guards_fn`` and raising
-       ``NameError: name 'L' is not defined`` during retracing.
-    2. Even after dropping the unresolvable guard, the surviving
-       ``args[1].item()`` is data-dependent: AOT autograd's fake-tensor pass
-       raises ``DataDependentOutputException(_local_scalar_dense)``, forcing
-       a graph break.
-
-    These guards exist solely to validate inputs at runtime in eager-mode
-    consumers of the ExportedProgram; the luminal compiler does its own
-    input shape/dtype checks against the compiled graph signature, so we
-    are not losing any safety by clearing them.
-    """
-
-    if hasattr(ep, "_guards_code"):
-        ep._guards_code = []
 
 
 def _drop_dead_data_dependent_ops(gm):
@@ -328,7 +300,6 @@ __all__ = [
     "_aot_decomposition_table",
     "_decomp_table",
     "_drop_dead_data_dependent_ops",
-    "_drop_input_guards",
     "_lower_sym_sum",
     "private_graph_copy",
 ]

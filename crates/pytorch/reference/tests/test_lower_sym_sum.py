@@ -1,18 +1,18 @@
-"""_lower_sym_sum: sym_sum nodes must not survive to torch.export.save.
+"""A size that sums three or more dimensions reaches the translator as a
+chain of binary additions.
 
-Three distinct-sized dynamic inputs concatenated force the output length
-s0+s1+s2 — an n-ary sympy Add that torch FX-ifies as torch.sym_sum on
-affected versions. Whether or not this torch build emits sym_sum, the
-contract is the same: after the pass, no sym_sum nodes remain and save()
-succeeds. CPU-only.
+Three inputs of independent dynamic length, concatenated, give an output
+length of ``s0 + s1 + s2``. sympy's ``Add`` is n-ary, so torch can write
+that sum in the graph as one ``torch.sym_sum`` node, which torch's own node
+serializer has no entry for. Whether or not this torch build emits the
+node, the contract is the same: the graph handed to the translator has no
+``sym_sum`` in it, and the program compiles and matches eager. CPU-only.
 """
 
-import os
-import tempfile
-
 import torch
-from luminal_reference.export_utils import _lower_sym_sum
-from torch.export import Dim, export
+from backend_test_utils import record_lowered_graphs
+from luminal_reference import Compiler
+from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
 
 
 class Cat3(torch.nn.Module):
@@ -21,22 +21,24 @@ class Cat3(torch.nn.Module):
         return out + out.shape[0]
 
 
-def test_lower_sym_sum_roundtrip():
-    m = Cat3()
-    ex = (torch.randn(3), torch.randn(5), torch.randn(7))
-    dyn = {"a": {0: Dim("s0")}, "b": {0: Dim("s1")}, "c": {0: Dim("s2")}}
-    ep = export(m, ex, dynamic_shapes=dyn)
-
-    _lower_sym_sum(ep)
-
-    assert not any(
-        n.op == "call_function" and n.target is getattr(torch, "sym_sum", None)
-        for n in ep.graph_module.graph.nodes
+def test_a_three_term_size_sum_reaches_the_translator_as_binary_adds(monkeypatch):
+    lowered = record_lowered_graphs(monkeypatch)
+    model = Cat3()
+    spec = ShapesSpec(
+        params={
+            name: TensorSpec([ShapeVar(f"s{i}", min=2, max=16, optimization_hint=4)])
+            for i, name in enumerate("abc")
+        }
     )
-    with tempfile.TemporaryDirectory() as td:
-        torch.export.save(ep, os.path.join(td, "m.pt2"))  # must not raise
+    compiled = torch.compile(model, backend=Compiler(), dynamic_shapes=spec)
 
-    # Semantics preserved.
-    got = ep.module()(*ex)
-    want = m(*ex)
-    torch.testing.assert_close(got, want)
+    for lengths in ((3, 5, 7), (2, 9, 4)):
+        inputs = tuple(torch.randn(length) for length in lengths)
+        torch.testing.assert_close(compiled(*inputs), model(*inputs))
+
+    assert len(lowered) == 1, "every size ran on the one compiled graph"
+    (program,) = lowered
+    assert not any(
+        node.op == "call_function" and node.target is getattr(torch, "sym_sum", None)
+        for node in program.graph_module.graph.nodes
+    )

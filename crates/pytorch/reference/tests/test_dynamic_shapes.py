@@ -66,31 +66,26 @@ def _explicit_mark_dynamic_mode():
         torch._dynamo.reset()
 
 
-def _first_trace_dynamic_shapes(capture_holder):
-    from luminal_reference.export_helpers import (
-        _build_dynamic_shapes_from_gm,
-        _strip_symint_placeholders,
-    )
+def _first_trace_dynamic_axes(capture_holder):
+    """The symbolic axes of each tensor argument of the first graph Dynamo
+    traced, read off the graph itself: one set per argument that has any."""
+    axes = []
+    for node in capture_holder["gm"].graph.nodes:
+        value = node.meta.get("example_value")
+        if node.op != "placeholder" or not isinstance(value, torch.Tensor):
+            continue
+        symbolic = {
+            axis for axis, size in enumerate(value.shape) if not isinstance(size, int)
+        }
+        if symbolic:
+            axes.append(symbolic)
+    return axes
 
-    gm = copy.deepcopy(capture_holder["gm"]).eval()
-    example_inputs = capture_holder["example_inputs"]
-    user_inputs = list(example_inputs)
-    user_inputs, _, strip_ok = _strip_symint_placeholders(gm, user_inputs)
-    dynamic_shapes = _build_dynamic_shapes_from_gm(gm) if strip_ok else None
-    return strip_ok, dynamic_shapes
 
-
-def _assert_single_dynamic_input(dynamic_shapes, expected_dims):
-    """Exactly one arg is dynamic, with the expected dims (position among
-    the args is a Dynamo ordering detail — weights are in the list too)."""
-    args_spec = dynamic_shapes.get("args")
-    assert args_spec is not None, f"expected an args spec, got {dynamic_shapes}"
-    dyn_specs = [spec for spec in args_spec if spec is not None]
-    assert len(dyn_specs) == 1, (
-        f"expected exactly one dynamic input, got {dynamic_shapes}"
-    )
-    assert set(dyn_specs[0].keys()) == set(expected_dims), (
-        f"expected dynamic dims {set(expected_dims)}, got {dynamic_shapes}"
+def _assert_single_dynamic_input(dynamic_axes, expected_dims):
+    """Exactly one argument is dynamic, on the expected axes."""
+    assert dynamic_axes == [set(expected_dims)], (
+        f"expected one dynamic input on axes {set(expected_dims)}, got {dynamic_axes}"
     )
 
 
@@ -282,10 +277,7 @@ def test_mark_dynamic_seq_via_torch_compile_starts_dynamic(device: torch.device)
                 f"seq_len={seq_len}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
             )
 
-        strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
-        assert strip_ok, "Expected explicit mark_dynamic SymInts to be rewritten"
-        assert dynamic_shapes is not None
-        _assert_single_dynamic_input(dynamic_shapes, {1})
+        _assert_single_dynamic_input(_first_trace_dynamic_axes(capture), {1})
 
         assert len(counts) == 1, (
             "Explicit mark_dynamic should produce one dynamic backend trace from the start, "
@@ -332,10 +324,7 @@ def test_mark_dynamic_seq_with_lifted_weights_single_compile(device: torch.devic
                     f"{seq_len}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
                 )
 
-        strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
-        assert strip_ok
-        assert dynamic_shapes is not None
-        _assert_single_dynamic_input(dynamic_shapes, {1})
+        _assert_single_dynamic_input(_first_trace_dynamic_axes(capture), {1})
 
         assert len(counts) == 1, (
             "Explicit mark_dynamic should avoid a second compile for lifted-weight models, "
@@ -375,10 +364,7 @@ def test_mark_dynamic_seq_preserves_affine_output_shape(device: torch.device):
                 f"seq_len={seq_len}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
             )
 
-        strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
-        assert strip_ok
-        assert dynamic_shapes is not None
-        _assert_single_dynamic_input(dynamic_shapes, {1})
+        _assert_single_dynamic_input(_first_trace_dynamic_axes(capture), {1})
 
         assert len(counts) == 1, (
             "Explicit mark_dynamic should keep affine output-shape models on one compile, "
@@ -419,10 +405,7 @@ def test_mark_dynamic_two_dim_via_torch_compile_starts_dynamic(device: torch.dev
                 f"shape={shape}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
             )
 
-        strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
-        assert strip_ok
-        assert dynamic_shapes is not None
-        _assert_single_dynamic_input(dynamic_shapes, {0, 1})
+        _assert_single_dynamic_input(_first_trace_dynamic_axes(capture), {0, 1})
 
         assert len(counts) == 1, (
             "Explicitly marked batch+seq dims should compile once from the first call, "
