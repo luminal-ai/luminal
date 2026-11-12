@@ -29,6 +29,35 @@ def luminal_backend(gm, example_inputs, options=None):
     return _backend(example_inputs).Compiler(**(options or {}))(gm, example_inputs)
 
 
+def record_translated_targets(monkeypatch) -> list:
+    """Record the ATen targets of every graph the backend hands to the
+    translator from here on, one set per compiled graph.
+
+    The backend lowers each AOTAutograd graph once, in process, and hands
+    the result to the translator. This observes that hand-off, so a test
+    can require that an op reached the translator itself rather than a
+    decomposition of it, and that a call compiled exactly once.
+    """
+    from luminal_reference import aot_graph
+
+    translated: list[set[str]] = []
+    lower = aot_graph.export_local_graph
+
+    def recording_lower(gm, example_inputs):
+        lowered = lower(gm, example_inputs)
+        translated.append(
+            {
+                str(node.target)
+                for node in lowered[0].graph_module.graph.nodes
+                if node.op == "call_function"
+            }
+        )
+        return lowered
+
+    monkeypatch.setattr(aot_graph, "export_local_graph", recording_lower)
+    return translated
+
+
 def compile_for_test(model, examples, *, dynamic_shapes=None, **options):
     """Internal PT2 translator harness; public API coverage uses Compiler directly."""
     from luminal_reference.export_utils import _drop_input_guards

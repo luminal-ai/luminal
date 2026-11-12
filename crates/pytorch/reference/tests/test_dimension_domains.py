@@ -33,7 +33,7 @@ def test_shared_shapevar_varies_sizes_without_recompile():
         x, y = torch.randn(size, size), torch.randn(3, size)
         torch.testing.assert_close(compiled(x, y), model(x, y))
     assert len(compiler.graphs) == 1
-    assert list(compiler.regions[0].bounds.values()) == [(2, 16)]
+    assert list(compiler.graphs[0].bounds.values()) == [(2, 16)]
     with pytest.raises((ValueError, RuntimeError, AssertionError)):
         compiled(torch.randn(4, 5), torch.randn(3, 4))
     with pytest.raises((ValueError, RuntimeError, AssertionError)):
@@ -54,7 +54,7 @@ def test_same_name_shapevars_are_independent():
         x = torch.randn(shape)
         torch.testing.assert_close(compiled(x), x.sin())
     assert len(compiler.graphs) == 1
-    assert list(compiler.regions[0].bounds.values()) == [(2, 12), (2, 12)]
+    assert list(compiler.graphs[0].bounds.values()) == [(2, 12), (2, 12)]
 
 
 def test_default_uses_pytorch_bounds_above_old_limit():
@@ -70,7 +70,7 @@ def test_default_uses_pytorch_bounds_above_old_limit():
         x = torch.randn(size)
         torch.testing.assert_close(compiled(x), x.sin())
     assert len(compiler.graphs) == 1
-    assert list(compiler.regions[0].bounds.values()) == [(2, 6000)]
+    assert list(compiler.graphs[0].bounds.values()) == [(2, 6000)]
 
 
 def test_mark_dynamic_bounds_are_preserved():
@@ -79,7 +79,7 @@ def test_mark_dynamic_bounds_are_preserved():
     torch._dynamo.mark_dynamic(x, 0, min=2, max=20)
     compiled = torch.compile(lambda x: x.sin(), backend=compiler, fullgraph=True)
     torch.testing.assert_close(compiled(x), x.sin())
-    assert list(compiler.regions[0].bounds.values()) == [(2, 20)]
+    assert list(compiler.graphs[0].bounds.values()) == [(2, 20)]
 
 
 def test_backward_preserves_shapevar_bounds():
@@ -96,7 +96,7 @@ def test_backward_preserves_shapevar_bounds():
         compiled(x).backward()
         torch.testing.assert_close(x.grad, 2 * x.detach())
     assert {g.phase for g in compiler.graphs} == {"forward", "backward"}
-    assert all(list(r.bounds.values()) == [(2, 12)] for r in compiler.regions)
+    assert all(list(r.bounds.values()) == [(2, 12)] for r in compiler.graphs)
 
 
 def test_whisper_shapespec_mask():
@@ -183,7 +183,7 @@ def test_application_dispatches_independently_bounded_callables():
         torch.testing.assert_close(dispatch(x), model(x))
     for lo, hi, compiler, _ in entries:
         assert len(compiler.graphs) == 1
-        assert list(compiler.regions[0].bounds.values()) == [(lo, hi)]
+        assert list(compiler.graphs[0].bounds.values()) == [(lo, hi)]
     with pytest.raises(ValueError, match="no application bucket"):
         dispatch(torch.ones(6))
 
@@ -199,7 +199,7 @@ def test_broad_domain_uses_small_profile_and_checks_live_budget():
     )
     x = torch.ones(2)
     torch.testing.assert_close(compiled(x), x.sin())
-    assert list(compiler.regions[0].bounds.values()) == [(2, 100000000)]
+    assert list(compiler.graphs[0].bounds.values()) == [(2, 100000000)]
     with pytest.raises(RuntimeError, match="budget"):
         compiled(torch.ones(400))
     assert len(compiler.graphs) == 1

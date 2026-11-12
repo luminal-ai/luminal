@@ -32,7 +32,7 @@ def test_compiler_logging_and_aot(logging, capfd):
     with torch.no_grad():
         torch.testing.assert_close(compiled(x), model(x))
     assert compiler.graphs
-    assert compiler.regions
+    assert compiler.graphs[0].targets
     assert ("Start" in capfd.readouterr().err) is (logging is True)
 
 

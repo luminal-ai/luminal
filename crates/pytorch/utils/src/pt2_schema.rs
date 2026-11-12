@@ -38,6 +38,14 @@ pub struct Graph {
     pub tensor_values: HashMap<String, TensorMeta>,
     #[serde(default)]
     pub sym_int_values: HashMap<String, serde_json::Value>,
+    /// Symbolic bool values by name: comparisons of symbolic integers
+    /// (`x.shape[0] > 3`), each carrying its sympy expression.
+    #[serde(default)]
+    pub sym_bool_values: HashMap<String, serde_json::Value>,
+    /// Symbolic float values by name (`x.shape[0] / 2.0`), each carrying
+    /// its sympy expression.
+    #[serde(default)]
+    pub sym_float_values: HashMap<String, serde_json::Value>,
 }
 
 /// A reference to a tensor by name (used in graph inputs/outputs).
@@ -253,7 +261,76 @@ pub struct SubGraph {
     pub graph: Graph,
 }
 
+/// Every string under a `name` or `as_name` key: the value names an
+/// argument spelling this schema does not model refers to.
+fn names_in_json<'a>(value: &'a serde_json::Value, visit: &mut dyn FnMut(&'a str)) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                match value {
+                    serde_json::Value::String(name) if key == "name" || key == "as_name" => {
+                        visit(name)
+                    }
+                    other => names_in_json(other, visit),
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                names_in_json(value, visit);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Argument {
+    /// Call `visit` with the name of every value this argument refers to:
+    /// a tensor, a symbolic scalar, each entry of a list, and whatever a
+    /// spelling this schema does not model names.
+    pub fn for_each_value_name<'a>(&'a self, visit: &mut dyn FnMut(&'a str)) {
+        match self {
+            Argument::Tensor(arg) => visit(&arg.as_tensor.name),
+            Argument::Tensors(arg) => {
+                for tensor in &arg.as_tensors {
+                    visit(&tensor.name);
+                }
+            }
+            Argument::OptionalTensors(arg) => {
+                for entry in &arg.as_optional_tensors {
+                    if let OptionalTensorEntry::Tensor(tensor) = entry {
+                        visit(&tensor.as_tensor.name);
+                    }
+                }
+            }
+            Argument::SymInt(arg) => visit(&arg.as_sym_int.as_name),
+            Argument::SymFloat(arg) => visit(&arg.as_sym_float.as_name),
+            Argument::SymBool(arg) => visit(&arg.as_sym_bool.as_name),
+            Argument::SymInts(arg) => {
+                for entry in &arg.as_sym_ints {
+                    if let SymIntEntry::Name(name) = entry {
+                        visit(&name.as_name);
+                    }
+                }
+            }
+            Argument::Graph(arg) => {
+                for node in &arg.as_graph.graph.nodes {
+                    for input in &node.inputs {
+                        input.arg.for_each_value_name(visit);
+                    }
+                }
+            }
+            Argument::Other(value) => names_in_json(value, visit),
+            Argument::Int(_)
+            | Argument::Float(_)
+            | Argument::Complex(_)
+            | Argument::Bool(_)
+            | Argument::Ints(_)
+            | Argument::Expr(_)
+            | Argument::ScalarType(_) => {}
+        }
+    }
+
     pub fn as_tensor_name(&self) -> Option<&str> {
         match self {
             Argument::Tensor(t) => Some(&t.as_tensor.name),

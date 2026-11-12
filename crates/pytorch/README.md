@@ -20,8 +20,7 @@ memory options on the compiler, for example `Compiler(search_log=True)`.
 PyTorch 2.14.0 or newer is required; package imports enforce the minimum before
 loading native extensions.
 
-For AOTAutograd and DTensor SPMD, see [reference/README.md](reference/README.md)
-and the inference-only [SPMD example](reference/examples/spmd.py).
+For AOTAutograd details, see [reference/README.md](reference/README.md).
 
 ## Development
 
@@ -32,13 +31,12 @@ project or test suite at the `crates/pytorch` root. From this directory:
 uv sync --project reference --group dev
 uv run --project reference --group dev maturin develop --manifest-path reference/Cargo.toml
 uv run --project reference --group dev pytest -c reference/pyproject.toml reference/tests/test_aot.py
-uv run --project reference torchrun --standalone --nproc-per-node=2 reference/examples/spmd.py
 ```
 
 Test ownership:
 
 - `reference/tests`: CPU runtime, host-buffer boundaries, export/region APIs,
-  AOTAutograd, and SPMD.
+  and AOTAutograd.
 - `cuda_lite/tests`: CUDA runtime, layouts, streams, capture, and CUDA-specific
   model regressions.
 - `utils/tests`: PT2 translator operation, dtype, shape, and composite-lowering

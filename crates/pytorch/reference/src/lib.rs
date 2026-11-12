@@ -370,6 +370,57 @@ impl CompiledGraph {
         Ok(())
     }
 
+    /// The program's arguments, in call order: `(kind, graph name, read,
+    /// symbol)`. A call passes one value per row. `read` says whether the
+    /// program reads the argument, and `symbol` is the dimension an integer
+    /// argument defines.
+    #[getter]
+    fn input_slots(&self) -> Vec<(String, String, bool, Option<String>)> {
+        self.translation.boundary.input_rows()
+    }
+
+    /// The messages of the runtime checks the program carries.
+    #[getter]
+    fn runtime_assertions(&self) -> Vec<String> {
+        self.translation
+            .boundary
+            .checks
+            .iter()
+            .map(|check| check.message.clone())
+            .collect()
+    }
+
+    /// Evaluate the program's runtime checks at the symbol values the
+    /// current call bound, and raise the first one it breaks with torch's
+    /// own message. Binding does not depend on this having run.
+    fn check_assertions(&self) -> PyResult<()> {
+        match self.translation.boundary.failed_check(&self.dims) {
+            Some(check) => Err(PyRuntimeError::new_err(check.message.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// The program's output leaves, in order: `(kind, source, index)`.
+    /// `source` is `"program"` (index: the output row), `"input"` (index:
+    /// the argument slot), `"expression"` or `"literal"`.
+    #[getter]
+    fn output_slots(&self) -> Vec<(String, String, Option<usize>)> {
+        self.translation.boundary.output_rows()
+    }
+
+    /// Bind one integer argument by value. An argument that is a symbol
+    /// defines that symbol for the call; before `search` the value is the
+    /// profiling value, afterward it is the execution value.
+    fn bind_int(&mut self, name: &str, value: i64) -> PyResult<()> {
+        if let Some((symbol, value)) = self.translation.int_binding(name, value).map_err(to_py)? {
+            self.dims.insert(symbol, value);
+            if self.searched {
+                self.runtime.set_dim(symbol, value);
+            }
+        }
+        Ok(())
+    }
+
     /// Override a dynamic dimension's value before `search`, by PT2 symbol
     /// name (e.g. `"s77"`). This selects the profiling shape without narrowing
     /// the exported domain. Static graphs need no call.
@@ -665,8 +716,39 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
     let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
-    let translation = translate(&parsed).map_err(to_py)?;
-    let bounds = luminal_pytorch_utils::symbol_bounds(&translation, &parsed).map_err(to_py)?;
+    load(&parsed)
+}
+
+/// Translate and load a program handed over in process: the JSON document
+/// of a PT2 archive, without the archive.
+#[pyfunction]
+fn compile_graph(program: &[u8]) -> PyResult<CompiledGraph> {
+    let parsed = luminal_pytorch_utils::parse_program(program).map_err(to_py)?;
+    load(&parsed)
+}
+
+/// The boundary of a program handed over in process, read off the program
+/// alone: `(arguments, output leaves, written tensors)`. See
+/// `CompiledGraph.input_slots` and `output_slots` for the first two rows;
+/// a written tensor is `(graph name, mutation target, returned)`.
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+fn boundary_plan(
+    program: &[u8],
+) -> PyResult<(
+    Vec<(String, String, bool, Option<String>)>,
+    Vec<(String, String, Option<usize>)>,
+    Vec<(String, Option<String>, bool)>,
+)> {
+    let parsed = luminal_pytorch_utils::parse_program(program).map_err(to_py)?;
+    let plan = luminal_pytorch_utils::boundary::plan(&parsed).map_err(to_py)?;
+    Ok((plan.input_rows(), plan.output_rows(), plan.written_rows()))
+}
+
+/// Translate a parsed program and load it on the reference runtime.
+fn load(parsed: &luminal_pytorch_utils::ParsedPT2) -> PyResult<CompiledGraph> {
+    let translation = translate(parsed).map_err(to_py)?;
+    let bounds = luminal_pytorch_utils::symbol_bounds(&translation, parsed).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let (bindings, output_buffers) = bind(&translation)
         .context("binding the translated program's boundary")
@@ -709,6 +791,8 @@ fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledGraph>()?;
     m.add_function(wrap_pyfunction!(_torch_dtype_codes, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_graph, m)?)?;
+    m.add_function(wrap_pyfunction!(boundary_plan, m)?)?;
     Ok(())
 }
 

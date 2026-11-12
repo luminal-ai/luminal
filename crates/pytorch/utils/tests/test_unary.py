@@ -3,7 +3,7 @@ from typing import Callable
 import pytest
 import torch
 import torch._dynamo
-from backend_test_utils import luminal_backend
+from backend_test_utils import luminal_backend, record_translated_targets
 from test_models import (
     AbsAllNegativeModel,
     AbsInExpressionModel,
@@ -164,18 +164,9 @@ _LOGIT_INPUT = (0.0, 1.0, 0.05, 0.2, 0.5, 0.7, 0.95, -0.5, 1.5, _NAN, _INF, -_IN
 
 
 def _compile_logit_real_path(monkeypatch, eps):
-    """Compile `torch.logit(x, eps)` through the real two-stage backend path,
-    recording the ATen targets of every program handed to the translator."""
-    translated = []
-    save = torch.export.save
-
-    def recording_save(program, *args, **kwargs):
-        translated.append(
-            {str(n.target) for n in program.graph.nodes if n.op == "call_function"}
-        )
-        return save(program, *args, **kwargs)
-
-    monkeypatch.setattr(torch.export, "save", recording_save)
+    """Compile `torch.logit(x, eps)` through the real backend path,
+    recording the ATen targets of every graph handed to the translator."""
+    translated = record_translated_targets(monkeypatch)
 
     def backend(gm, example_inputs):
         return luminal_backend(gm, example_inputs, options={"search_iterations": 1})

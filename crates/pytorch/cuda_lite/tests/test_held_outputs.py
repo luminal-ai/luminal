@@ -112,20 +112,14 @@ def test_no_reinstantiation_when_only_pointers_move():
     """A held output moves the address the plan writes to, and nothing
     else: the captured graph is updated, never rebuilt."""
     torch.manual_seed(0)
-    models = []
-
-    def capture(gm, example_inputs, **kwargs):
-        compiled = luminal_cuda_lite.Compiler()(gm, example_inputs)
-        models.append(compiled)
-        return compiled
-
+    compiler = luminal_cuda_lite.Compiler()
     model = _linear_stack()
-    compiled = torch.compile(model, backend=capture)
+    compiled = torch.compile(model, backend=compiler)
     with torch.no_grad():
         for _ in range(3):
             compiled(torch.randn(8, 64, device="cuda"))
-        assert models, "the backend compiled no graph"
-        graph = models[-1]._graph
+        assert compiler.graphs, "the backend compiled no graph"
+        graph = compiler.graphs[-1].program._graph
         warm = graph.graph_stats()
         if warm is None:
             pytest.skip("no device counters (the runtime has not run on a device)")

@@ -1130,14 +1130,6 @@ def test_passthrough_scalar_index_and_vector(device: torch.device) -> None:
     _strict_match(compiled[1], eager[1])
 
 
-@pytest.mark.xfail(
-    reason=(
-        "LUM-538: PT2 can return a mutated input with the same boundary name; "
-        "Luminal should support or explicitly reject this case. "
-        "https://linear.app/luminalai/issue/LUM-538/"
-        "pt2-mutated-input-can-be-returned-with-the-same-boundary-name-as-the"
-    )
-)
 def test_mutated_input_returned_with_same_boundary_name(device: torch.device) -> None:
     x = torch.rand(5, device=device)
     eager, compiled = _run(_SetItemReturnSameInput(), x)

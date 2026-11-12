@@ -89,10 +89,13 @@ def _reads_as_plain_storage(value: Any) -> bool:
     return type(value) in (torch.Tensor, torch.nn.Parameter, FakeTensor)
 
 
-def _refuse_unreadable(name: str, value: Any) -> None:
+def _refuse_unreadable(name: str, value: Any, *, allow_offset: bool = False) -> None:
     """Refuse a boundary value whose storage a binding cannot state: a
     tensor subclass, a layout that is not dense strides, or storage whose
-    base the binding cannot name."""
+    base the binding cannot name. ``allow_offset`` admits a value whose
+    traced storage offset is not zero: the layout statement of an output
+    the caller ALLOCATES, whose own storage starts where eager's view did
+    not."""
     if isinstance(value, torch.Tensor) and not _reads_as_plain_storage(value):
         raise UnsupportedBoundary(
             f"{name}: {type(value).__name__} is a tensor subclass with semantics of its "
@@ -104,7 +107,7 @@ def _refuse_unreadable(name: str, value: Any) -> None:
             "element strides over dense storage"
         )
     offset = _extent(value.storage_offset())
-    if offset != 0:
+    if offset != 0 and not allow_offset:
         raise UnsupportedBoundary(
             f"{name}: storage offset {offset} is not bound today; a binding names a "
             "buffer's base, and two bindings on one buffer share that base"
@@ -118,8 +121,24 @@ def boundary_shape(tensor: torch.Tensor, fake: Optional[Any] = None) -> tuple[An
     return tuple(_extent(size) for size in source.shape)
 
 
+def dense_strides(shape: Sequence[Any]) -> tuple[Any, ...]:
+    """Row-major element strides for ``shape``: an ``int`` per literal axis,
+    the program's own symbolic arithmetic per dynamic one."""
+    strides: list[Any] = []
+    span: Any = 1
+    for size in reversed(tuple(shape)):
+        strides.append(span)
+        span = span * size
+    return tuple(reversed(strides))
+
+
 def boundary_layout(
-    name: str, tensor: torch.Tensor, fake: Optional[Any] = None
+    name: str,
+    tensor: torch.Tensor,
+    fake: Optional[Any] = None,
+    *,
+    allocated: bool = False,
+    dense: bool = False,
 ) -> Strided:
     """The element strides a boundary tensor is bound at, or a refusal.
 
@@ -130,10 +149,20 @@ def boundary_layout(
     neither — is the e-graph's to discover from the chain, so nothing is
     classified here and nothing is reinterpreted: a tensor this boundary
     cannot state is an error naming it and the offending fact.
+
+    ``allocated`` states the layout of an output the caller allocates
+    fresh at these strides: eager's value may be a view starting inside
+    some intermediate's storage, and that offset is not reproduced, so it
+    is not refused. A value bound AS IT LIES (an input, or an output that
+    is a view of a boundary tensor) keeps the offset refusal. ``dense``
+    states row-major strides over the value's extents instead of the
+    strides eager gave it: the layout of an output nobody but this backend
+    reads, such as an activation saved for the backward graph.
     """
-    _refuse_unreadable(name, tensor)
+    allocated = allocated or dense
+    _refuse_unreadable(name, tensor, allow_offset=allocated)
     if fake is not None:
-        _refuse_unreadable(name, fake)
+        _refuse_unreadable(name, fake, allow_offset=allocated)
     if not tensor.is_cuda:
         raise UnsupportedBoundary(
             f"{name}: expected a CUDA tensor, got device {tensor.device}"
@@ -143,7 +172,10 @@ def boundary_layout(
             f"{name}: dtype {tensor.dtype} has no CUDA-lite storage dtype"
         )
     source = fake if fake is not None else tensor
-    strides = tuple(_extent(stride) for stride in source.stride())
+    if dense:
+        strides = tuple(_extent(stride) for stride in dense_strides(source.shape))
+    else:
+        strides = tuple(_extent(stride) for stride in source.stride())
     for axis, stride in enumerate(strides):
         if isinstance(stride, int) and stride < 0:
             raise UnsupportedBoundary(
@@ -219,13 +251,28 @@ def _dim_values(binding: Binding, tensor: torch.Tensor) -> dict[str, int]:
     return values
 
 
-def call_dim_values(pairs: Sequence[tuple[Binding, torch.Tensor]]) -> dict[str, int]:
-    """The value one call gives each dynamic dimension, read off the
-    bare-symbol axes of every boundary tensor in it. A dimension two
-    boundaries give two different extents is refused by name: the declared
-    strides are read against this one map, so it must be single-valued."""
+def call_dim_values(
+    pairs: Sequence[tuple[Binding, torch.Tensor]],
+    integers: Sequence[tuple[str, str | None, int]] = (),
+) -> dict[str, int]:
+    """The value one call gives each dynamic dimension: an integer argument
+    that is the dimension states it, and so does the bare-symbol axis of
+    every boundary tensor. ``integers`` are ``(argument name, the symbol it
+    defines, value)``. A dimension the call gives two different values is
+    refused by name: the declared strides are read against this one map,
+    so it must be single-valued."""
     values: dict[str, int] = {}
     source: dict[str, str] = {}
+    for name, symbol, value in integers:
+        if symbol is None:
+            continue
+        if symbol in values and values[symbol] != value:
+            raise UnsupportedBoundary(
+                f"dimension {symbol} is {values[symbol]} in {source[symbol]!r} and "
+                f"{value} in {name!r}: one dimension, two values"
+            )
+        values.setdefault(symbol, value)
+        source.setdefault(symbol, name)
     for binding, tensor in pairs:
         for symbol, value in _dim_values(binding, tensor).items():
             if symbol in values and values[symbol] != value:

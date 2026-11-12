@@ -624,15 +624,26 @@ impl Translator<'_> {
             "constant_pad_nd changed dtype from {:?} to {dtype:?}",
             x.dtype
         );
-        let raw = self.get_ints_arg(node, 1)?;
+        let raw = self.get_int_exprs_arg(node, 1)?;
+        // A literal amount states its own sign (a negative one crops). A
+        // symbolic amount is a pad only if it is never negative, which the
+        // program's dimension ranges must prove.
+        for amount in &raw {
+            anyhow::ensure!(
+                amount.as_num().is_some() || self.provably_nonnegative(*amount),
+                "constant_pad_nd pads by `{amount}`, which the program's dimension \
+                 ranges do not prove nonnegative; cropping by a symbolic amount is \
+                 not translated"
+            );
+        }
         let rank = x.rank();
         // ATen lists the last dimension first: [last_left, last_right, ...].
         let mut pairs: Vec<(IntExpr, IntExpr)> = Vec::new();
         let mut index = 0usize;
         while index < raw.len() {
             let left = raw[index];
-            let right = raw.get(index + 1).copied().unwrap_or(0);
-            pairs.push((IntExpr::from(left), IntExpr::from(right)));
+            let right = raw.get(index + 1).copied().unwrap_or(IntExpr::from(0));
+            pairs.push((left, right));
             index += 2;
         }
         anyhow::ensure!(
@@ -830,20 +841,43 @@ impl Translator<'_> {
         let x = self.operand(&node.inputs[0])?;
         let rank = x.rank();
         anyhow::ensure!(rank > 0, "topk on a rank-0 tensor is not ported");
-        let k = match self
-            .named_int_arg(node, "k")
-            .or_else(|| node.inputs.get(1).and_then(|input| input.arg.as_int()))
-        {
-            Some(k) => k,
-            None => bail!("topk with a tensor `k` (topk.values) is not ported"),
+        // `k` is a dimension expression, literal or symbolic: the result is
+        // the first `k` entries of the sorted axis.
+        let k_arg = node
+            .inputs
+            .iter()
+            .find(|input| input.name == "k")
+            .or_else(|| node.inputs.get(1));
+        let k = match k_arg.map(|input| (input, self.resolve_arg_as_expression(&input.arg))) {
+            Some((_, Some(k))) => k,
+            Some((input, None)) if input.arg.as_sym_int_name().is_some() => bail!(
+                "topk: cannot resolve the symbolic `k`{}",
+                self.describe_symbolic_arg(&input.arg)
+            ),
+            _ => bail!("topk with a tensor `k` (topk.values) is not ported"),
         };
-        anyhow::ensure!(k >= 0, "topk k must be nonnegative, got {k}");
-        let k = k as usize;
         let raw_dim = self
             .named_int_arg(node, "dim")
             .or_else(|| node.inputs.get(2).and_then(|input| input.arg.as_int()))
             .unwrap_or(-1);
         let dim = normalize_dim(raw_dim, rank);
+        // torch refuses a `k` outside `0..=size`. A literal states its own
+        // sign; a symbolic `k` must be kept inside the axis by the program's
+        // dimension ranges (torch's own check narrows them when it traces
+        // the call), or the slice below would read past the sorted axis.
+        match k.as_num() {
+            Some(literal) => {
+                anyhow::ensure!(literal >= 0, "topk k must be nonnegative, got {literal}")
+            }
+            None => {
+                let size = x.dims()[dim];
+                anyhow::ensure!(
+                    self.provably_nonnegative(k) && self.provably_nonnegative(size - k),
+                    "topk `k` = `{k}` is not proved to lie within the axis of size `{size}` \
+                     by the program's dimension ranges"
+                );
+            }
+        }
         let largest = self
             .named_bool_arg(node, "largest")
             .or_else(|| node.inputs.get(3).and_then(|input| input.arg.as_bool()))
@@ -852,7 +886,7 @@ impl Translator<'_> {
         // sort is a valid order.
         let key = self.order_sort_key(x);
         let order = key.stable_argsort(dim, largest);
-        let indices = order.slice_along(0..k, dim);
+        let indices = order.slice_along(IntExpr::from(0)..k, dim);
         let values = self.order_gather(x, indices, dim);
         let indices = indices.cast(DType::I64);
         self.movement_bind_outputs(node, vec![values, indices])

@@ -239,11 +239,12 @@ Historical validation snapshots remain historical records, not live API clients.
 
 The reference compiler removes `DimBucket`, normalization/remapping helpers,
 `Compiler(dim_buckets=...)`, and bucket arguments throughout AOT, local export,
-native search, and distributed compilation. `RegionRecord.bounds` reports one
-local domain. Forward/backward and DTensor regions keep their exported dimension
+native search, and distributed compilation. `GraphRecord.bounds` reports one
+local domain. Forward and backward graphs keep their exported dimension
 relationships, including tied and affine axes. Both Rust bridges use the same
 exported-bounds conversion; CUDA's implicit `[1,4096]` domain is removed.
-CUDA re-export preserves those bounds and shared/derived symbols. Profiling
+The CUDA backend compiles the same AOT graphs through the shared adapter, so
+its programs carry the same bounds and shared/derived symbols. Profiling
 shapes are evaluated without adding equality guards to the original symbolic
 metadata. Dynamic CUDA consumers explicitly declare finite domains for arena
 capacity planning.

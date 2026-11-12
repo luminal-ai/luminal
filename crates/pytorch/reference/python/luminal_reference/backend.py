@@ -1,8 +1,9 @@
 """The luminal_reference torch.compile backend.
 
 The public entry point uses AOTAutograd for inference and training. Its local
-compiler exports each ATen region to PT2 for translation and reference-runtime
-search, then binds caller tensors and symbolic dimensions on each invocation.
+compiler wraps each AOTAutograd graph as a PT2 ExportedProgram, without a second
+trace (see ``aot_graph``), for translation and reference-runtime search, then
+binds caller tensors and symbolic dimensions on each invocation.
 """
 
 import os
@@ -11,19 +12,11 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
-from torch.export import export
 
 from . import _luminal
-from .dimensions import export_specs, profile_value
-from .export_utils import (
-    _box_scalar_graph_outputs,
-    _decomp_table,
-    _drop_dead_data_dependent_ops,
-    _drop_input_guards,
-    _lower_sym_sum,
-    _register_cache_serialization,
-    private_graph_copy,
-)
+from .aot_graph import LoweredGraph, integer_argument, tensor_argument
+from .dimensions import profile_value
+from .export_utils import _decomp_table, _drop_dead_data_dependent_ops, _lower_sym_sum
 
 # torch._export.serde.schema.ScalarType codes we can round-trip today.
 _PT2_TO_TORCH = {
@@ -61,6 +54,12 @@ def _output_tensor(raw: bytes, dtype_code: int, shape: Sequence[int]) -> torch.T
 class CompiledModel:
     """Callable wrapper around a compiled reference-backend graph."""
 
+    # Whether each call evaluates the runtime checks torch asserted in the
+    # graph (a user's ``torch._check`` on a size). Binding does not depend
+    # on them: set this to ``False``, on the class or on one model, and
+    # calls run unchecked.
+    runtime_assertions = True
+
     def __init__(
         self,
         graph: Any,
@@ -74,10 +73,13 @@ class CompiledModel:
         # Graph input name -> the exported parameter/buffer tensor staged for
         # it, so a buffer mutation has somewhere to write back.
         self._held = dict(held or {})
-        names = graph.input_names
-        kinds = graph.input_kinds
+        # The program's boundary, as the translation states it. A call
+        # passes one value per argument slot: `(kind, name, read, symbol)`.
+        # The output leaves are `(kind, source, index)`.
+        self._slots = list(graph.input_slots)
+        self._output_slots = list(graph.output_slots)
         self._user_input_names = [
-            name for name, kind in zip(names, kinds) if kind == "user_input"
+            name for kind, name, read, _ in self._slots if kind == "tensor" and read
         ]
         self._output_names = graph.output_names
         self._output_dtypes = graph.output_dtypes
@@ -102,33 +104,49 @@ class CompiledModel:
             if mutation is not None
         }
 
-    def __call__(self, *args: torch.Tensor) -> Any:
-        # Under dynamic shapes Dynamo's wrapper passes the graph's symbolic
-        # shape values alongside the tensor inputs (as SymInt or int). The
-        # compiled program folds those symbols into `sym_size`, so it has no
-        # scalar inputs: keep tensors, drop the scalars.
-        inputs = [arg for arg in args if isinstance(arg, torch.Tensor)]
-        if len(inputs) != len(self._user_input_names):
+    def _bind(self, args: Sequence[Any]) -> list:
+        """Bind one call's arguments, one per slot, and return the tensors
+        the program reads. Nothing is filtered: an argument the program
+        does not read is not looked at, and a value of the wrong type for a
+        slot the program reads is refused by the slot's name."""
+        if len(args) != len(self._slots):
             raise RuntimeError(
-                f"luminal_reference expected {len(self._user_input_names)} inputs, "
-                f"got {len(inputs)}"
+                f"luminal_reference expected {len(self._slots)} inputs, got {len(args)}"
             )
-        for name, value in zip(self._user_input_names, inputs):
-            self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
+        inputs = []
+        integers = []
+        for (kind, name, read, symbol), value in zip(self._slots, args):
+            if kind == "tensor" and read:
+                value = tensor_argument(name, value)
+                inputs.append(value)
+                self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
+            elif kind == "int" and symbol is not None:
+                integers.append((name, integer_argument(name, value)))
+            # Any other argument is not looked at. A tensor no node reads
+            # is never touched, and any other symbolic scalar is the
+            # expression torch recorded for it: the program reads that,
+            # never the call's value.
+        # An integer argument that is a symbol defines that symbol, as it
+        # does for torch, so it is bound after the tensor shapes.
+        for name, value in integers:
+            self._graph.bind_int(name, value)
+        return inputs
+
+    def rows(self, *args: Any) -> list:
+        """Run one call and return the tensor the program wrote in each
+        row: the caller's own tensor for a writeback, a fresh tensor
+        otherwise."""
+        inputs = self._bind(args)
+        if self.runtime_assertions:
+            self._graph.check_assertions()
         # Output shapes depend on the bound dims, so read them after the
         # inputs are staged rather than caching them at compile time.
         output_shapes = self._graph.output_shapes
         self._graph.execute()
 
-        results = []
-        outputs = zip(
-            self._output_names,
-            self._output_dtypes,
-            output_shapes,
-            self._output_mutations,
-            self._output_returns,
-        )
-        for index, (_, dtype_code, shape, mutation, returned) in enumerate(outputs):
+        written = []
+        outputs = zip(self._output_dtypes, output_shapes, self._output_mutations)
+        for index, (dtype_code, shape, mutation) in enumerate(outputs):
             tensor = _output_tensor(self._graph.output_bytes(index), dtype_code, shape)
             if mutation is not None:
                 # A mutation target is a graph input: a user input, or a
@@ -145,177 +163,72 @@ class CompiledModel:
                 destination.copy_(tensor)
                 # A returned mutation IS the caller's tensor (same storage),
                 # matching eager's aliasing semantics.
-                if returned:
-                    results.append(destination)
-                continue
-            if returned:
-                # Scalar graph outputs were boxed into rank-zero tensors before
-                # export; restore the Python scalar backend contract here.
-                if index in self._scalar_output_positions:
-                    results.append(tensor.item())
-                else:
-                    results.append(tensor)
+                tensor = destination
+            written.append(tensor)
+        return written
+
+    def __call__(self, *args: Any) -> Any:
+        """The program's output leaves that are tensors or forwarded
+        arguments, in order."""
+        written = self.rows(*args)
+        results = []
+        for _, source, index in self._output_slots:
+            if source == "program":
+                value = written[index]
+                # Scalar graph outputs were boxed into rank-zero tensors
+                # before export; restore the Python scalar backend contract.
+                if len(results) in self._scalar_output_positions:
+                    value = value.item()
+                results.append(value)
+            elif source == "input":
+                # The leaf is an argument: the caller's own object.
+                results.append(args[index])
         # Dynamo's backend contract: return the graph's output tree (a
         # sequence), even for one result. It unwraps single-tensor returns
         # for the user.
         return tuple(results)
 
 
-def _is_dynamic(size: Any) -> bool:
-    """A dim is dynamic only if it is a SymInt that is not a literal.
-
-    Static dims can also surface as ``SymInt('8')``; those are numbers and
-    must NOT be marked dynamic.
-    """
-    return isinstance(size, torch.SymInt) and not size.node.expr.is_number
+# The version of the saved form `save_compiled` writes.
+SAVED_FORMAT = 1
 
 
-def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> Any:
-    """Export a Dynamo GraphModule, preserving its symbolic dimensions.
-
-    Dynamo hands each free symbolic dimension to the backend as an explicit
-    ``SymInt`` graph input (``view``/``reshape`` take integer shape arguments,
-    so the symbol has to be a scalar input), and ``torch.export`` rejects a raw
-    ``SymInt``. We therefore:
-
-    1. read the dynamic dims from the *fake* tensor metadata **before**
-       materialising any hint (materialising a hint specializes the ShapeEnv,
-       and every later shape comes back concrete);
-    2. erase unused ``SymInt`` placeholders and rewrite used ones to
-       ``aten.sym_size.int(tensor, dim)``, which carries the same symbol on
-       the tensor's own dimension — no scalar input survives;
-    3. re-export with a ``dynamic_shapes`` tree rebuilt from the fake metadata.
-    """
-    # Work on a copy: Dynamo keeps the original GraphModule and checks its own
-    # guards against it after the backend returns, so mutating it in place
-    # trips "Guard failed on the same frame it was created". Only the GRAPH is
-    # private; the module's weights are shared (see private_graph_copy).
-    gm = private_graph_copy(gm)
-    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
-
-    all_shapes = [
-        getattr(n.meta.get("example_value", v), "shape", ())
-        for n, v in zip(placeholders, example_inputs)
-    ]
-    axis_specs = export_specs(all_shapes)
-    records: list[tuple[str, torch.fx.Node, Any]] = []
-    tensor_dims: dict[Any, tuple[torch.fx.Node, int]] = {}
-    for node, value, dim_spec in zip(placeholders, example_inputs, axis_specs):
-        if isinstance(value, torch.SymInt):
-            records.append(("sym", node, value))
-            continue
-        shape = getattr(node.meta.get("example_value"), "shape", None)
-        if shape is None:
-            shape = getattr(value, "shape", ())
-        dims = dim_spec
-        for dim, size in enumerate(shape):
-            if _is_dynamic(size):
-                tensor_dims.setdefault(size.node.expr, (node, dim))
-        records.append(("tensor", node, dims))
-
-    # Pass 2: rewrite used SymInts to `sym_size`, drop unused ones.
-    erased: set[int] = set()
-    for kind, node, value in records:
-        if kind != "sym":
-            continue
-        if not node.users:
-            gm.graph.erase_node(node)
-            erased.add(id(node))
-            continue
-        source = tensor_dims.get(value.node.expr)
-        if source is None:
-            raise RuntimeError(
-                f"cannot locate the tensor dimension for symbolic input {value}"
-            )
-        tensor_node, dim = source
-        with gm.graph.inserting_after(tensor_node):
-            size = gm.graph.call_function(
-                torch.ops.aten.sym_size.int, args=(tensor_node, dim)
-            )
-        node.replace_all_uses_with(size)
-        gm.graph.erase_node(node)
-        erased.add(id(node))
-    if erased:
-        gm.graph.lint()
-        gm.recompile()
-
-    inputs: list[Any] = []
-    specs: list[Any] = []
-    any_dynamic = False
-    for (kind, node, info), value in zip(records, example_inputs):
-        if id(node) in erased:
-            continue
-        inputs.append(value)
-        if kind == "tensor" and info:
-            specs.append(info)
-            any_dynamic = True
-        else:
-            specs.append(None)
-
-    dynamic_shapes = {"args": tuple(specs)} if any_dynamic else None
-
-    # The AOT local compiler isolates FakeTensor and TracingContext before
-    # entering here. Keep export on the owning thread: native reference graphs
-    # are unsendable, and cyclic GC in an export worker could destroy them.
-    ep = export(gm, tuple(inputs), dynamic_shapes=dynamic_shapes, strict=False)
-    return ep, inputs
+def save_compiled(model: CompiledModel) -> dict:
+    """A compiled AOTAutograd graph as plain data: the graph the translator
+    reads, the plan search selected for it, and the constants the program
+    holds. Nothing in it has to be searched for again."""
+    program = model._ep
+    if not isinstance(program, LoweredGraph):
+        raise TypeError(
+            "only a graph lowered in process is saved; this model was compiled "
+            f"from a {type(program).__name__}"
+        )
+    return {
+        "format": SAVED_FORMAT,
+        "program": program.program_json(),
+        "plan": bytes(model._graph.serialize_compiled()),
+        "constants": dict(model._held),
+    }
 
 
-def _prepare_local_graph(
-    gm: torch.fx.GraphModule,
-    example_inputs: Sequence[Any],
-) -> tuple:
-    """Export one local ATen graph after AOT partitioning."""
-
-    # HF DynamicCache must be pytree-registered before torch.export capture so
-    # use_cache=True models can export. Idempotent.
-    _register_cache_serialization()
-
-    # Canonicalize scalar (SymInt/SymFloat/SymBool) graph outputs into rank-zero
-    # tensors before the export capture. Work on a private copy: Dynamo holds
-    # onto the original graph module for guard installation and retracing, and
-    # mutating it here would corrupt that bookkeeping. The copy shares the
-    # module's weights (see private_graph_copy).
-    gm = private_graph_copy(gm)
-    scalar_output_positions = _box_scalar_graph_outputs(gm)
-
-    # The graph-module preprocessing above runs first; `_dynamic_export` then
-    # rewrites the SymInt placeholders onto `sym_size` and runs the nested
-    # `torch.export`, so the exported program keeps its symbolic dims.
-    ep, export_inputs = _dynamic_export(gm, example_inputs)
-    # LUM-499: drop dynamo-emitted input guards before run_decompositions calls
-    # ep.module(), which would otherwise emit a `_guards_fn` containing
-    # data-dependent .item() calls and unresolved `L[...]` references.
-    _drop_input_guards(ep)
-    _drop_dead_data_dependent_ops(ep.graph_module)
-    # Functionalise WITHOUT decomposing: every in-place op becomes its
-    # functional form plus a USER_INPUT_MUTATION spec naming the input storage
-    # it writes, and a mutation through a view becomes an explicit scatter
-    # (select_scatter / slice_scatter). The empty table decomposes nothing, so
-    # composites the translator lowers directly (aten.linear) survive. The
-    # translator reads mutations from the specs and refuses in-place ops.
-    try:
-        ep = ep.run_decompositions({})
-    except AssertionError as exc:
-        # torch's export functionalisation cannot express a write to an
-        # input that shares storage with another input (its alias wrapper
-        # returns a callable where export needs a graph); the program is
-        # refused by name, not translated.
-        if "expected compiled_fn to be GraphModule" not in str(exc):
-            raise
+def load_compiled(saved: dict) -> CompiledModel:
+    """The compiled model ``save_compiled`` described: the saved graph is
+    translated again and the saved plan installed on it. No search runs."""
+    if saved.get("format") != SAVED_FORMAT:
         raise RuntimeError(
-            "graph inputs share device storage and the program writes one of them: "
-            "the export cannot functionalise a write through aliased inputs"
-        ) from exc
-    _drop_dead_data_dependent_ops(ep.graph_module)
-    # Serde gap workaround; must run before save. See _lower_sym_sum.
-    _lower_sym_sum(ep)
-
-    return ep, export_inputs, scalar_output_positions
+            f"saved program has format {saved.get('format')!r}; this build of "
+            f"luminal_reference reads format {SAVED_FORMAT}"
+        )
+    graph = _luminal.compile_graph(saved["program"])
+    graph.load_compiled(saved["plan"])
+    held = dict(saved["constants"])
+    for name, value in held.items():
+        graph.set_input(name, _tensor_bytes(value), list(value.shape))
+    return CompiledModel(graph, None, (), held)
 
 
 def _compile_local_graph(
-    gm: torch.fx.GraphModule,
+    program: LoweredGraph,
     example_inputs: Sequence[Any],
     options: dict | None = None,
     search_iterations: int | None = None,
@@ -323,7 +236,8 @@ def _compile_local_graph(
     max_intermediate_bytes: int | None = None,
     memory_budget_bytes: int | None = None,
 ) -> CompiledModel:
-    """Compile one local ATen graph after AOT partitioning."""
+    """Compile one lowered AOTAutograd graph with the native runtime.
+    ``example_inputs`` holds one example value per argument slot."""
     if options:
         search_iterations = options.get("search_iterations", search_iterations)
         search_log = options.get("search_log", search_log)
@@ -331,17 +245,15 @@ def _compile_local_graph(
             "max_intermediate_bytes", max_intermediate_bytes
         )
         memory_budget_bytes = options.get("memory_budget_bytes", memory_budget_bytes)
-    ep, export_inputs, scalar_output_positions = _prepare_local_graph(
-        gm, example_inputs
-    )
     return compile_exported(
-        ep,
-        export_inputs,
+        program,
+        example_inputs,
         search_iterations,
-        scalar_output_positions,
         search_log=search_log,
         max_intermediate_bytes=max_intermediate_bytes,
         memory_budget_bytes=memory_budget_bytes,
+        decompose_on_rejection=False,
+        symbolic_outputs=True,
     )
 
 
@@ -354,11 +266,26 @@ def compile_exported(
     search_log=False,
     max_intermediate_bytes=None,
     memory_budget_bytes=None,
-    artifact=None,
+    decompose_on_rejection=True,
+    symbolic_outputs=False,
 ):
-    """Compile a functional ExportedProgram with the native runtime."""
+    """Compile a functional program with the native runtime: an
+    ``ExportedProgram``, or an AOTAutograd graph lowered in process.
+
+    ``decompose_on_rejection`` retries a translator rejection after running
+    the core decompositions on the program. It serves programs captured by
+    ``torch.export``; the AOTAutograd path decomposes once up front and
+    passes ``False`` so an unsupported op fails by name.
+
+    ``symbolic_outputs`` says the caller evaluates output leaves that are
+    symbolic scalars itself, as the AOTAutograd adapter does. Without it a
+    program with such a leaf is refused: the compiled model returns tensors.
+    """
 
     def _save_and_compile(program: Any) -> Any:
+        # An AOTAutograd graph is handed to the translator in process.
+        if isinstance(program, LoweredGraph):
+            return _luminal.compile_graph(program.program_json())
         with tempfile.TemporaryDirectory() as tmp:
             pt2_path = os.path.join(tmp, "model.pt2")
             torch.export.save(program, pt2_path)
@@ -373,7 +300,7 @@ def compile_exported(
         # ``aten.linear`` -> ``aten.addmm``). Gate the aggressive pass on an
         # actual translator rejection so the common case keeps its original,
         # un-decomposed graph.
-        if "unsupported ATen op" not in str(exc):
+        if not decompose_on_rejection or "unsupported ATen op" not in str(exc):
             raise
         ep = ep.run_decompositions(_decomp_table())
         _drop_dead_data_dependent_ops(ep.graph_module)
@@ -384,23 +311,36 @@ def compile_exported(
     kinds = graph.input_kinds
     parameter_names = graph.parameter_names
 
-    user_index = 0
+    # One example value per argument slot, in call order.
+    slots = graph.input_slots
+    if len(slots) != len(export_inputs):
+        raise RuntimeError(
+            f"export declared {len(slots)} user inputs "
+            f"({', '.join(name for _, name, _, _ in slots)}) and was given "
+            f"{len(export_inputs)} example_inputs"
+        )
+    examples = {name: value for (_, name, _, _), value in zip(slots, export_inputs)}
+    if not symbolic_outputs:
+        for position, (kind, source, _) in enumerate(graph.output_slots):
+            if source == "expression":
+                raise RuntimeError(
+                    f"output leaf {position} is a symbolic {kind} computed from "
+                    "sizes; this entry point returns tensors only"
+                )
+
     held: dict = {}
     for name, kind, parameter_name in zip(names, kinds, parameter_names):
         if kind == "user_input":
-            if user_index >= len(export_inputs):
-                raise RuntimeError(
-                    f"export declared more user inputs than example_inputs: {name!r}"
-                )
-            value = export_inputs[user_index]
-            user_index += 1
+            value = examples[name]
         else:
-            if parameter_name not in ep.state_dict:
+            value = ep.state_dict.get(parameter_name)
+            if value is None:
+                value = ep.constants.get(parameter_name)
+            if value is None:
                 raise RuntimeError(
                     f"parameter {parameter_name!r} (graph input {name!r}) is not in "
-                    "the exported state_dict"
+                    "the exported state_dict or constants"
                 )
-            value = ep.state_dict[parameter_name]
             # The export's own tensor, not the caller's module buffer: mutated
             # state persists across calls on the input's runtime buffer.
             held[name] = value
@@ -413,18 +353,16 @@ def compile_exported(
                 )
         graph.set_input(name, _tensor_bytes(value), list(value.shape))
 
-    if user_index != len(export_inputs):
-        raise RuntimeError(
-            f"export consumed {user_index} of {len(export_inputs)} example_inputs"
-        )
+    # An integer argument that defines a symbol is profiled at the value
+    # torch traced it with.
+    for (kind, name, _, symbol), value in zip(slots, export_inputs):
+        if kind == "int" and symbol is not None:
+            graph.bind_int(name, integer_argument(name, profile_value(value)))
 
-    if artifact is None:
-        graph.search(
-            search_iterations,
-            search_log=search_log,
-            max_intermediate_bytes=max_intermediate_bytes,
-            memory_budget_bytes=memory_budget_bytes,
-        )
-    else:
-        graph.load_compiled(artifact, memory_budget_bytes=memory_budget_bytes)
+    graph.search(
+        search_iterations,
+        search_log=search_log,
+        max_intermediate_bytes=max_intermediate_bytes,
+        memory_budget_bytes=memory_budget_bytes,
+    )
     return CompiledModel(graph, ep, scalar_output_positions, held)

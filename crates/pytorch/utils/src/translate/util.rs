@@ -677,12 +677,21 @@ impl Translator<'_> {
         if let Some(v) = arg.as_int() {
             return Ok(v);
         }
-        if let Some(expr) = self.resolve_arg_as_expression(arg)
-            && let Some(v) = expr.to_usize()
-        {
-            return Ok(v as i64);
+        if let Some(expr) = self.resolve_arg_as_expression(arg) {
+            if let Some(v) = expr.to_usize() {
+                return Ok(v as i64);
+            }
+            bail!(
+                "input {idx} of {} must be a literal integer in this lowering, but is \
+                 the symbolic value `{expr}`",
+                node.target
+            );
         }
-        bail!("input {idx} of {} is not an int: {arg:?}", node.target)
+        bail!(
+            "input {idx} of {} is not an int{}",
+            node.target,
+            self.describe_symbolic_arg(arg)
+        )
     }
 
     pub(super) fn get_float_arg(&self, node: &Node, idx: usize) -> Result<f64> {
@@ -696,6 +705,17 @@ impl Translator<'_> {
         }
         if let Some(i) = arg.as_int() {
             return Ok(i as f64);
+        }
+        if matches!(
+            arg,
+            Argument::SymInt(_) | Argument::SymFloat(_) | Argument::SymBool(_)
+        ) {
+            bail!(
+                "input {idx} of {} must be a literal number in this lowering, but is \
+                 a symbolic value{}",
+                node.target,
+                self.describe_symbolic_arg(arg)
+            );
         }
         bail!("input {idx} of {} is not a float: {arg:?}", node.target)
     }
@@ -733,14 +753,15 @@ impl Translator<'_> {
                 match entry {
                     SymIntEntry::Int(i) => out.push(i.as_int),
                     SymIntEntry::Name(s) => {
-                        let v = self
-                            .resolve_sym_int(&s.as_name)
-                            .and_then(|e| e.to_usize())
-                            .map(|u| u as i64)
-                            .with_context(|| {
-                                format!("input {idx} of {} has an unresolved sym_int", node.target)
-                            })?;
-                        out.push(v);
+                        let expr = self.resolve_sym_int_entry(node, idx, &s.as_name)?;
+                        let Some(v) = expr.to_usize() else {
+                            bail!(
+                                "input {idx} of {} must be literal integers in this \
+                                 lowering, but has the symbolic entry `{expr}`",
+                                node.target
+                            );
+                        };
+                        out.push(v as i64);
                     }
                 }
             }
@@ -749,6 +770,20 @@ impl Translator<'_> {
         arg.as_ints()
             .map(|v| v.to_vec())
             .with_context(|| format!("input {idx} of {} is not an int list", node.target))
+    }
+
+    /// One named entry of a symbolic integer list as its expression.
+    fn resolve_sym_int_entry(&self, node: &Node, idx: usize, name: &str) -> Result<IntExpr> {
+        self.resolve_sym_int(name).with_context(|| {
+            let source = match self.symbolic_value_source(name) {
+                Some(source) => format!(" = {source}"),
+                None => String::new(),
+            };
+            format!(
+                "input {idx} of {}: cannot resolve the symbolic integer `{name}`{source}",
+                node.target
+            )
+        })
     }
 
     /// Like [`Self::get_ints_arg`], but keeps symbolic entries as `IntExpr`
@@ -766,9 +801,7 @@ impl Translator<'_> {
                 .iter()
                 .map(|entry| match entry {
                     SymIntEntry::Int(i) => Ok(IntExpr::from(i.as_int)),
-                    SymIntEntry::Name(s) => self.resolve_sym_int(&s.as_name).with_context(|| {
-                        format!("input {idx} of {} has an unresolved sym_int", node.target)
-                    }),
+                    SymIntEntry::Name(s) => self.resolve_sym_int_entry(node, idx, &s.as_name),
                 })
                 .collect();
         }

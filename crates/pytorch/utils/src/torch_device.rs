@@ -38,7 +38,10 @@ impl fmt::Display for TorchDevice {
 /// The one device the program's tensors live on, or `None` when the export
 /// states no device. Inputs that disagree, or any value on another device,
 /// are refused by name.
-pub fn program_device(parsed: &ParsedPT2) -> Result<Option<TorchDevice>> {
+pub fn program_device(
+    parsed: &ParsedPT2,
+    unread: &std::collections::HashSet<&str>,
+) -> Result<Option<TorchDevice>> {
     let graph = &parsed.program.graph_module.graph;
     let device_of = |name: &str| -> Option<TorchDevice> {
         graph
@@ -53,6 +56,10 @@ pub fn program_device(parsed: &ParsedPT2) -> Result<Option<TorchDevice>> {
         let Some(name) = input.value_name() else {
             continue;
         };
+        // An argument no node reads is never touched, wherever it lives.
+        if unread.contains(name) {
+            continue;
+        }
         let Some(device) = device_of(name) else {
             continue;
         };
@@ -80,6 +87,9 @@ pub fn program_device(parsed: &ParsedPT2) -> Result<Option<TorchDevice>> {
     let mut names: Vec<&String> = graph.tensor_values.keys().collect();
     names.sort();
     for name in names {
+        if unread.contains(name.as_str()) {
+            continue;
+        }
         if let Some(device) = device_of(name)
             && device != expected
         {
@@ -100,6 +110,11 @@ mod tests {
     use super::*;
     use crate::pt2_schema::{DimInt, DimSize, ExportedProgram, GraphModule, Signature, TensorMeta};
     use crate::translate::test_support::*;
+
+    /// The program's device with every argument read.
+    fn program_device_of(parsed: &ParsedPT2) -> Result<Option<TorchDevice>> {
+        program_device(parsed, &Default::default())
+    }
 
     fn device(kind: &str, index: Option<i64>) -> Device {
         Device {
@@ -137,6 +152,8 @@ mod tests {
                         )],
                         tensor_values,
                         sym_int_values: std::collections::HashMap::new(),
+                        sym_bool_values: std::collections::HashMap::new(),
+                        sym_float_values: std::collections::HashMap::new(),
                     },
                     signature: Signature {
                         input_specs: Vec::new(),
@@ -155,18 +172,21 @@ mod tests {
     #[test]
     fn a_program_on_one_device_reports_it() {
         let cuda = || Some(device("cuda", Some(0)));
-        let found = program_device(&program([cuda(), cuda(), cuda()])).unwrap();
+        let found = program_device_of(&program([cuda(), cuda(), cuda()])).unwrap();
         assert_eq!(found.map(|d| d.to_string()), Some("cuda:0".to_string()));
     }
 
     #[test]
     fn an_export_that_states_no_device_reports_none() {
-        assert_eq!(program_device(&program([None, None, None])).unwrap(), None);
+        assert_eq!(
+            program_device_of(&program([None, None, None])).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn inputs_on_different_devices_are_refused_by_name() {
-        let err = program_device(&program([
+        let err = program_device_of(&program([
             Some(device("cpu", None)),
             Some(device("cuda", Some(0))),
             None,
@@ -181,7 +201,7 @@ mod tests {
 
     #[test]
     fn two_cuda_indices_are_different_devices() {
-        let err = program_device(&program([
+        let err = program_device_of(&program([
             Some(device("cuda", Some(0))),
             Some(device("cuda", Some(1))),
             None,
@@ -194,7 +214,7 @@ mod tests {
     #[test]
     fn a_value_moved_to_another_device_is_refused_with_its_producer() {
         let cpu = || Some(device("cpu", None));
-        let err = program_device(&program([cpu(), cpu(), Some(device("cuda", Some(0)))]))
+        let err = program_device_of(&program([cpu(), cpu(), Some(device("cuda", Some(0)))]))
             .unwrap_err()
             .to_string();
         assert!(

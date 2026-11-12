@@ -9,7 +9,7 @@ use luminal::prelude::*;
 
 use super::Translator;
 use super::util::{self, normalize_dim};
-use crate::pt2_schema::Node;
+use crate::pt2_schema::{Argument, Node};
 
 /// Reduction family for the keepdim-aware `sum`/`mean`/`max`/`min`/`prod`.
 #[derive(Clone, Copy)]
@@ -288,11 +288,31 @@ impl Translator<'_> {
         Ok(out.expand(aligned))
     }
 
+    /// `repeat(counts)`: tile each axis by its count. A count is a
+    /// dimension expression, literal or symbolic. torch refuses a negative
+    /// count, so one that torch's ranges do not prove nonnegative is
+    /// refused here rather than tiled by whatever it evaluates to. More
+    /// counts than axes prepend size-1 axes, as torch does.
     pub(super) fn translate_repeat(&mut self, node: &Node) -> Result<GraphTensor> {
-        let x = self.operand(&node.inputs[0])?;
-        let repeats = self.get_ints_arg(node, 1)?;
-        let repeats: Vec<usize> = repeats.iter().map(|r| (*r).max(0) as usize).collect();
-        Ok(x.repeat(repeats.as_slice()))
+        let mut x = self.operand(&node.inputs[0])?;
+        let repeats = self.get_int_exprs_arg(node, 1)?;
+        for count in &repeats {
+            anyhow::ensure!(
+                self.provably_nonnegative(*count),
+                "repeat count `{count}` is not proved nonnegative by the program's \
+                 dimension ranges"
+            );
+        }
+        anyhow::ensure!(
+            repeats.len() >= x.rank(),
+            "repeat received {} counts for a rank-{} tensor",
+            repeats.len(),
+            x.rank()
+        );
+        while x.rank() < repeats.len() {
+            x = x.expand_dim(0, 1usize);
+        }
+        Ok(x.repeat(repeats))
     }
 
     pub(super) fn translate_stack(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -479,18 +499,26 @@ impl Translator<'_> {
     // ---------------------------------------------------------------
 
     pub(super) fn translate_full(&mut self, node: &Node, like: bool) -> Result<GraphTensor> {
-        let (shape, dtype, value) = if like {
+        let (shape, dtype) = if like {
             let x = self.operand(&node.inputs[0])?;
-            let meta = self.output_meta_dtype(node).unwrap_or(x.dtype);
-            (x.dims(), meta, self.get_number_arg(node, 1)?)
+            (x.dims(), self.output_meta_dtype(node).unwrap_or(x.dtype))
         } else {
-            let shape = self.get_int_exprs_arg(node, 0)?;
             (
-                shape,
+                self.get_int_exprs_arg(node, 0)?,
                 self.output_meta_dtype(node)?,
-                self.get_number_arg(node, 1)?,
             )
         };
+        // A symbolic fill (`torch.full(shape, x.shape[0])`) is a scalar like
+        // any other; a literal keeps its exact double.
+        if let Some(fill) = node.inputs.get(1)
+            && matches!(
+                fill.arg,
+                Argument::SymInt(_) | Argument::Expr(_) | Argument::SymBool(_)
+            )
+        {
+            return Ok(self.scalar(fill, dtype)?.expand_rhs(shape));
+        }
+        let value = self.get_number_arg(node, 1)?;
         Ok(self.full_tensor(shape, dtype, value))
     }
 

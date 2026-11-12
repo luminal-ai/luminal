@@ -138,6 +138,7 @@ def _box_scalar_graph_outputs(gm):
     inside Luminal the values remain ordinary typed rank-zero tensors.
     """
     import torch
+    from torch._guards import detect_fake_mode
 
     output = next(node for node in gm.graph.nodes if node.op == "output")
     flat_outputs, output_spec = torch.utils._pytree.tree_flatten(output.args[0])
@@ -174,8 +175,20 @@ def _box_scalar_graph_outputs(gm):
 
         with gm.graph.inserting_before(output):
             boxed = gm.graph.call_function(
-                torch.scalar_tensor, (value,), {"dtype": dtype}
+                torch.ops.aten.scalar_tensor.default, (value,), {"dtype": dtype}
             )
+        # A graph that is serialized without re-tracing needs the node's
+        # value metadata; a graph that is re-exported regenerates it.
+        fake_mode = detect_fake_mode(
+            [
+                node.meta.get("val")
+                for node in gm.graph.nodes
+                if node.op == "placeholder"
+            ]
+        )
+        if fake_mode is not None:
+            with fake_mode:
+                boxed.meta["val"] = torch.empty((), dtype=dtype)
         boxed_outputs.append(boxed)
         scalar_output_positions.append(compiled_position)
         compiled_position += 1
@@ -224,6 +237,132 @@ def _decomp_table():
 # ---------------------------------------------------------------------------
 # Symbolic-sum serde workaround
 # ---------------------------------------------------------------------------
+
+
+# Composite ATen ops the translator lowers as single Luminal ops. This mirrors
+# the dispatch table in crates/pytorch/utils/src/translate.rs (follow-up: export
+# that list from Rust instead of restating it here). The core ATen
+# decomposition table would split these into primitives that search then has
+# to reassemble, so they are preserved for the translator.
+_NATIVELY_LOWERED = frozenset(
+    {
+        "__and__.Tensor",
+        "__or__.Tensor",
+        "__xor__.Tensor",
+        "_fused_rms_norm.default",
+        "_scaled_dot_product_flash_attention_for_cpu.default",
+        "_unsafe_view.default",
+        "_upsample_bilinear2d_aa.vec",
+        "_upsample_nearest_exact1d.default",
+        "_upsample_nearest_exact1d.vec",
+        "_upsample_nearest_exact2d.default",
+        "_upsample_nearest_exact2d.vec",
+        "_upsample_nearest_exact3d.default",
+        "_upsample_nearest_exact3d.vec",
+        "adaptive_avg_pool2d.default",
+        "adaptive_avg_pool3d.default",
+        "arange.default",
+        "arange.start",
+        "argsort.default",
+        "binary_cross_entropy_with_logits.default",
+        "cat.default",
+        "celu.default",
+        "clamp_max.Tensor",
+        "clamp_min.Tensor",
+        "conv2d.default",
+        "detach.default",
+        "dot.default",
+        "floor_divide.default",
+        "glu.default",
+        "group_norm.default",
+        "im2col.default",
+        "isfinite.default",
+        "item.default",
+        "layer_norm.default",
+        "leaky_relu.default",
+        "linalg_vector_norm.default",
+        "linear.default",
+        "log_softmax.int",
+        "logaddexp.default",
+        "logaddexp2.default",
+        "logit.default",
+        "masked_fill.Scalar",
+        "matmul.default",
+        "max_pool2d.default",
+        "mish.default",
+        "mvlgamma.default",
+        "nansum.default",
+        "ones.default",
+        "ones_like.default",
+        "pad.default",
+        "repeat_interleave.self_Tensor",
+        "repeat_interleave.self_int",
+        "rms_norm.default",
+        "rsub.Scalar",
+        "rsub.Tensor",
+        "scaled_dot_product_attention.default",
+        "select_scatter.default",
+        "silu.default",
+        "sinc.default",
+        "smooth_l1_loss.default",
+        "soft_margin_loss.default",
+        "softmax.int",
+        "softplus.default",
+        "special_i0.default",
+        "special_xlog1py.default",
+        "split.Tensor",
+        "square.default",
+        "squeeze.default",
+        "squeeze.dim",
+        "stack.default",
+        "std.correction",
+        "std.default",
+        "std.dim",
+        "sum.default",
+        "sym_size.int",
+        "t.default",
+        "transpose.int",
+        "tril.default",
+        "triu.default",
+        "unbind.int",
+        "upsample_bicubic2d.vec",
+        "upsample_linear1d.default",
+        "upsample_linear1d.vec",
+        "upsample_nearest1d.default",
+        "upsample_nearest1d.vec",
+        "upsample_nearest2d.default",
+        "upsample_nearest3d.default",
+        "upsample_nearest3d.vec",
+        "upsample_trilinear3d.vec",
+        "var.default",
+        "var.dim",
+        "var_mean.default",
+        "var_mean.dim",
+        "vdot.default",
+        "where.ScalarOther",
+        "xlogy.Tensor",
+        "zeros_like.default",
+    }
+)
+
+
+def _aot_decomposition_table():
+    """The one decomposition table AOTAutograd applies while tracing.
+
+    Core ATen decompositions, minus SDPA (see `_decomp_table`), minus the
+    composites the translator lowers directly. Every other op the translator
+    cannot lower is decomposed into primitives it can, and an op outside both
+    sets fails translation by name. Passed to ``aot_autograd`` as a thunk, so
+    the table is built once per compiler.
+    """
+    table = _decomp_table()
+    if table is None:
+        return {}
+    for op in list(table):
+        name = f"{op._schema.name.split('::')[-1]}.{op._overloadname}"
+        if name in _NATIVELY_LOWERED:
+            table.pop(op, None)
+    return table.materialize() if hasattr(table, "materialize") else dict(table)
 
 
 def _lower_sym_sum(ep) -> None:
@@ -353,6 +492,7 @@ def _drop_dead_data_dependent_ops(gm):
 
 
 __all__ = [
+    "_aot_decomposition_table",
     "_box_scalar_graph_outputs",
     "_decomp_table",
     "_drop_dead_data_dependent_ops",

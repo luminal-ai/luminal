@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
-from backend_test_utils import luminal_backend
+from backend_test_utils import luminal_backend, record_translated_targets
 
 
 def _compile(module: torch.nn.Module, *inputs: torch.Tensor, dynamic_shapes=None):
@@ -968,27 +968,14 @@ def test_fixed_shape_indexing_and_search_composites() -> None:
 
 
 def _backend_path(module: torch.nn.Module, monkeypatch, **compile_options):
-    """`torch.compile` through the luminal backend, the real two-stage path.
+    """`torch.compile` through the luminal backend, the real path.
 
-    Returns the compiled module and the ATen targets of every program handed
-    to the translator. Stage 1 is the undecomposed graph; a second attempt
-    appears only if stage 1 raised "unsupported ATen op". The list doubles as
-    a recompile guard: one entry per compilation.
+    Returns the compiled module and the ATen targets of every graph handed
+    to the translator: the graph as AOTAutograd decomposed it once, with the
+    ops the translator lowers itself left whole. The list doubles as a
+    recompile guard: one entry per compilation.
     """
-    attempts: list[set[str]] = []
-    save = torch.export.save
-
-    def recording_save(program, *args, **kwargs):
-        attempts.append(
-            {
-                str(node.target)
-                for node in program.graph.nodes
-                if node.op == "call_function"
-            }
-        )
-        return save(program, *args, **kwargs)
-
-    monkeypatch.setattr(torch.export, "save", recording_save)
+    attempts = record_translated_targets(monkeypatch)
     compiled = torch.compile(
         module, backend=luminal_backend, fullgraph=True, **compile_options
     )
@@ -1783,23 +1770,10 @@ class PairwiseDistance(torch.nn.Module):
 
 
 def _check_pdist_real_path(monkeypatch, points, p) -> None:
-    """Compile through `torch.compile`'s two-stage backend and require that
-    stage 1 translated the undecomposed `_pdist_forward` (no stage-2 retry),
-    so the pdist lowering itself is what runs."""
-    saved = []
-    save = torch.export.save
-
-    def recording_save(program, *args, **kwargs):
-        saved.append(
-            {
-                str(node.target)
-                for node in program.graph.nodes
-                if node.op == "call_function"
-            }
-        )
-        return save(program, *args, **kwargs)
-
-    monkeypatch.setattr(torch.export, "save", recording_save)
+    """Compile through `torch.compile` and require that the translator was
+    handed the undecomposed `_pdist_forward`, so the pdist lowering itself
+    is what runs."""
+    saved = record_translated_targets(monkeypatch)
     module = PairwiseDistance(p)
     actual = torch.compile(module, backend=luminal_backend)(points)
     assert saved == [{"aten._pdist_forward.default"}]

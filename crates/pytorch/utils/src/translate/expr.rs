@@ -1,8 +1,10 @@
-//! Symbolic-dimension resolution for PT2 expressions.
+//! Symbolic-value resolution for PT2 expressions.
 //!
-//! Bare symbols and compound sympy expressions (`Add`, `Mul`, `FloorDiv`,
-//! `Mod`, `Min`, `Max`) map to recorder `IntExpr`s so dynamic dims survive
-//! as expressions instead of freezing at the export hint. Torch's exported
+//! Bare symbols and compound sympy expressions (`Add`, `Mul`, `Pow`,
+//! `FloorDiv`, `CleanDiv`, `Mod`, `PythonMod`, `Min`, `Max`) map to recorder
+//! `IntExpr`s so dynamic dims survive as expressions instead of freezing at
+//! the export hint. A symbolic bool (a comparison of symbolic integers)
+//! maps to the expression of its integer reading, 1 or 0. Torch's exported
 //! range constraints feed the bounds simplifier; anything unresolved
 //! fails translation; a sample hint must never freeze a dynamic dimension.
 #![allow(dead_code)]
@@ -28,6 +30,77 @@ impl Translator<'_> {
             .get("as_int")
             .and_then(|v| v.as_i64())
             .map(IntExpr::from)
+    }
+
+    /// Resolve a PT2 sym_bool value by name to the expression of its
+    /// integer reading: 1 where the comparison holds, 0 where it does not.
+    pub(super) fn resolve_sym_bool(&self, name: &str) -> Option<IntExpr> {
+        let values = &self.parsed.program.graph_module.graph.sym_bool_values;
+        let value = values.get(name)?;
+        if let Some(expr_str) = value
+            .get("as_expr")
+            .and_then(|e| e.get("expr_str"))
+            .and_then(|s| s.as_str())
+        {
+            return self.resolve_expr_str(expr_str);
+        }
+        value
+            .get("as_bool")
+            .and_then(|v| v.as_bool())
+            .map(|v| IntExpr::from(v as i64))
+    }
+
+    /// A symbolic scalar argument as the expression of its value: a
+    /// symbolic integer, or a symbolic bool read as 1 or 0.
+    pub(super) fn resolve_symbolic_scalar(&self, arg: &Argument) -> Option<IntExpr> {
+        match arg {
+            Argument::SymBool(value) => self.resolve_sym_bool(&value.as_sym_bool.as_name),
+            _ => self.resolve_arg_as_expression(arg),
+        }
+    }
+
+    /// The sympy expression torch recorded for a named symbolic value, for
+    /// a refusal that has to say what it could not use.
+    pub(super) fn symbolic_value_source(&self, name: &str) -> Option<&str> {
+        let graph = &self.parsed.program.graph_module.graph;
+        graph
+            .sym_int_values
+            .get(name)
+            .or_else(|| graph.sym_bool_values.get(name))
+            .or_else(|| graph.sym_float_values.get(name))?
+            .get("as_expr")?
+            .get("expr_str")?
+            .as_str()
+    }
+
+    /// ` (`name` = <sympy expression>)` for a named symbolic argument, and
+    /// the argument's debug form for anything else.
+    pub(super) fn describe_symbolic_arg(&self, arg: &Argument) -> String {
+        let name = match arg {
+            Argument::SymInt(value) => Some(value.as_sym_int.as_name.as_str()),
+            Argument::SymBool(value) => Some(value.as_sym_bool.as_name.as_str()),
+            Argument::SymFloat(value) => Some(value.as_sym_float.as_name.as_str()),
+            _ => None,
+        };
+        match name {
+            Some(name) => match self.symbolic_value_source(name) {
+                Some(source) => format!(" (`{name}` = {source})"),
+                None => format!(" (`{name}`)"),
+            },
+            None => format!(" (arg: {arg:?})"),
+        }
+    }
+
+    /// Whether torch's range constraints prove a dimension expression
+    /// nonnegative for every call the program admits.
+    pub(super) fn provably_nonnegative(&self, expr: IntExpr) -> bool {
+        if let Some(value) = expr.as_num() {
+            return value >= 0;
+        }
+        let symbols = super::sympy::symbol_bounds(&self.symbols, &self.ranges);
+        super::sympy::bounds_of_expr(expr, &symbols)
+            .min
+            .is_some_and(|min| min >= 0)
     }
 
     pub(super) fn resolve_arg_as_expression(&self, arg: &Argument) -> Option<IntExpr> {
@@ -65,9 +138,10 @@ impl Translator<'_> {
     }
 
     /// Resolve a PT2 sympy `srepr` expression string into a recorder
-    /// dimension. Bare `Symbol('s77', ...)` and compound expressions
-    /// (`Add`, `Mul`, `FloorDiv`, `Mod`, `Min`, `Max`) are parsed; torch's
-    /// exported range constraints feed the bounds simplifier.
+    /// dimension. Bare `Symbol('s77', ...)` and the compound expressions
+    /// `sympy::parse_sympy_expr` reads are parsed; torch's exported range
+    /// constraints feed the bounds simplifier and decide how a division or
+    /// remainder that may see a negative operand is spelled.
     pub(super) fn resolve_expr_str(&self, expr_str: &str) -> Option<IntExpr> {
         super::sympy::parse_sympy_expr_with_ranges(expr_str, &self.symbols, &self.ranges)
     }

@@ -5,27 +5,10 @@ dependency enforces the same minimum during installation. On Linux/Windows,
 the configured CUDA wheel source is CUDA 13.0; the CUDA 12.8 index does not
 provide PyTorch 2.14 wheels.
 
-## Run a minimal SPMD example
-
-From the repository root:
-
-```sh
-cd crates/pytorch/reference
-uv run --group dev maturin develop
-uv run python examples/spmd.py
-```
-
-[`examples/spmd.py`](examples/spmd.py) runs one inference-only sharded matrix
-multiply on two CPU ranks. It launches both ranks automatically, using a temporary
-file for rendezvous and the local loopback interface for Gloo communication
-(`lo0` on macOS, `lo` on Linux), without hostname discovery. It checks the result against dense PyTorch and prints
-the output and local shard shapes. Local computation executes through
-ReferenceRuntime, while PyTorch executes the collectives.
-
 ## Backend API
 
 Construct a compiler with its options, then pass that instance to PyTorch.
-Reference compilation uses AOTAutograd for inference, training, and DTensor:
+Reference compilation uses AOTAutograd for inference and training:
 
 ```python
 import torch
@@ -48,21 +31,28 @@ profiling, not when compilation begins. Cached graphs do not rerun search or pri
 search progress. The existing core `SEARCH_LOG`/`LUMINAL_LOG` environment settings
 still take precedence when set.
 
-The compiler exposes `graphs` (phase, FX source, collective targets) and `regions`
-(local shapes, ATen targets, execution count).
+The compiler exposes `graphs`: one record per compiled AOT graph with its phase,
+FX source, local input shapes, ATen targets, execution count, and dimension bounds.
+
+AOTAutograd traces each graph once with a fixed decomposition table: the core
+ATen decompositions, minus the composites the translator lowers directly (for
+example `native_layer_norm`, `silu`, SDPA). The functional graph it produces is
+wrapped as a PT2 `ExportedProgram` from its own metadata, with no second
+`torch.export` capture; an operator outside both the table and the translator
+fails compilation by name.
 One compiler instance can compile multiple graphs. `Compiler` is the only public
 compilation entry point; pass it to `torch.compile`.
 
 CUDA users import `Compiler` from `luminal_cuda_lite`. It accepts `search_iterations`,
-`log`, `device_budget_bytes`, and `max_intermediate_bytes`; it retains the
-CUDA backend's existing compilation path.
+`search_log`, `device_budget_bytes`, and `max_intermediate_bytes`, and compiles
+through the same AOTAutograd adapter; `graphs` holds its records.
 
 ## Named dimensions and application bucketing
 
 Each local program compiles over its PyTorch-declared bounds. Reuse `ShapeVar`
 objects to tie input axes together; the name is only diagnostic. Profiling uses
 the tracing or optimization hint, or a small valid size if neither exists.
-There is no implicit 4096 limit. `compiler.regions[i].bounds` reports the local
+There is no implicit 4096 limit. `compiler.graphs[i].bounds` reports the local
 exported symbol intervals. Data-dependent sizes remain unsupported.
 
 Applications can compile separate domains with isolated Dynamo caches and
@@ -93,7 +83,7 @@ def dispatch(x):
 ```
 
 The application owns overlap/gap policy, dispatch, and each compiler's budget.
-The backend searches one domain per region. CUDA obtains intermediate scratch
+The backend searches one domain per graph. CUDA obtains intermediate scratch
 through PyTorch; its explicit static arena/capture mode remains available for
 one program. A GPU program must fit its entire declared domain; a reference
 program also checks its live memory budget at execution.
@@ -101,71 +91,99 @@ program also checks its live memory budget at execution.
 The [Whisper example](examples/whisper.py) uses separate decoder callables for
 short and long token sequences and dispatches at the application layer.
 
-## Initial SPMD contract
+## Collectives
 
-Use one CPU process per rank, a Gloo process group, and a CPU `DeviceMesh`.
-DTensor placements specify the sharding plan. AOTAutograd traces DTensor's
-local operations and creates the forward and backward programs. For example,
-with a one-dimensional mesh:
+Collective operations are not compiled. A forward, backward, or inference
+graph that contains a `c10d` functional collective (for example `all_reduce`
+or `wait_tensor`) is refused with an error naming the operations. Programs
+that communicate must be split by the application so that each
+`torch.compile` region is collective-free; PyTorch then executes the
+collectives between compiled regions. Unsupported local operations also fail
+compilation; there is no eager compute fallback. The same rules apply to the
+CUDA backend, which shares this adapter (`luminal_reference.aot_graph`).
 
-```python
-from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+Compilation uses synthetic tensors derived from local FakeTensor metadata and
+never reads fake storage. Real parameters bind on every invocation.
 
-# All ranks start with the same full tensors. Setup and optimizer stay eager.
-x = distribute_tensor(full_x, mesh, [Shard(1)]).requires_grad_()
-w = torch.nn.Parameter(distribute_tensor(full_w, mesh, [Shard(0)]))
+Each graph is handed to the Rust translator in process, as the JSON document
+of a PT2 program. No `ExportedProgram` is built and nothing is written to
+disk. PyTorch's own serializer writes the nodes; the inputs, the signature and
+the symbol ranges are written by the adapter, because PyTorch's serializer has
+no spelling for a symbolic float or bool as a graph input. The whole graph is
+written: every placeholder and every output leaf.
 
-def model(x, w):
-    partial = x @ w
-    return partial.redistribute(placements=[Replicate()]).to_local()
+The Rust side reads the graph's boundary off that document as slots. PyTorch
+calls a compiled graph with one value per placeholder and expects one value per
+output leaf, in order. A slot is one of those positions, and its kind is the
+type of the value: a tensor, an `int`, a `float`, a `bool`, or any other
+object. A call passes one value per slot, and nothing is dropped by type.
 
-compiled = torch.compile(model, backend=compiler, fullgraph=True, dynamic=True)
-compiled(x, w).square().sum().backward()
-```
+- A tensor a node reads is bound to the caller's tensor. A tensor no node
+  reads keeps its slot and is never touched: nothing states or checks its
+  device, its layout or its storage.
+- A symbolic scalar is the expression PyTorch recorded for it. A node that
+  reads one reads that expression, and the call's value is not read. This is
+  how a bool saved for the backward graph (`x.shape[0] > 3`) is read.
+- An integer argument that is a symbol defines that symbol by value, as it
+  does for PyTorch; no tensor has to carry it. A negative value is refused by
+  the argument's name, because a symbol's value is unsigned in the runtimes
+  today.
+- A symbolic float has no expression the translator reads yet. A tensor op
+  that reads one is refused, naming the value and its expression.
+- An output slot is a tensor the program computes, the caller's own object for
+  a leaf that is an argument, a scalar evaluated from the call's sizes, or a
+  literal such as the `None` of a missing gradient.
 
-The backend partitions the AOT FX graph at communication boundaries. Every
-compute region goes through PT2 translation, egglog search, and ReferenceRuntime;
-there is no eager compute fallback. PyTorch executes functional collectives and
-`wait_tensor` in their original FX order. Communication does not enter Luminal's
-algebraic rewrites or reference plans. The process group and PyTorch own the
-collective algorithms, synchronization, and transport.
+PyTorch asserts some conditions inside the graph (`_assert_scalar`). A
+declared range arrives this way and is also guarded by PyTorch before the
+graph is called. A check the user wrote, such as
+`torch._check(x.shape[0] != 5)`, is asserted nowhere else: the compiled
+program evaluates it at each call and raises PyTorch's own message. These
+checks are separate from binding. Set `CompiledModel.runtime_assertions =
+False`, on the class or on one compiled model, to run without them.
 
-Compilation uses synthetic tensors derived from local FakeTensor metadata,
-never reads fake storage, and never executes a collective. Real parameters and
-shards bind on every invocation. The adapter preserves AOT output slots,
-constants, missing gradients, and forwarded inputs/opaque DTensor metadata.
+### Saving a compiled function
+
+Each compiler returns an `OutputCode`, the object PyTorch's AOT machinery
+holds for a compiled graph. That is what `torch.compile(...).aot_compile(...)`
+needs to save a compiled function and `torch.compiler.load_compiled_function`
+to load it. On the reference backend the saved form of a graph is the JSON
+document above, the plan search selected for it, and the constants it holds.
+A loaded function translates the graph, installs the plan, and runs: no search
+runs after a load. Forward, backward and inference graphs are all saved, and a
+dynamic dimension keeps working at new sizes.
+
+The CUDA runtime has no serialized form of a searched plan yet, so
+`aot_compile` on the CUDA backend is refused by name.
+
+Both backends keep input mutations in the graph
+(AOTAutograd's `keep_inference_input_mutations`), so a mutated input (a KV
+cache, a module buffer) is written in place on its own storage by the runtime
+rather than returned and copied back by AOTAutograd's epilogue.
 The reference binding copies computed outputs into independently owned tensors,
 so later forwards do not overwrite saved activations.
-
-When a multi-rank Gloo process group is active, each participating rank exports
-its local regions for an AOT compilation round. The group's rank zero searches
-each distinct region request and sends the selected reference plans to their owning
-ranks. Followers translate their local PT2 boundary metadata and install the
-received plans without saturation, extraction, search, or profiling. The plans
-include the complete dimension bounds and remap boundary slots to the follower's
-local graph values. The cache key keeps graph contents, declared bounds, constants,
-input specs, and compile options while ignoring process-local node provenance IDs.
-The compiler's
-`leader_compilations` count is positive only on the rank that actually searches.
-Artifact exchange and boundary synchronization use a separate Gloo process group,
-so they do not interleave with PyTorch's model collectives.
-Participating ranks must enter compilation rounds in the same order; a failed
-rank or process group must be restarted.
 
 Static and input-backed symbolic CPU shapes are supported in forward, backward,
 and inference, including input dimensions declared with `ShapesSpec`.
 Use `dynamic=True` or `torch._dynamo.mark_dynamic` to request
 symbolic dimensions; default PyTorch automatic dynamism is also supported.
-Shape-only scalar outputs are evaluated from runtime shape bindings. Saved scalar
-dimensions enter local PT2 graphs through zero-storage shape carriers, so backward
-does not need to retain an activation merely to recover its dimensions.
-PyTorch resolves communication shapes and split sizes on every invocation, while
-group membership, rank topology, and communication order stay fixed.
+Shape-only scalar outputs are evaluated from runtime shape bindings and returned
+in the Python type torch expects for the leaf: an `int`, a `float` or a `bool`.
+A saved size enters the backward graph as an integer argument, so backward does
+not need to retain an activation merely to recover its dimensions.
+
+A symbolic integer can be used wherever a Python integer can: as a count or an
+amount (`repeat`, `tile`, `pad`, `roll`, `full`, `topk`) and as a value in
+tensor arithmetic. Integer arithmetic on one follows torch: `//` floors and `%` takes
+the sign of the divisor. A comparison of symbolic integers (`x.shape[0] > 3`)
+is a symbolic bool, which reads as 1 or 0 where a program uses it as a number.
+A symbolic count or pad amount must be nonnegative on the whole declared range
+of its dimensions; one that may go negative is refused at compile time. A
+symbolic `k` for `topk` must likewise stay inside the sorted axis on that
+range. A symbolic exponent (`x ** n`) is not translated.
 
 Data-dependent unbacked dimensions and changing tensor rank are outside this
-contract. Shape-dependent branches may require separate guarded graphs. CUDA,
-communication overlap, coalesced collectives, and automatic sharding selection
-remain outside this scope. Unsupported local operations fail compilation.
+contract. Shape-dependent branches may require separate guarded graphs.
 The integration uses private PyTorch AOT/FX APIs; the end-to-end tests are the
 compatibility gate (validated on PyTorch 2.14.0).
 
@@ -198,20 +216,10 @@ compiler state, allocator overhead, and rank-sized kernel metadata are excluded.
 From the repository root:
 
 ```sh
-bash crates/pytorch/reference/run_tests.sh -q -k "aot or spmd or collectives or dynamic_shapes or symbolic_shapes"
+bash crates/pytorch/reference/run_tests.sh -q -k "aot or dynamic_shapes or symbolic_shapes"
 ```
 
-The two-rank Gloo test uses real DTensors and checks forward results, input and
-weight gradients, and optimizer updates against both eager DTensor and dense
-PyTorch, including two reductions interleaved with local computation. It asserts
-local shard dimensions and ReferenceRuntime execution in
-both AOT phases. Single-process tests also exercise two outstanding forwards
-before backward, output structure, and parameter rebinding.
-
-The three-rank collective test covers reductions, repeated
-execution, all-gather/reduce-scatter/all-to-all gradients, uneven and empty peer
-payloads, subgroups, and a singleton group.
-
-Dynamic tests assert graph reuse across changing sizes, including DTensor
-inference, collective gradients, symbolic all-to-all splits, and backward graphs
-that save only dimensions. The minimal SPMD example uses the default module backend.
+Single-process AOT tests exercise two outstanding forwards before backward,
+output structure, parameter rebinding, and the collective refusal. Dynamic tests
+assert graph reuse across changing sizes, including backward graphs that save
+only dimensions.

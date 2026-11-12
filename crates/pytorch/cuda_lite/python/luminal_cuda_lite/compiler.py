@@ -2,15 +2,17 @@
 
 from dataclasses import dataclass
 
-from .backend import _compile_graph
+from .aot import CudaAOTBackend
 
 
 @dataclass(frozen=True)
 class Compiler:
     """Pass an instance as ``torch.compile(..., backend=compiler)``.
 
-    Memory limits are bytes; None selects the CUDA runtime's device budget.
-    Logging is off by default. CUDA-lite retains its existing compilation path.
+    Compiles through AOTAutograd with options fixed at construction. Memory
+    limits are bytes; None selects the CUDA runtime's device budget. Logging
+    is off by default. ``graphs`` retains one record per compiled AOT graph.
+    One compiler can compile multiple graphs.
     """
 
     search_iterations: int = 1
@@ -25,13 +27,21 @@ class Compiler:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, int) or value < 0):
                 raise ValueError(f"{name} must be a nonnegative integer or None")
+        object.__setattr__(
+            self,
+            "_backend",
+            CudaAOTBackend(
+                search_iterations=self.search_iterations,
+                search_log=self.search_log,
+                device_budget_bytes=self.device_budget_bytes,
+                max_intermediate_bytes=self.max_intermediate_bytes,
+            ),
+        )
+
+    @property
+    def graphs(self):
+        """Compilation diagnostics, one ``GraphRecord`` per AOT graph."""
+        return self._backend.graphs
 
     def __call__(self, gm, example_inputs):
-        return _compile_graph(
-            gm,
-            example_inputs,
-            search_iterations=self.search_iterations,
-            search_log=self.search_log,
-            device_budget_bytes=self.device_budget_bytes,
-            max_intermediate_bytes=self.max_intermediate_bytes,
-        )
+        return self._backend(gm, example_inputs)

@@ -297,10 +297,12 @@ def test_read_only_aliasing_binds_two_buffers_on_one_address():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_aliased_inputs_with_a_writeback_are_refused():
-    """The hazardous variant: one binding of the overlapping pair is written
-    back into, and one buffer per binding cannot order that write against the
-    other's reads. Refused by name."""
+def test_aliased_inputs_with_a_writeback_match_eager():
+    """The hazardous variant: one of the overlapping pair is written back
+    into. AOTAutograd resolves the aliasing before the backend sees the
+    graph: the program takes the shared storage as ONE input, reads both
+    views off it (``as_strided``) and writes the update back once, so there
+    is one buffer and the caller sees what eager leaves."""
 
     def fn(a, b):
         a.add_(1)
@@ -308,8 +310,11 @@ def test_aliased_inputs_with_a_writeback_are_refused():
 
     torch.manual_seed(0)
     x = torch.randn(4, 8, device="cuda")
-    with pytest.raises(Exception, match="share device storage"):
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, x[:])
+    expected_x = x + 1
+    expected = expected_x * expected_x
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, x[:])
+    torch.testing.assert_close(got, expected)
+    torch.testing.assert_close(x, expected_x)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -434,11 +439,11 @@ def test_expanded_input_is_a_broadcast_read_map():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_stride_zero_mutation_target_finds_no_plan_naming_the_output():
-    """The same broadcast view as a WRITE target: it is stated as the
-    strided map it is and bound as such, and the e-graph's write gate — a
-    destination layout must be injective — leaves the search with nothing
-    to install, which it reports by naming the output and its layout."""
+def test_stride_zero_mutation_target_is_refused_as_eager_refuses_it():
+    """The same broadcast view as a WRITE target. Eager refuses this
+    program outright (a write through a non-injective view), and so does
+    functionalization while AOTAutograd traces it, before any boundary is
+    declared: the refusal the caller sees is torch's own, by name."""
     from luminal_cuda_lite.boundary import Strided, boundary_layout
 
     def fn(t):
@@ -449,7 +454,11 @@ def test_stride_zero_mutation_target_finds_no_plan_naming_the_output():
     x = torch.randn(1, 8, device="cuda").expand(4, 8)
     assert boundary_layout("x", x) == Strided(("Integer(0)", "Integer(1)"))
     with pytest.raises(
-        Exception, match=r"no plan writes the bound outputs: v\d+ at Strided"
+        RuntimeError, match="more than one element of the written-to tensor"
+    ):
+        fn(torch.randn(1, 8, device="cuda").expand(4, 8))
+    with pytest.raises(
+        Exception, match="more than one element of the written-to tensor"
     ):
         torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
 
@@ -502,3 +511,46 @@ def test_a_parameter_whose_storage_moved_is_read_at_its_new_address():
         model.weight.data = model.weight.data.clone() + 1
         torch.cuda.empty_cache()
         torch.testing.assert_close(compiled(x), model(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_training_round_trip_through_saved_activation_views():
+    """AOTAutograd saves activations for the backward graph as the views
+    eager made of them: here a half of a split (a padded row stride at an
+    offset) and a transposed tensor. The forward allocates every saved
+    activation row-major, reports those strides to AOTAutograd, and the
+    backward binds what it was handed. Parity with eager on outputs and on
+    every parameter gradient, across two steps, is the whole contract."""
+    import copy
+
+    class SplitGate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_proj = torch.nn.Linear(16, 64, bias=False)
+            self.out_proj = torch.nn.Linear(32, 16, bias=False)
+
+        def forward(self, x):
+            x_part, z = self.in_proj(x).chunk(2, dim=-1)
+            x_part = x_part.transpose(1, 2).transpose(1, 2)
+            gate = torch.nn.functional.silu(x_part) * torch.nn.functional.silu(z)
+            return self.out_proj(gate)
+
+    torch.manual_seed(0)
+    eager = SplitGate().cuda()
+    model = copy.deepcopy(eager)
+    compiler = luminal_cuda_lite.Compiler()
+    compiled = torch.compile(model, backend=compiler)
+    for _ in range(2):
+        x = torch.randn(2, 64, 16, device="cuda")
+        want = eager(x)
+        want.square().sum().backward()
+        got = compiled(x)
+        got.square().sum().backward()
+        torch.testing.assert_close(got, want, atol=1e-3, rtol=1e-3)
+        for (name, expected), (_, actual) in zip(
+            eager.named_parameters(), model.named_parameters()
+        ):
+            torch.testing.assert_close(
+                actual.grad, expected.grad, atol=1e-3, rtol=1e-3, msg=f"grad of {name}"
+            )
+    assert [record.phase for record in compiler.graphs] == ["forward", "backward"]

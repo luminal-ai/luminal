@@ -19,15 +19,22 @@ fn assert_clamp(target: &str, bounds: Vec<NodeInput>, expected: &[f32]) {
         &["y"],
     );
     let data = [
-        &[-2.0f32, -0.5, 2.0, -1.0, 3.0, -4.0][..],
-        &[-1.0, 1.0, 0.0],
-        &[1.5],
+        ("x", &[-2.0f32, -0.5, 2.0, -1.0, 3.0, -4.0][..]),
+        ("lo", &[-1.0, 1.0, 0.0]),
+        ("hi", &[1.5]),
     ];
+    // A bound the node does not take is an argument nothing reads: it has
+    // no storage in the program, so each input is staged by name.
     let inputs = t
         .inputs
         .iter()
-        .zip(data)
-        .map(|(input, data)| (input.tensor, data.to_vec().into()))
+        .map(|input| {
+            let (_, values) = data
+                .iter()
+                .find(|(name, _)| *name == input.graph_name)
+                .expect("a declared input");
+            (input.tensor, values.to_vec().into())
+        })
         .collect::<Vec<_>>();
     let rt = run_reference(&t.graph, &inputs);
     assert_eq!(rt.get_f32(t.outputs[0].tensor).unwrap(), expected);

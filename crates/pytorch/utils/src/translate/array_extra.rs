@@ -717,6 +717,14 @@ impl Translator<'_> {
         for (name, value) in &subgraph.graph.sym_int_values {
             sym_int_values.insert(name.clone(), value.clone());
         }
+        let mut sym_bool_values = main_graph.sym_bool_values.clone();
+        for (name, value) in &subgraph.graph.sym_bool_values {
+            sym_bool_values.insert(name.clone(), value.clone());
+        }
+        let mut sym_float_values = main_graph.sym_float_values.clone();
+        for (name, value) in &subgraph.graph.sym_float_values {
+            sym_float_values.insert(name.clone(), value.clone());
+        }
         let merged = ParsedPT2 {
             program: ExportedProgram {
                 graph_module: GraphModule {
@@ -726,6 +734,8 @@ impl Translator<'_> {
                         nodes: Vec::new(),
                         tensor_values,
                         sym_int_values,
+                        sym_bool_values,
+                        sym_float_values,
                     },
                     signature: Signature {
                         input_specs: Vec::new(),
@@ -861,6 +871,8 @@ mod tests {
                     nodes: vec![node],
                     tensor_values,
                     sym_int_values: HashMap::new(),
+                    sym_bool_values: HashMap::new(),
+                    sym_float_values: HashMap::new(),
                 },
                 signature: Signature {
                     input_specs: Vec::new(),
@@ -1327,6 +1339,8 @@ mod tests {
                 }],
                 tensor_values: inner_values,
                 sym_int_values: HashMap::new(),
+                sym_bool_values: HashMap::new(),
+                sym_float_values: HashMap::new(),
             },
         };
         let wrap_node = Node {

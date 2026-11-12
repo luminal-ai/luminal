@@ -192,14 +192,24 @@ def test_module_buffer_slice_write():
 
 
 @cuda
-def test_writes_through_storage_sharing_inputs_are_refused_by_name():
+def test_writes_through_storage_sharing_inputs_match_eager():
+    """Two inputs on one storage, one written back into. AOTAutograd
+    resolves the aliasing before the backend sees the graph: the shared
+    storage is ONE input, both views are read off it, and the write lands
+    once, so the returned view shows the mutation exactly as eager's does."""
+
     def fn(a, b):
         a.add_(1)
         return b
 
-    x = _x()
-    with pytest.raises(Exception, match="share device storage"):
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, x[0])
+    eager_x, x = _x(), _x()
+    want = fn(eager_x, eager_x[0])
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, x[0])
+    torch.testing.assert_close(got, want)
+    torch.testing.assert_close(x, eager_x)
+    assert got.data_ptr() == x.data_ptr(), (
+        "the returned row is a view of the caller's tensor"
+    )
 
 
 @cuda

@@ -12,7 +12,7 @@ luminal_backend = Compiler()
     reason="CUDA graph in-place update test — requires CUDA",
 )
 def test_dynamic_dim_reuse_no_recompile(device: torch.device):
-    """Compile once with dynamic shapes, execute with varying seq lengths.
+    """Compile once over a declared sequence domain, execute at varying lengths.
 
     Validates that the luminal runtime correctly handles dynamic dimension
     changes without recompilation. This is the core scenario optimized by
@@ -20,7 +20,7 @@ def test_dynamic_dim_reuse_no_recompile(device: torch.device):
     compiled graph handles multiple sequence lengths via in-place parameter
     updates rather than rebuilding the entire CUDA graph each step.
     """
-    from backend_test_utils import compile_for_test as luminal_compile
+    from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
 
     class DynamicSeqModel(torch.nn.Module):
         """Embedding + linear projection with variable-length integer input."""
@@ -33,24 +33,34 @@ def test_dynamic_dim_reuse_no_recompile(device: torch.device):
         def forward(self, x):
             return self.proj(self.embed(x))
 
+    torch._dynamo.reset()
     model = DynamicSeqModel().eval().to(device)
 
-    # Compile once with dynamic seq dim (auto-detected for integer inputs).
-    # Factory capsule is auto-detected from example.device.
-    example = torch.tensor([[1, 2, 3, 4]], device=device)
-    compiled = luminal_compile(model, example, search_iterations=5)
+    # One compile over the whole declared domain: the sequence axis is a
+    # ShapeVar, so every length in [2, 16] runs the same program.
+    seq = ShapeVar("seq", min=2, max=16, optimization_hint=4)
+    compiler = Compiler(search_iterations=5)
+    compiled = torch.compile(
+        model,
+        backend=compiler,
+        fullgraph=True,
+        isolate_recompiles=True,
+        dynamic_shapes=ShapesSpec(params={"x": TensorSpec([1, seq])}),
+    )
 
     # Execute with multiple different seq lengths — each call reuses the
     # same compiled graph, updating dynamic dims in-place.
-    for seq_len in [4, 5, 6, 7, 8]:
+    for seq_len in [4, 5, 6, 7, 8, 16, 2]:
         input_ids = torch.tensor([list(range(1, seq_len + 1))], device=device)
         with torch.no_grad():
             ref = model(input_ids)
             out = compiled(input_ids)
-        assert torch.allclose(out[0], ref, atol=1e-5), (
-            f"seq_len={seq_len}: "
-            f"max_diff={torch.max(torch.abs(out[0] - ref)).item():.2e}"
+        assert torch.allclose(out, ref, atol=1e-5), (
+            f"seq_len={seq_len}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
         )
+    assert len(compiler.graphs) == 1, "a new sequence length recompiled the program"
+    assert list(compiler.graphs[0].bounds.values()) == [(2, 16)]
+    torch._dynamo.reset()
 
 
 @pytest.mark.slow

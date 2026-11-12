@@ -39,7 +39,11 @@ struct BoundedExpr {
 
 /// Parse a sympy `srepr`-style expression string into a luminal `IntExpr`.
 ///
-/// Supports the subset of sympy heads PT2 emits for symbolic shape metadata.
+/// Supports the subset of sympy heads PT2 emits for symbolic shape metadata
+/// and symbolic scalar values: integer arithmetic (`Add`, `Mul`, `Pow` by a
+/// literal natural, `Min`, `Max`), torch's division family with torch's
+/// rounding (`FloorDiv`, `CleanDiv`, `Mod`, `PythonMod`), and comparisons
+/// and boolean connectives, which read as the integer 1 or 0.
 pub(super) fn parse_sympy_expr(
     expr: &str,
     sym_to_symbol: &HashMap<String, Symbol>,
@@ -56,11 +60,19 @@ pub(super) fn parse_sympy_expr_with_ranges(
 }
 
 pub(super) fn sym_char_ranges(sym_map: &SymDimMap) -> FxHashMap<Symbol, ExprBounds> {
-    sym_map
-        .sym_to_symbol
+    symbol_bounds(&sym_map.sym_to_symbol, &sym_map.ranges)
+}
+
+/// The bounds of every dimension symbol: torch's exported range, clamped
+/// to the nonnegative values a recorder dimension symbol can hold.
+pub(super) fn symbol_bounds(
+    symbols: &HashMap<String, Symbol>,
+    ranges: &HashMap<String, RangeConstraint>,
+) -> FxHashMap<Symbol, ExprBounds> {
+    symbols
         .iter()
         .map(|(sym_name, sym_char)| {
-            let range = sym_map.ranges.get(sym_name);
+            let range = ranges.get(sym_name);
             let min = range
                 .and_then(|range| range.min_val)
                 .map(|min| min.max(0))
@@ -129,6 +141,12 @@ fn parse_sympy_expr_inner(
     if let Ok(value) = expr.parse::<i64>() {
         return Some(ParsedExpr::exact(IntExpr::from(value), value));
     }
+    // sympy's boolean constants print bare.
+    match expr {
+        "true" => return Some(truth(true)),
+        "false" => return Some(truth(false)),
+        _ => {}
+    }
 
     let (head, body) = split_head(expr)?;
     match head {
@@ -172,31 +190,301 @@ fn parse_sympy_expr_inner(
             }
             Some(acc)
         }
-        "FloorDiv" => {
-            let mut parts = split_top_level_args(body).into_iter();
-            let lhs = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
-            let rhs = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
-            if parts.next().is_some() {
+        // sympy spells `n * n` as `Pow(n, 2)`. A literal natural exponent is
+        // repeated multiplication; any other power (`Pow(n, -1)` is sympy's
+        // `1 / n`) is not an integer expression and stays unread.
+        "Pow" | "PowByNatural" => {
+            let (base, exponent) = parse_two_args(body, sym_to_symbol, ranges)?;
+            let exponent = exponent.expr.as_num()?;
+            if !(0..=MAX_NATURAL_POWER).contains(&exponent) {
                 return None;
             }
+            if exponent == 0 {
+                return Some(ParsedExpr::exact(IntExpr::from(1i64), 1));
+            }
+            let mut acc = base;
+            for _ in 1..exponent {
+                acc = ParsedExpr {
+                    expr: normalize_mul_expr(acc.expr, base.expr),
+                    bounds: mul_bounds(acc.bounds, base.bounds),
+                };
+            }
+            Some(acc)
+        }
+        "FloorDiv" => {
+            let (lhs, rhs) = parse_two_args(body, sym_to_symbol, ranges)?;
+            Some(floor_div(lhs, rhs))
+        }
+        // torch's `CleanDiv` is a `FloorDiv` it has proved exact, and an
+        // exact quotient is the same under every rounding rule.
+        "CleanDiv" => {
+            let (lhs, rhs) = parse_two_args(body, sym_to_symbol, ranges)?;
             Some(ParsedExpr {
                 expr: lhs.expr / rhs.expr,
                 bounds: div_bounds(lhs.bounds, rhs.bounds),
             })
         }
+        // torch's `Mod` is defined on nonnegative operands only (it prints
+        // `PythonMod` for anything else), where it is the recorder's `%`.
         "Mod" => {
-            let mut parts = split_top_level_args(body).into_iter();
-            let lhs = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
-            let rhs = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
-            if parts.next().is_some() {
-                return None;
-            }
+            let (lhs, rhs) = parse_two_args(body, sym_to_symbol, ranges)?;
             Some(ParsedExpr {
                 expr: lhs.expr % rhs.expr,
                 bounds: mod_bounds(lhs.bounds, rhs.bounds),
             })
         }
+        "PythonMod" => {
+            let (lhs, rhs) = parse_two_args(body, sym_to_symbol, ranges)?;
+            Some(python_mod(lhs, rhs))
+        }
+        // A symbolic bool is the integer 1 or 0, the value torch gives it
+        // wherever a program uses one as a number.
+        "StrictLessThan" => {
+            let (lhs, rhs) = parse_two_args(body, sym_to_symbol, ranges)?;
+            Some(less_than(lhs, rhs))
+        }
+        "StrictGreaterThan" => {
+            let (lhs, rhs) = parse_two_args(body, sym_to_symbol, ranges)?;
+            Some(less_than(rhs, lhs))
+        }
+        "GreaterThan" => {
+            let (lhs, rhs) = parse_two_args(body, sym_to_symbol, ranges)?;
+            Some(at_least(lhs, rhs))
+        }
+        "LessThan" => {
+            let (lhs, rhs) = parse_two_args(body, sym_to_symbol, ranges)?;
+            Some(at_least(rhs, lhs))
+        }
+        "Equality" => {
+            let (lhs, rhs) = parse_two_args(body, sym_to_symbol, ranges)?;
+            Some(both(at_least(lhs, rhs), at_least(rhs, lhs)))
+        }
+        "Unequality" => {
+            let (lhs, rhs) = parse_two_args(body, sym_to_symbol, ranges)?;
+            Some(either(less_than(lhs, rhs), less_than(rhs, lhs)))
+        }
+        "And" | "Or" => {
+            let mut parts = split_top_level_args(body).into_iter();
+            let mut acc = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
+            for part in parts {
+                let rhs = parse_sympy_expr_inner(part, sym_to_symbol, ranges)?;
+                acc = if head == "And" {
+                    both(acc, rhs)
+                } else {
+                    either(acc, rhs)
+                };
+            }
+            Some(acc)
+        }
+        "Not" => {
+            let mut parts = split_top_level_args(body).into_iter();
+            let operand = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(negation(operand))
+        }
         _ => None,
+    }
+}
+
+/// The largest literal exponent expanded into repeated multiplication.
+const MAX_NATURAL_POWER: i64 = 16;
+
+/// The two operands of a binary sympy head; any other arity is unread.
+fn parse_two_args(
+    body: &str,
+    sym_to_symbol: &HashMap<String, Symbol>,
+    ranges: &HashMap<String, RangeConstraint>,
+) -> Option<(ParsedExpr, ParsedExpr)> {
+    let mut parts = split_top_level_args(body).into_iter();
+    let lhs = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
+    let rhs = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((lhs, rhs))
+}
+
+fn is_nonnegative(bounds: ExprBounds) -> bool {
+    bounds.min.is_some_and(|min| min >= 0)
+}
+
+fn is_positive(bounds: ExprBounds) -> bool {
+    bounds.min.is_some_and(|min| min >= 1)
+}
+
+/// The largest shift `shifted_nonnegative` adds to a dividend. A shift is a
+/// distance below zero that a dimension-sized value can reach; a lower
+/// bound further out than this is no bound to shift by, and adding its
+/// magnitude would only move the overflow to the other end.
+const MAX_SHIFT: i64 = i32::MAX as i64;
+
+/// `lhs + k * rhs` for the least `k` that makes it nonnegative, when the
+/// bounds give one: `lhs` has a finite lower bound and `rhs` is one positive
+/// number. Adding a multiple of the divisor moves a floor quotient by `k`
+/// and leaves the Python remainder alone, so both can then be read with the
+/// recorder's truncating `/` and `%`, whose operands stay nonnegative as
+/// the recorder's expression algebra assumes.
+fn shifted_nonnegative(lhs: ParsedExpr, rhs: ParsedExpr) -> Option<(ParsedExpr, i64)> {
+    let divisor = exact_bound_value(rhs.bounds).filter(|divisor| *divisor > 0)?;
+    let deficit = lhs.bounds.min?.checked_neg()?;
+    let k = deficit.checked_add(divisor - 1)? / divisor;
+    let shift = k.checked_mul(divisor).filter(|shift| *shift <= MAX_SHIFT)?;
+    let shifted = ParsedExpr {
+        expr: normalize_add_expr(lhs.expr, IntExpr::from(shift)),
+        bounds: add_bounds(
+            lhs.bounds,
+            ExprBounds {
+                min: Some(shift),
+                max: Some(shift),
+            },
+        ),
+    };
+    Some((shifted, k))
+}
+
+/// Python's `%` for operands of any sign, in the recorder's truncating
+/// `%`: `((a % b) + b) % b`. The inner remainder lies strictly between
+/// `-|b|` and `|b|`; adding `b` gives it `b`'s sign or zero.
+fn python_mod_expr(lhs: IntExpr, rhs: IntExpr) -> IntExpr {
+    ((lhs % rhs) + rhs) % rhs
+}
+
+/// torch's `PythonMod`: the remainder takes the divisor's sign. The
+/// recorder's `%` truncates, which agrees only on a nonnegative dividend
+/// over a positive divisor.
+fn python_mod(lhs: ParsedExpr, rhs: ParsedExpr) -> ParsedExpr {
+    if is_nonnegative(lhs.bounds) && is_positive(rhs.bounds) {
+        return ParsedExpr {
+            expr: lhs.expr % rhs.expr,
+            bounds: mod_bounds(lhs.bounds, rhs.bounds),
+        };
+    }
+    if let Some((shifted, _)) = shifted_nonnegative(lhs, rhs) {
+        return ParsedExpr {
+            expr: shifted.expr % rhs.expr,
+            bounds: mod_bounds(shifted.bounds, rhs.bounds),
+        };
+    }
+    let bounds = match exact_bound_value(rhs.bounds) {
+        Some(divisor) if divisor > 0 => ExprBounds {
+            min: Some(0),
+            max: Some(divisor - 1),
+        },
+        _ => ExprBounds::default(),
+    };
+    ParsedExpr {
+        expr: python_mod_expr(lhs.expr, rhs.expr),
+        bounds,
+    }
+}
+
+/// torch's `FloorDiv` rounds toward negative infinity. The recorder's `/`
+/// truncates, which agrees only on a nonnegative dividend over a positive
+/// divisor; that case keeps the plain spelling. Otherwise the quotient is
+/// read off a dividend shifted nonnegative, or, with no bound to shift by,
+/// as the exact division of `a - PythonMod(a, b)`.
+fn floor_div(lhs: ParsedExpr, rhs: ParsedExpr) -> ParsedExpr {
+    if is_nonnegative(lhs.bounds) && is_positive(rhs.bounds) {
+        return ParsedExpr {
+            expr: lhs.expr / rhs.expr,
+            bounds: div_bounds(lhs.bounds, rhs.bounds),
+        };
+    }
+    if let Some((shifted, k)) = shifted_nonnegative(lhs, rhs) {
+        let quotient = div_bounds(shifted.bounds, rhs.bounds);
+        return ParsedExpr {
+            expr: normalize_expr(shifted.expr / rhs.expr - k),
+            bounds: sub_bounds(
+                quotient,
+                ExprBounds {
+                    min: Some(k),
+                    max: Some(k),
+                },
+            ),
+        };
+    }
+    ParsedExpr {
+        expr: (lhs.expr - python_mod_expr(lhs.expr, rhs.expr)) / rhs.expr,
+        bounds: ExprBounds::default(),
+    }
+}
+
+fn truth(value: bool) -> ParsedExpr {
+    ParsedExpr::exact(IntExpr::from(value as i64), value as i64)
+}
+
+/// `lhs < rhs` as 1 or 0, decided here when the bounds decide it.
+fn less_than(lhs: ParsedExpr, rhs: ParsedExpr) -> ParsedExpr {
+    if let (Some(lhs_max), Some(rhs_min)) = (lhs.bounds.max, rhs.bounds.min)
+        && lhs_max < rhs_min
+    {
+        return truth(true);
+    }
+    if let (Some(lhs_min), Some(rhs_max)) = (lhs.bounds.min, rhs.bounds.max)
+        && lhs_min >= rhs_max
+    {
+        return truth(false);
+    }
+    ParsedExpr {
+        expr: lhs.expr.lt(rhs.expr),
+        bounds: bool_bounds(),
+    }
+}
+
+/// `lhs >= rhs` as 1 or 0, decided here when the bounds decide it.
+fn at_least(lhs: ParsedExpr, rhs: ParsedExpr) -> ParsedExpr {
+    if let (Some(lhs_min), Some(rhs_max)) = (lhs.bounds.min, rhs.bounds.max)
+        && lhs_min >= rhs_max
+    {
+        return truth(true);
+    }
+    if let (Some(lhs_max), Some(rhs_min)) = (lhs.bounds.max, rhs.bounds.min)
+        && lhs_max < rhs_min
+    {
+        return truth(false);
+    }
+    ParsedExpr {
+        expr: lhs.expr.gte(rhs.expr),
+        bounds: bool_bounds(),
+    }
+}
+
+/// Conjunction of two 1-or-0 values: their product.
+fn both(lhs: ParsedExpr, rhs: ParsedExpr) -> ParsedExpr {
+    match (exact_bound_value(lhs.bounds), exact_bound_value(rhs.bounds)) {
+        (Some(0), _) | (_, Some(0)) => truth(false),
+        (Some(_), _) => rhs,
+        (_, Some(_)) => lhs,
+        _ => ParsedExpr {
+            expr: lhs.expr * rhs.expr,
+            bounds: bool_bounds(),
+        },
+    }
+}
+
+/// Disjunction of two 1-or-0 values: their maximum.
+fn either(lhs: ParsedExpr, rhs: ParsedExpr) -> ParsedExpr {
+    match (exact_bound_value(lhs.bounds), exact_bound_value(rhs.bounds)) {
+        (Some(0), _) => rhs,
+        (_, Some(0)) => lhs,
+        (Some(_), _) | (_, Some(_)) => truth(true),
+        _ => ParsedExpr {
+            expr: lhs.expr.max(rhs.expr),
+            bounds: bool_bounds(),
+        },
+    }
+}
+
+/// Negation of a 1-or-0 value.
+fn negation(operand: ParsedExpr) -> ParsedExpr {
+    match exact_bound_value(operand.bounds) {
+        Some(value) => truth(value == 0),
+        None => ParsedExpr {
+            expr: IntExpr::from(1i64) - operand.expr,
+            bounds: bool_bounds(),
+        },
     }
 }
 
@@ -750,16 +1038,194 @@ mod tests {
         assert_eq!(expr, IntExpr::from(8i64) * a);
     }
 
+    fn parse(expr: &str) -> IntExpr {
+        parse_sympy_expr_with_ranges(expr, &sym_map(), &HashMap::new())
+            .unwrap_or_else(|| panic!("{expr} should parse"))
+    }
+
+    /// The expression's value with `s0` bound to `value`.
+    fn eval(expr: IntExpr, value: usize) -> i64 {
+        let mut dims = FxHashMap::default();
+        dims.insert(Symbol::try_new_dim("a").unwrap(), value);
+        expr.exec(&dims).expect("expression should evaluate") as i64
+    }
+
+    const S0: &str = "Symbol('s0', positive=True, integer=True)";
+
     #[test]
-    fn floordiv_parses() {
-        let expr = parse_sympy_expr_with_ranges(
-            "FloorDiv(Symbol('s0', integer=True), Integer(4))",
-            &sym_map(),
-            &HashMap::new(),
-        )
-        .expect("floordiv should parse");
+    fn floordiv_of_a_nonnegative_dividend_keeps_the_plain_spelling() {
+        let expr = parse(&format!("FloorDiv({S0}, Integer(4))"));
         let a = IntExpr::from(Symbol::try_new_dim("a").unwrap());
         assert_eq!(expr, a / IntExpr::from(4i64));
+    }
+
+    #[test]
+    fn floordiv_rounds_toward_negative_infinity() {
+        // Bounded below (`s0 - 3 >= -2`), unbounded below (`-s0`), and a
+        // symbol with no stated sign: each must floor, not truncate.
+        for (text, dividend) in [
+            (
+                format!("FloorDiv(Add({S0}, Integer(-3)), Integer(2))"),
+                (|a| a - 3) as fn(i64) -> i64,
+            ),
+            (
+                format!("FloorDiv(Mul(Integer(-1), {S0}), Integer(2))"),
+                |a| -a,
+            ),
+            (
+                "FloorDiv(Add(Symbol('s0', integer=True), Integer(-5)), Integer(2))".to_string(),
+                |a| a - 5,
+            ),
+        ] {
+            let expr = parse(&text);
+            for a in 1..=9i64 {
+                assert_eq!(
+                    eval(expr, a as usize),
+                    dividend(a).div_euclid(2),
+                    "{text} at s0 = {a}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_lower_bound_too_far_out_is_not_shifted_by() {
+        // A symbol whose declared range reaches far below zero: shifting the
+        // dividend up by that distance would overflow on ordinary values,
+        // so the quotient and remainder are corrected in place instead.
+        let ranges = HashMap::from([(
+            "s0".to_string(),
+            RangeConstraint {
+                min_val: Some(-(1i64 << 62)),
+                max_val: None,
+            },
+        )]);
+        let parse = |text: &str| {
+            parse_sympy_expr_with_ranges(text, &sym_map(), &ranges).expect("should parse")
+        };
+        let quotient = parse("FloorDiv(Add(Symbol('s0', integer=True), Integer(-5)), Integer(2))");
+        let remainder =
+            parse("PythonMod(Add(Symbol('s0', integer=True), Integer(-5)), Integer(4))");
+        for a in 0..=9i64 {
+            assert_eq!(eval(quotient, a as usize), (a - 5).div_euclid(2));
+            assert_eq!(eval(remainder, a as usize), (a - 5).rem_euclid(4));
+        }
+    }
+
+    #[test]
+    fn clean_div_is_exact_division() {
+        let expr = parse(&format!("CleanDiv(Mul(Integer(6), {S0}), Integer(3))"));
+        for a in 1..=5 {
+            assert_eq!(eval(expr, a), 2 * a as i64);
+        }
+    }
+
+    #[test]
+    fn python_mod_takes_the_sign_of_the_divisor() {
+        for (text, dividend) in [
+            (
+                format!("PythonMod(Add({S0}, Integer(-7)), Integer(4))"),
+                (|a| a - 7) as fn(i64) -> i64,
+            ),
+            (
+                format!("PythonMod(Add(Integer(4), Mul(Integer(-1), {S0})), Integer(4))"),
+                |a| 4 - a,
+            ),
+            (format!("PythonMod({S0}, Integer(4))"), |a| a),
+        ] {
+            let expr = parse(&text);
+            for a in 1..=12i64 {
+                assert_eq!(
+                    eval(expr, a as usize),
+                    dividend(a).rem_euclid(4),
+                    "{text} at s0 = {a}"
+                );
+            }
+        }
+        // A nonnegative dividend needs no correction.
+        let a = IntExpr::from(Symbol::try_new_dim("a").unwrap());
+        assert_eq!(
+            parse(&format!("PythonMod({S0}, Integer(4))")),
+            a % IntExpr::from(4i64)
+        );
+    }
+
+    #[test]
+    fn natural_power_is_repeated_multiplication() {
+        let expr = parse(&format!("Pow({S0}, Integer(3))"));
+        for a in 1..=5 {
+            assert_eq!(eval(expr, a), (a * a * a) as i64);
+        }
+        assert_eq!(
+            parse(&format!("Pow({S0}, Integer(0))")),
+            IntExpr::from(1i64)
+        );
+        // `1 / n` is not an integer expression.
+        assert!(
+            parse_sympy_expr_with_ranges(
+                &format!("Pow({S0}, Integer(-1))"),
+                &sym_map(),
+                &HashMap::new()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn comparisons_read_as_one_or_zero() {
+        for (head, holds) in [
+            ("StrictGreaterThan", (|a| a > 3) as fn(i64) -> bool),
+            ("GreaterThan", |a| a >= 3),
+            ("StrictLessThan", |a| a < 3),
+            ("LessThan", |a| a <= 3),
+            ("Equality", |a| a == 3),
+            ("Unequality", |a| a != 3),
+        ] {
+            let expr = parse(&format!("{head}({S0}, Integer(3))"));
+            for a in 1..=6i64 {
+                assert_eq!(eval(expr, a as usize), holds(a) as i64, "{head} at {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn boolean_connectives_combine_comparisons() {
+        let inside = parse(&format!(
+            "And(StrictGreaterThan({S0}, Integer(2)), StrictLessThan({S0}, Integer(5)))"
+        ));
+        let outside = parse(&format!(
+            "Or(LessThan({S0}, Integer(2)), GreaterThan({S0}, Integer(5)))"
+        ));
+        let not_three = parse(&format!("Not(Equality({S0}, Integer(3)))"));
+        for a in 1..=6i64 {
+            assert_eq!(eval(inside, a as usize), (a > 2 && a < 5) as i64);
+            assert_eq!(eval(outside, a as usize), (a <= 2 || a >= 5) as i64);
+            assert_eq!(eval(not_three, a as usize), (a != 3) as i64);
+        }
+        assert_eq!(parse("true"), IntExpr::from(1i64));
+        assert_eq!(parse("false"), IntExpr::from(0i64));
+    }
+
+    #[test]
+    fn a_comparison_the_range_decides_is_a_constant() {
+        let ranges = HashMap::from([(
+            "s0".to_string(),
+            RangeConstraint {
+                min_val: Some(4),
+                max_val: Some(8),
+            },
+        )]);
+        let parse = |text: &str| {
+            parse_sympy_expr_with_ranges(text, &sym_map(), &ranges).expect("should parse")
+        };
+        assert_eq!(
+            parse("StrictGreaterThan(Symbol('s0', integer=True), Integer(3))"),
+            IntExpr::from(1i64)
+        );
+        assert_eq!(
+            parse("StrictLessThan(Symbol('s0', integer=True), Integer(4))"),
+            IntExpr::from(0i64)
+        );
     }
 
     #[test]

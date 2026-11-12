@@ -163,6 +163,83 @@ impl ParsedPT2 {
             .collect()
     }
 
+    /// Every value name a node takes as an operand.
+    pub fn operand_names(&self) -> std::collections::HashSet<&str> {
+        let mut operands = std::collections::HashSet::new();
+        for node in &self.program.graph_module.graph.nodes {
+            for input in &node.inputs {
+                input.arg.for_each_value_name(&mut |name| {
+                    operands.insert(name);
+                });
+            }
+        }
+        operands
+    }
+
+    /// The integer arguments that define a symbol, as `argument name ->
+    /// symbol`.
+    ///
+    /// torch binds a symbol from an integer argument that IS that symbol.
+    /// Here the argument defines it when the program uses either one: a
+    /// node reads the argument, or another value's size or expression
+    /// names the symbol. An argument nothing reads, whose symbol nothing
+    /// else names, is never touched and defines nothing (a symbol torch
+    /// mints for a stride alone is one).
+    pub fn integer_symbol_definitions(&self) -> HashMap<String, String> {
+        let graph = &self.program.graph_module.graph;
+        let operands = self.operand_names();
+        let candidates: Vec<(&str, String)> = graph
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let name = input.as_sym_int.as_ref()?.as_name.as_str();
+                let symbol = graph
+                    .sym_int_values
+                    .get(name)
+                    .and_then(bare_symbol_of_value)?;
+                Some((name, symbol))
+            })
+            .collect();
+
+        // Every symbol another value names: a tensor's size, or the
+        // expression of a symbolic scalar. An argument no node reads does
+        // not vouch for its own symbol.
+        let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for meta in graph.tensor_values.values() {
+            for size in &meta.sizes {
+                if let Some(expr) = size.symbol_name() {
+                    named.extend(symbol_names_in(expr));
+                }
+            }
+        }
+        let silent =
+            |name: &str| !operands.contains(name) && candidates.iter().any(|(own, _)| *own == name);
+        for values in [
+            &graph.sym_int_values,
+            &graph.sym_bool_values,
+            &graph.sym_float_values,
+        ] {
+            for (name, value) in values {
+                if silent(name) {
+                    continue;
+                }
+                if let Some(expr) = value
+                    .get("as_expr")
+                    .and_then(|expr| expr.get("expr_str"))
+                    .and_then(|expr| expr.as_str())
+                {
+                    named.extend(symbol_names_in(expr));
+                }
+            }
+        }
+
+        candidates
+            .into_iter()
+            .filter(|(name, symbol)| operands.contains(name) || named.contains(symbol))
+            .map(|(name, symbol)| (name.to_string(), symbol))
+            .collect()
+    }
+
     /// Get tensor metadata by name.
     pub fn tensor_meta(&self, name: &str) -> Option<&TensorMeta> {
         self.program.graph_module.graph.tensor_values.get(name)
@@ -183,6 +260,11 @@ impl ParsedPT2 {
                 }
             }
         }
+
+        // An integer argument that is a symbol states that symbol too, also
+        // when no tensor axis carries it (`t * n`, or a backward graph that
+        // is handed only a saved size).
+        sym_set.extend(self.integer_symbol_definitions().into_values());
 
         let mut sym_names: Vec<String> = sym_set.into_iter().collect();
         sym_names.sort();
@@ -225,6 +307,32 @@ impl ParsedPT2 {
 /// Public alias for use by translator.
 pub fn extract_symbol_name_pub(expr_str: &str) -> Option<String> {
     extract_symbol_name(expr_str)
+}
+
+/// The symbol a serialized symbolic integer IS, when its expression is one
+/// bare symbol (`Symbol('u0', integer=True)`) and nothing else.
+pub fn bare_symbol_of_value(value: &serde_json::Value) -> Option<String> {
+    let expr = value.get("as_expr")?.get("expr_str")?.as_str()?.trim();
+    // A compound expression starts with its function (`Mul(`, `Add(`), and
+    // a bare symbol's `srepr` has no nested call.
+    if !expr.starts_with("Symbol(") || expr.matches('(').count() != 1 {
+        return None;
+    }
+    extract_symbol_name(expr)
+}
+
+/// The name of every `Symbol('...')` a sympy `srepr` string mentions.
+fn symbol_names_in(expr_str: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = expr_str;
+    while let Some(at) = rest.find("Symbol(") {
+        rest = &rest[at..];
+        if let Some(name) = extract_symbol_name(rest) {
+            names.push(name);
+        }
+        rest = &rest["Symbol(".len()..];
+    }
+    names
 }
 
 fn extract_symbol_name(expr_str: &str) -> Option<String> {
@@ -297,6 +405,21 @@ pub fn parse_pt2(path: &str) -> Result<ParsedPT2> {
         weights_config,
         archive_prefix,
         pt2_path: path.to_string(),
+    })
+}
+
+/// Parse a program handed over in process: the `model.json` document of a
+/// PT2 archive, without the archive. Constant data does not travel with it;
+/// the caller stages every held tensor itself.
+pub fn parse_program(json: &[u8]) -> Result<ParsedPT2> {
+    let program: ExportedProgram =
+        serde_json::from_slice(json).context("Failed to parse the serialized program")?;
+    Ok(ParsedPT2 {
+        program,
+        constants_config: None,
+        weights_config: None,
+        archive_prefix: String::new(),
+        pt2_path: String::new(),
     })
 }
 
@@ -489,6 +612,58 @@ mod tests {
             distinct.len(),
             names.len(),
             "two dims must never share a symbol"
+        );
+    }
+
+    /// A symbol only an integer argument states (`t * n`: no tensor axis
+    /// carries `n`) is a symbol of the program when the program uses it: a
+    /// node reads the argument, or another value's expression names the
+    /// symbol. A compound integer argument states no symbol of its own,
+    /// and neither does an argument nothing reads whose symbol nothing
+    /// else names.
+    #[test]
+    fn build_sym_dim_map_reads_bare_integer_arguments() {
+        let json = r#"{"graph_module":{"graph":{
+            "inputs":[{"as_tensor":{"name":"x"}},{"as_sym_int":{"as_name":"n"}},
+                      {"as_sym_int":{"as_name":"twice"}},
+                      {"as_sym_int":{"as_name":"unread"}},
+                      {"as_sym_int":{"as_name":"named"}}],
+            "outputs":[],
+            "nodes":[{"target":"torch.ops.aten.mul.Tensor",
+                      "inputs":[{"name":"self","arg":{"as_tensor":{"name":"x"}}},
+                                {"name":"other","arg":{"as_sym_int":{"as_name":"n"}}},
+                                {"name":"more","arg":{"as_sym_int":{"as_name":"twice"}}}],
+                      "outputs":[{"as_tensor":{"name":"y"}}]}],
+            "tensor_values":{"x":{"dtype":6,"sizes":[{"as_int":4}]}},
+            "sym_int_values":{
+              "n":{"as_expr":{"expr_str":"Symbol('u0', integer=True)","hint":null}},
+              "twice":{"as_expr":{"expr_str":"Mul(Integer(2), Symbol('u1', integer=True))"}},
+              "unread":{"as_expr":{"expr_str":"Symbol('u2', integer=True)"}},
+              "named":{"as_expr":{"expr_str":"Symbol('u3', integer=True)"}}},
+            "sym_bool_values":{
+              "big":{"as_expr":{"expr_str":"StrictGreaterThan(Symbol('u3', integer=True), Integer(3))"}}}},
+            "signature":{"input_specs":[]}}}"#;
+        let parsed = ParsedPT2 {
+            program: serde_json::from_str(json).expect("fixture must parse"),
+            constants_config: None,
+            weights_config: None,
+            archive_prefix: String::new(),
+            pt2_path: String::new(),
+        };
+        let map = parsed.build_sym_dim_map();
+        let mut symbols: Vec<_> = map.sym_to_symbol.keys().cloned().collect();
+        symbols.sort();
+        assert_eq!(
+            symbols,
+            vec!["u0", "u3"],
+            "the argument a node reads, and the one another expression names"
+        );
+        assert_eq!(
+            parsed
+                .integer_symbol_definitions()
+                .get("named")
+                .map(String::as_str),
+            Some("u3")
         );
     }
 

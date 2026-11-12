@@ -284,11 +284,14 @@ impl Translator<'_> {
             }
         };
 
-        // GQA: repeat-interleave K/V heads up to Q's count, gated on
-        // `enable_gqa` — only the unified op carries the flag, and the
-        // pipeline emits only the unified op (sdpa decomps are stripped).
-        // Flagless graphs with mismatched heads fail the ensure below.
-        let enable_gqa = self.named_bool_arg(node, "enable_gqa").unwrap_or(false);
+        // GQA: repeat-interleave K/V heads up to Q's count. The unified op
+        // carries `enable_gqa` and, like eager, refuses mismatched heads
+        // without it. The fused kernel ops (`_scaled_dot_product_*`) carry no
+        // flag: AOTAutograd traces through the unified op's dispatch, and the
+        // dispatcher hands a kernel grouped K/V heads only when that kernel
+        // broadcasts them, so a mismatch there IS grouped-query attention.
+        let fused = node.target.contains("_scaled_dot_product_");
+        let enable_gqa = self.named_bool_arg(node, "enable_gqa").unwrap_or(fused);
         if enable_gqa && q_ndim >= 3 && !same_dim(query.dims()[q_ndim - 3], key.dims()[q_ndim - 3])
         {
             let h_axis = q_ndim - 3;

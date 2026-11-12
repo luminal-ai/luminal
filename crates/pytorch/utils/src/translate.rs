@@ -63,6 +63,8 @@ mod remainder_tests;
 #[cfg(test)]
 mod scan_tests;
 mod shifts;
+#[cfg(test)]
+mod slot_tests;
 mod special;
 #[cfg(test)]
 mod special_tests;
@@ -81,6 +83,7 @@ use ops::ReductionOp;
 use reductions_more::AddMmVariant;
 use stats_more::DistVariant;
 
+use crate::boundary::{BoundaryPlan, RuntimeCheck, SlotKind};
 use crate::declared_dtype::DeclaredDtype;
 use crate::dim_range::{self, DimRange};
 use crate::dtype::TorchDType;
@@ -120,8 +123,14 @@ pub struct TranslatedOutput {
 /// A translated program: the recorder graph plus its boundary tables.
 pub struct Translation {
     pub graph: Graph,
+    /// The tensors the program reads, each with storage: the arguments it
+    /// reads and every parameter, buffer and constant it holds.
     pub inputs: Vec<TranslatedInput>,
+    /// The tensors the program writes. See [`OutputRow`](crate::boundary::OutputRow).
     pub outputs: Vec<TranslatedOutput>,
+    /// The program's boundary, slot by slot: one argument per placeholder
+    /// and one leaf per output, in torch's order. See the boundary module.
+    pub boundary: BoundaryPlan,
     /// Recorder dim symbol -> the concrete hint torch exported with it.
     pub dims: HashMap<Symbol, usize>,
     /// PT2 symbol name -> recorder dim symbol, for runtime `set_dim` by name.
@@ -135,6 +144,35 @@ pub struct Translation {
     /// The one device every tensor lives on; `None` when the export states
     /// no device. See the torch_device module.
     pub device: Option<crate::torch_device::TorchDevice>,
+}
+
+impl Translation {
+    /// The symbol one integer argument defines at a call, with the value
+    /// the call gives it; `None` for an argument that defines no symbol.
+    ///
+    /// A symbol's value is unsigned in the runtimes today, so a negative
+    /// argument is refused by name rather than wrapped.
+    pub fn int_binding(&self, graph_name: &str, value: i64) -> Result<Option<(Symbol, usize)>> {
+        let slot = self
+            .boundary
+            .argument(graph_name)
+            .map(|(_, slot)| slot)
+            .filter(|slot| slot.kind == SlotKind::Int)
+            .ok_or_else(|| anyhow!("{graph_name:?} is not an integer argument of this program"))?;
+        let Some(name) = &slot.binds else {
+            return Ok(None);
+        };
+        let symbol = *self.symbols.get(name).ok_or_else(|| {
+            anyhow!("integer argument {graph_name:?} defines unknown symbol {name}")
+        })?;
+        let value = usize::try_from(value).map_err(|_| {
+            anyhow!(
+                "integer argument {graph_name:?} is {value}: it defines the symbol {name}, and \
+                 a symbol's value is unsigned in this runtime (LUM-1337)"
+            )
+        })?;
+        Ok(Some((symbol, value)))
+    }
 }
 
 /// The dtypes a torch op performs its math in: tensor operands meet at
@@ -177,6 +215,8 @@ struct Translator<'a> {
     /// One widening per (value, common dtype), so several nodes widening
     /// the same value share one cast.
     widened: HashMap<(NodeIndex, Discriminant<DType>), GraphTensor>,
+    /// The runtime checks torch asserts in the graph, as read so far.
+    checks: Vec<RuntimeCheck>,
 }
 
 /// Read one dimension expression a caller stated in sympy's `srepr`
@@ -207,10 +247,17 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         .iter()
         .collect();
     tensors.sort_by(|a, b| a.0.cmp(b.0));
+    let boundary = crate::boundary::plan(parsed)?;
+    // An argument no node reads is never touched: nothing states or checks
+    // its layout or its device.
+    let unread = boundary.unread_tensors();
     for (name, meta) in tensors {
+        if unread.contains(name.as_str()) {
+            continue;
+        }
         crate::torch_layout::check_strided(name, meta.layout)?;
     }
-    let device = crate::torch_device::program_device(parsed)?;
+    let device = crate::torch_device::program_device(parsed, &unread)?;
     let sym_dim_map = parsed.build_sym_dim_map();
     let mut t = Translator {
         cx: Graph::new(),
@@ -225,6 +272,7 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         storage_values: HashMap::new(),
         storage_geometries: HashMap::new(),
         widened: HashMap::new(),
+        checks: Vec::new(),
     };
 
     let kinds: HashMap<String, InputKind> = parsed
@@ -239,26 +287,45 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
             (name, kind)
         })
         .collect();
-    // A `buffer_mutation` output names its target by module FQN; the
-    // boundary binds by graph input name.
-    let buffer_graph_names: HashMap<String, String> = kinds
-        .values()
-        .filter_map(|kind| match kind {
-            InputKind::Buffer {
-                graph_name,
-                original_name,
-            } => Some((original_name.clone(), graph_name.clone())),
-            _ => None,
-        })
-        .collect();
-
-    // 1. Inputs, in export order.
+    // 1. Inputs, in export order. Only a tensor has storage. A symbolic
+    //    scalar argument is the expression torch recorded for it, which
+    //    every node that reads it resolves by name; a constant argument is
+    //    nothing the program names; and a tensor argument no node reads is
+    //    never touched.
     let mut inputs = Vec::new();
     for tref in &parsed.program.graph_module.graph.inputs {
+        if tref.as_tensor.is_none() {
+            // An integer argument that IS a symbol defines it at each call.
+            // A backed symbol carries the value it was traced at, which is
+            // the profiling value search starts from.
+            if let Some(scalar) = &tref.as_sym_int
+                && let Some(value) = parsed
+                    .program
+                    .graph_module
+                    .graph
+                    .sym_int_values
+                    .get(&scalar.as_name)
+                && let Some(symbol) = crate::pt2_parser::bare_symbol_of_value(value)
+                    .and_then(|name| t.symbols.get(&name).copied())
+                && let Some(hint) = value
+                    .get("as_expr")
+                    .and_then(|expr| expr.get("hint"))
+                    .and_then(|hint| hint.get("as_int"))
+                    .and_then(|hint| hint.as_i64())
+                    .and_then(|hint| usize::try_from(hint).ok())
+            {
+                t.dims.insert(symbol, hint);
+                t.cx.set_dim(symbol, hint);
+            }
+            continue;
+        }
         let name = tref
             .value_name()
             .ok_or_else(|| anyhow!("graph input has no tensor/scalar name: {tref:?}"))?
             .to_string();
+        if unread.contains(name.as_str()) {
+            continue;
+        }
         let meta = t
             .tensor_meta(&name)
             .with_context(|| format!("input {name} has no tensor metadata"))?
@@ -310,35 +377,17 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         t.refuse_narrow_float_arithmetic(node, recorded)?;
     }
 
-    // 3. Outputs, in export order: one row per output spec, keyed by the
-    //    export's own node name. A mutation spec writes back into its target
-    //    input's storage and is not returned; torch emits it before the user
-    //    output that returns the same NODE, and that user output IS the
-    //    writeback (the caller's tensor), not a second boundary. Two specs
-    //    naming different nodes are two rows even when they translate to one
-    //    value (a returned clone of a written-back value): the boundary gives
-    //    each its own buffer, and the plan writes one and copies.
-    let output_specs = &parsed.program.graph_module.signature.output_specs;
-    let mut regular: Vec<TranslatedOutput> = Vec::new();
-    // Export node name of each mutation row -> index in `regular`.
-    let mut writeback_by_name: HashMap<String, usize> = HashMap::new();
-    for (position, tref) in parsed.program.graph_module.graph.outputs.iter().enumerate() {
-        // Literal user outputs have no runtime storage. The Python boundary
-        // restores them from the export signature, retaining their positions.
-        if let Some(crate::pt2_schema::OutputSpec::Other(spec)) = output_specs.get(position)
-            && let Some(arg) = spec.get("user_output").and_then(|output| output.get("arg"))
-            && ["as_none", "as_int", "as_float", "as_bool", "as_string"]
-                .iter()
-                .any(|key| arg.get(key).is_some())
-        {
-            continue;
-        }
-        let name = tref
-            .value_name()
-            .ok_or_else(|| anyhow!("graph output has no tensor name: {tref:?}"))?
-            .to_string();
+    // 3. Outputs: one row per tensor the boundary plan says the program
+    //    writes, keyed by the export's own node name. A mutation row writes
+    //    back into its target input's storage. Two leaves naming different
+    //    nodes are two rows even when they translate to one value (a
+    //    returned clone of a written-back value): the boundary gives each
+    //    its own buffer, and the plan writes one and copies.
+    let mut outputs: Vec<TranslatedOutput> = Vec::with_capacity(boundary.rows.len());
+    for row in &boundary.rows {
+        let name = &row.graph_name;
         let meta = t
-            .tensor_meta(&name)
+            .tensor_meta(name)
             .with_context(|| format!("output {name} has no tensor metadata"))?
             .clone();
         let torch_dtype = TorchDType::from_code(meta.dtype)
@@ -347,39 +396,22 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
             Some(component_dtype) => component_dtype,
             None => dtype_of(meta.dtype)?,
         };
-        let shape = t.boundary_shape(&meta, &name)?;
+        let shape = t.boundary_shape(&meta, name)?;
         // A complex output is repacked into interleaved `[..., 2]` storage
         // for the boundary; its logical shape stays the unpacked one.
-        let value = if let Some(value) = t.complex_tensors.get(&name).copied() {
+        let value = if let Some(value) = t.complex_tensors.get(name).copied() {
             value.pack(&mut t.cx)
         } else {
             *t.values
-                .get(&name)
+                .get(name)
                 .ok_or_else(|| anyhow!("output {name} was never produced"))?
-        };
-
-        let mutation_target = match output_specs.get(position) {
-            Some(crate::pt2_schema::OutputSpec::UserInputMutation {
-                user_input_mutation,
-            }) => Some(user_input_mutation.user_input_name.clone()),
-            Some(crate::pt2_schema::OutputSpec::BufferMutation { buffer_mutation }) => {
-                let buffer_name = &buffer_mutation.buffer_name;
-                let Some(target_name) = buffer_graph_names.get(buffer_name) else {
-                    bail!("mutation output {name} targets unknown buffer {buffer_name:?}");
-                };
-                Some(target_name.clone())
-            }
-            _ => None,
         };
         // A mutation writes an INPUT's storage: the target must be a graph
         // input for the backend to have a buffer to bind this output on.
-        if let Some(target_name) = &mutation_target
-            && !t.input_values.contains_key(target_name)
-        {
-            bail!("mutation output {name} targets unknown input {target_name:?}");
-        }
-        if let Some(target_name) = &mutation_target {
-            let target = t.input_values[target_name];
+        if let Some(target_name) = &row.mutation_target {
+            let Some(target) = t.input_values.get(target_name) else {
+                bail!("mutation output {name} targets unknown input {target_name:?}");
+            };
             if target.dtype != value.dtype {
                 bail!(
                     "mutation output {name} changes {target_name:?} from {:?} to {:?}",
@@ -388,26 +420,15 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
                 );
             }
         }
-        // A writeback is not part of the caller's returned pytree.
-        let returned = mutation_target.is_none();
-        if returned && let Some(&index) = writeback_by_name.get(&name) {
-            regular[index].returned = true;
-            continue;
-        }
-        if !returned {
-            writeback_by_name.insert(name.clone(), regular.len());
-        }
-        regular.push(TranslatedOutput {
-            graph_name: name,
+        outputs.push(TranslatedOutput {
+            graph_name: name.clone(),
             tensor: value.id,
             dtype,
             shape,
-            mutation_target,
-            returned,
+            mutation_target: row.mutation_target.clone(),
+            returned: row.returned,
         });
     }
-
-    let outputs = regular;
 
     // 4. The dtype torch declared for each bound value. A name torch
     //    declares with a dtype our IR has no type for (the complex family,
@@ -446,10 +467,14 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
 
     let dim_ranges = dim_range::dim_ranges(&t.ranges, &t.symbols);
 
+    let mut boundary = boundary;
+    boundary.checks = std::mem::take(&mut t.checks);
+
     Ok(Translation {
         graph: t.cx,
         inputs,
         outputs,
+        boundary,
         dims: t.dims,
         symbols: t.symbols,
         declared_dtypes,
@@ -564,8 +589,18 @@ impl Translator<'_> {
         }))
     }
 
-    /// A scalar literal as a rank-0 tensor of `dtype`. A Python float is
-    /// read at the dtype the op computes in (F64 keeps the double).
+    /// An ATen `Scalar` as a rank-0 tensor of `dtype`: a Python literal, or
+    /// a symbolic value. A Python float is read at the dtype the op
+    /// computes in (F64 keeps the double).
+    ///
+    /// A symbolic integer (`x.shape[0]`, `x.shape[0] + 1`) IS its dimension
+    /// expression, and a symbolic bool (`x.shape[0] > 3`) is that
+    /// comparison read as 1 or 0, the number torch uses for it. Either is
+    /// materialised as an `Int` iota of the expression, the frontend's own
+    /// `tensor * IntExpr` spelling, and converted to `dtype` like an integer
+    /// literal. The iota is 32-bit, so a value beyond `i32` refuses at the
+    /// iota rather than wrapping. A `SymFloat` has no integer expression
+    /// and stays refused.
     fn scalar(&mut self, input: &NodeInput, dtype: DType) -> Result<GraphTensor> {
         if let Some(v) = input.arg.as_float() {
             return Ok(self.typed_scalar(v, dtype));
@@ -582,34 +617,24 @@ impl Translator<'_> {
         if let Some(v) = input.arg.as_bool() {
             return Ok(self.typed_scalar(if v { 1.0 } else { 0.0 }, dtype));
         }
+        if matches!(
+            input.arg,
+            Argument::SymInt(_) | Argument::Expr(_) | Argument::SymBool(_)
+        ) {
+            let expr = self.resolve_symbolic_scalar(&input.arg).ok_or_else(|| {
+                anyhow!(
+                    "operand {:?}: cannot resolve its symbolic value{}",
+                    input.name,
+                    self.describe_symbolic_arg(&input.arg)
+                )
+            })?;
+            return Ok(convert(self.cx.constant_i32(expr), dtype));
+        }
         bail!(
             "operand {:?} is not a scalar (arg: {:?})",
             input.name,
             input.arg
         )
-    }
-
-    /// An arithmetic op's ATen `Scalar` as a rank-0 tensor of `dtype`: a
-    /// Python literal (`scalar`), or a symbolic integer, which export
-    /// records as a `SymInt` (`x.shape[0]`, `x.shape[0] + 1`). A symbolic
-    /// scalar IS its dimension expression: it is materialised as an `Int`
-    /// iota of that expression, the frontend's own `tensor * IntExpr`
-    /// spelling, and converted to `dtype` like an integer literal. The iota
-    /// is 32-bit, so a dimension beyond `i32` refuses at the iota rather
-    /// than wrapping. A `SymFloat` or `SymBool` has no dimension expression
-    /// and stays refused.
-    fn scalar_operand(&mut self, input: &NodeInput, dtype: DType) -> Result<GraphTensor> {
-        if !matches!(input.arg, Argument::SymInt(_) | Argument::Expr(_)) {
-            return self.scalar(input, dtype);
-        }
-        let expr = self.resolve_arg_as_expression(&input.arg).ok_or_else(|| {
-            anyhow!(
-                "operand {:?}: cannot resolve its symbolic integer (arg: {:?})",
-                input.name,
-                input.arg
-            )
-        })?;
-        Ok(convert(self.cx.constant_i32(expr), dtype))
     }
 
     /// The two operands of an elementwise arithmetic op, broadcast to a
@@ -642,11 +667,11 @@ impl Translator<'_> {
         };
         let a = match lhs_tensor {
             Some(tensor) => tensor,
-            None => self.scalar_operand(lhs, dtype)?,
+            None => self.scalar(lhs, dtype)?,
         };
         let b = match rhs_tensor {
             Some(tensor) => tensor,
-            None => self.scalar_operand(rhs, dtype)?,
+            None => self.scalar(rhs, dtype)?,
         };
         Ok(broadcast_pair(a, b))
     }
@@ -860,6 +885,39 @@ impl Translator<'_> {
         Ok(())
     }
 
+    /// Read `_assert_scalar(condition, message)` as a runtime check.
+    ///
+    /// The condition is a symbolic bool, read as 1 or 0 over the program's
+    /// symbols. One the dimension ranges already decide is true at every
+    /// call the program admits and is not kept. One this translator cannot
+    /// read (a float comparison, or a value known only from tensor data)
+    /// is not checked: nothing is refused for it, as before.
+    fn record_assertion(&mut self, node: &Node) {
+        let Some(condition) = node.inputs.first() else {
+            return;
+        };
+        let condition = match &condition.arg {
+            Argument::Bool(value) => Some(IntExpr::from(i64::from(value.as_bool))),
+            arg => self.resolve_symbolic_scalar(arg),
+        };
+        let Some(condition) = condition else {
+            return;
+        };
+        if condition.as_num() == Some(1) {
+            return;
+        }
+        let message = node
+            .inputs
+            .get(1)
+            .and_then(|input| match &input.arg {
+                Argument::Other(value) => value.get("as_string")?.as_str(),
+                _ => None,
+            })
+            .unwrap_or("Runtime assertion failed")
+            .to_string();
+        self.checks.push(RuntimeCheck { condition, message });
+    }
+
     fn dispatch(&mut self, node: &Node) -> Result<()> {
         let target = node
             .target
@@ -881,32 +939,40 @@ impl Translator<'_> {
             );
         }
 
-        // Assertion nodes carry no dataflow; they never bind outputs.
+        // A scalar assertion carries no dataflow. It states a condition
+        // every call must meet, which becomes a runtime check of the plan.
+        if target == "_assert_scalar.default" {
+            self.record_assertion(node);
+            return Ok(());
+        }
+
+        // A metadata assertion carries no dataflow and binds no output.
         // `sym_size` produces a scalar SymInt, not a tensor: its value is
         // carried in `sym_int_values` and resolved where a shape argument
         // needs it (`get_int_exprs_arg`), so it binds nothing here.
-        if matches!(
-            target,
-            "_assert_tensor_metadata.default" | "_assert_scalar.default" | "sym_size.int"
-        ) {
+        if matches!(target, "_assert_tensor_metadata.default" | "sym_size.int") {
             return Ok(());
         }
 
-        // Symbolic integer arithmetic has no tensor dataflow. Its exported
-        // expression is consumed by shape arguments and scalar_tensor below.
+        // Arithmetic on symbolic scalars has no tensor dataflow: every
+        // operand and every result is a symbolic integer, float or bool, or
+        // a literal. Its result is the expression torch recorded for it,
+        // resolved by name where a tensor op reads it (a shape argument,
+        // `scalar`), or returned as an output leaf. A result this
+        // translator cannot read is refused there, by name, and only if
+        // something reads it. An op that takes a tensor and yields a scalar
+        // (`item`) is tensor dataflow and is dispatched below.
         if !node.outputs.is_empty()
-            && node.outputs.iter().all(|out| out.as_sym_int.is_some())
             && node.outputs.iter().all(|out| {
-                self.resolve_sym_int(&out.as_sym_int.as_ref().unwrap().as_name)
-                    .is_some()
+                out.as_sym_int.is_some() || out.as_sym_float.is_some() || out.as_sym_bool.is_some()
+            })
+            && !node.inputs.iter().any(|input| {
+                matches!(
+                    input.arg,
+                    Argument::Tensor(_) | Argument::Tensors(_) | Argument::OptionalTensors(_)
+                )
             })
         {
-            return Ok(());
-        }
-
-        // Shape comparisons feed export's scalar assertions. They contain no
-        // tensor data; Dynamo/export owns their guards at the call boundary.
-        if !node.outputs.is_empty() && node.outputs.iter().all(|out| out.as_sym_bool.is_some()) {
             return Ok(());
         }
 
@@ -1105,7 +1171,13 @@ impl Translator<'_> {
             // `rsub(self, other, alpha)` is `other - alpha * self`.
             "rsub.Tensor" | "rsub.Scalar" => self.add_sub(&n[1], &n[0], alpha_input(n), true)?,
             "mul.Tensor" | "mul.Scalar" => self.binary(n, |a, b| a * b)?,
-            "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
+            // `true_divide` is torch's other name for `div` with no rounding
+            // mode. torch's scalar-tensorify pass emits it after AOTAutograd
+            // has applied the decomposition table (`x * (n / 2.0)`), so no
+            // decomposition renames it.
+            "div.Tensor" | "div.Scalar" | "true_divide.Tensor" | "true_divide.Scalar" => {
+                self.binary(n, |a, b| a / b)?
+            }
             "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
             "minimum.default" => self.binary(n, |a, b| a.minimum(b))?,
             // ---- movement ----
@@ -1655,7 +1727,7 @@ impl Translator<'_> {
         });
         let b = match alpha {
             Some(alpha) if !unit_alpha => {
-                let alpha = self.scalar_operand(alpha, b.dtype)?.expand_rhs(b.dims());
+                let alpha = self.scalar(alpha, b.dtype)?.expand_rhs(b.dims());
                 b * alpha
             }
             _ => b,
@@ -1844,6 +1916,8 @@ fn opmath_target(target: &str) -> bool {
             | "mul.Scalar"
             | "div.Tensor"
             | "div.Scalar"
+            | "true_divide.Tensor"
+            | "true_divide.Scalar"
             | "div.Tensor_mode"
             | "floor_divide.default"
             | "maximum.default"
@@ -2050,6 +2124,7 @@ mod dim_expr_tests {
             graph: Graph::new(),
             inputs: Vec::new(),
             outputs: Vec::new(),
+            boundary: Default::default(),
             dims: HashMap::new(),
             symbols: symbols
                 .iter()

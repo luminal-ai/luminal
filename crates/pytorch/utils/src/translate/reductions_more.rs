@@ -444,6 +444,8 @@ mod tests {
                     nodes: vec![node],
                     tensor_values,
                     sym_int_values: HashMap::new(),
+                    sym_bool_values: HashMap::new(),
+                    sym_float_values: HashMap::new(),
                 },
                 signature: Signature {
                     input_specs: Vec::new(),
@@ -752,6 +754,7 @@ mod scalar_precision_tests {
             storage_values: HashMap::new(),
             storage_geometries: HashMap::new(),
             widened: HashMap::new(),
+            checks: Vec::new(),
         };
         let x = translator.cx.tensor(vec![1], DType::I64);
         let alpha = (1i64 << 54) + 3;

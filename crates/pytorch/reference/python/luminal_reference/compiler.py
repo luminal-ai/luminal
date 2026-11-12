@@ -13,8 +13,7 @@ class Compiler(ReferenceAOTBackend):
         model = torch.compile(model, backend=compiler)
 
     ``None`` memory limits select the runtime defaults (2 GiB per intermediate,
-    8 GiB live payload). ``graphs`` and ``regions`` retain compilation
-    diagnostics. One compiler can compile multiple graphs.
+    8 GiB live payload). ``graphs`` retains compilation diagnostics. One compiler can compile multiple graphs.
     Each local graph compiles once over its PyTorch-declared shape bounds.
     Applications can use ``torch.compile(..., isolate_recompiles=True)`` to create independently bounded callables and
     dispatch among them. ``search_iterations`` selects the number of candidates

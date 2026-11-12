@@ -195,6 +195,22 @@ impl CompiledGraph {
             .collect()
     }
 
+    /// The declared bounds of every named dimension, keyed by symbol name.
+    #[getter]
+    fn dim_bounds(&self) -> HashMap<String, (usize, usize)> {
+        self.translation
+            .symbols
+            .iter()
+            .map(|(name, symbol)| {
+                let range = self
+                    .bounds
+                    .get(symbol)
+                    .expect("translated dimension bounds");
+                (name.clone(), (range.min(), range.max()))
+            })
+            .collect()
+    }
+
     #[getter]
     fn output_mutations(&self) -> Vec<Option<String>> {
         self.translation
@@ -259,14 +275,62 @@ impl CompiledGraph {
     /// against the dimensions THIS call states: read input by input, an
     /// input declared `2*s0` would be checked against whatever s0 was left
     /// at by the call before it.
-    fn bind_input_shapes(&mut self, shapes: Vec<(String, Vec<usize>)>) -> PyResult<()> {
-        self.bind_dims(&shapes).map_err(to_py)
+    ///
+    /// `ints` are the call's integer arguments by graph name. One that is
+    /// a symbol defines that symbol, ahead of any tensor axis that carries
+    /// it, which is then checked against it.
+    #[pyo3(signature = (shapes, ints = Vec::new()))]
+    fn bind_input_shapes(
+        &mut self,
+        shapes: Vec<(String, Vec<usize>)>,
+        ints: Vec<(String, i64)>,
+    ) -> PyResult<()> {
+        self.bind_dims(&shapes, &ints).map_err(to_py)
     }
 
     /// The same for a single input — the whole call, when it has one
     /// tensor in it.
     fn bind_input_shape(&mut self, name: &str, shape: Vec<usize>) -> PyResult<()> {
-        self.bind_dims(&[(name.to_string(), shape)]).map_err(to_py)
+        self.bind_dims(&[(name.to_string(), shape)], &[])
+            .map_err(to_py)
+    }
+
+    /// The program's arguments, in call order: `(kind, graph name, read,
+    /// symbol)`. A call passes one value per row. `read` says whether the
+    /// program reads the argument, and `symbol` is the dimension an integer
+    /// argument defines.
+    #[getter]
+    fn input_slots(&self) -> Vec<(String, String, bool, Option<String>)> {
+        self.translation.boundary.input_rows()
+    }
+
+    /// The messages of the runtime checks the program carries.
+    #[getter]
+    fn runtime_assertions(&self) -> Vec<String> {
+        self.translation
+            .boundary
+            .checks
+            .iter()
+            .map(|check| check.message.clone())
+            .collect()
+    }
+
+    /// Evaluate the program's runtime checks at the symbol values the
+    /// current call bound, and raise the first one it breaks with torch's
+    /// own message. Binding does not depend on this having run.
+    fn check_assertions(&self) -> PyResult<()> {
+        match self.translation.boundary.failed_check(&self.dims) {
+            Some(check) => Err(PyRuntimeError::new_err(check.message.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// The program's output leaves, in order: `(kind, source, index)`.
+    /// `source` is `"program"` (index: the output row), `"input"` (index:
+    /// the argument slot), `"expression"` or `"literal"`.
+    #[getter]
+    fn output_slots(&self) -> Vec<(String, String, Option<usize>)> {
+        self.translation.boundary.output_rows()
     }
 
     /// Address one EXTERNAL buffer for the next execution: the caller's
@@ -506,7 +570,7 @@ impl CompiledGraph {
     /// read backwards; one dimension on two axes must be given one extent,
     /// wherever in the call those axes are; and nothing is recorded until
     /// every input has passed, so a refusal leaves the map as it was.
-    fn bind_dims(&mut self, shapes: &[(String, Vec<usize>)]) -> Result<()> {
+    fn bind_dims(&mut self, shapes: &[(String, Vec<usize>)], ints: &[(String, i64)]) -> Result<()> {
         let declared = |name: &str| -> Result<Vec<IntExpr>> {
             Ok(self
                 .translation
@@ -517,8 +581,27 @@ impl CompiledGraph {
                 .shape
                 .clone())
         };
-        // Which axis IS a dimension: the bare ones, over the whole call.
-        let mut bound: HashMap<Symbol, (String, usize, usize)> = HashMap::new();
+        // What states a dimension, over the whole call: an integer argument
+        // that is the dimension, and every tensor axis that is. Each entry
+        // names where the value came from, so a call that gives one
+        // dimension two values is refused naming both.
+        let mut bound: HashMap<Symbol, (String, usize)> = HashMap::new();
+        let mut state = |symbol: Symbol, source: String, value: usize| -> Result<()> {
+            if let Some((first_source, first)) = bound.insert(symbol, (source.clone(), value))
+                && first != value
+            {
+                bail!(
+                    "dimension {symbol} is {first_source} and {source}, called with {first} \
+                     and {value}"
+                );
+            }
+            Ok(())
+        };
+        for (name, value) in ints {
+            if let Some((symbol, value)) = self.translation.int_binding(name, *value)? {
+                state(symbol, format!("integer argument {name:?}"), value)?;
+            }
+        }
         for (name, shape) in shapes {
             for (axis, dim) in declared(name)?.iter().enumerate() {
                 let Some(value) = shape.get(axis).copied() else {
@@ -527,21 +610,16 @@ impl CompiledGraph {
                 if !is_bare(dim) {
                     continue;
                 }
-                let symbol = dim.to_symbols()[0];
-                if let Some((first_input, first_axis, first)) =
-                    bound.insert(symbol, (name.clone(), axis, value))
-                    && first != value
-                {
-                    bail!(
-                        "dimension {symbol} is axis {first_axis} of input {first_input:?} and \
-                         axis {axis} of input {name:?}, called with {first} and {value}"
-                    );
-                }
+                state(
+                    dim.to_symbols()[0],
+                    format!("axis {axis} of input {name:?}"),
+                    value,
+                )?;
             }
         }
         let call: DynMap = bound
             .iter()
-            .map(|(symbol, (_, _, value))| (*symbol, *value))
+            .map(|(symbol, (_, value))| (*symbol, *value))
             .collect();
 
         // A compound extent is a statement ABOUT the dimensions, checked
@@ -689,12 +767,17 @@ fn bind(
     output_layouts: &HashMap<String, DeclaredLayout>,
     aliases: &HashMap<String, String>,
 ) -> Result<Boundary> {
+    // A row for a tensor argument no node reads states storage the program
+    // never binds: it is not used. A row naming anything else that is not
+    // a graph input is a caller's mistake.
+    let unread = translation.boundary.unread_tensors();
     for name in input_layouts.keys() {
         ensure!(
-            translation
-                .inputs
-                .iter()
-                .any(|input| &input.graph_name == name),
+            unread.contains(name.as_str())
+                || translation
+                    .inputs
+                    .iter()
+                    .any(|input| &input.graph_name == name),
             "a boundary layout was declared for {name:?}, which is not a graph input"
         );
     }
@@ -834,8 +917,50 @@ fn compile(
     let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
-    let translation = translate(&parsed).map_err(to_py)?;
-    let bounds = luminal_pytorch_utils::symbol_bounds(&translation, &parsed).map_err(to_py)?;
+    load(&parsed, input_layouts, output_layouts, output_aliases)
+}
+
+/// The same for a program handed over in process: the JSON document of a
+/// PT2 archive, without the archive.
+#[pyfunction]
+fn compile_graph(
+    program: &[u8],
+    input_layouts: Vec<(String, String, Vec<String>)>,
+    output_layouts: Vec<(String, String, Vec<String>)>,
+    output_aliases: Vec<(String, String)>,
+) -> PyResult<CompiledGraph> {
+    let parsed = luminal_pytorch_utils::parse_program(program).map_err(to_py)?;
+    load(&parsed, input_layouts, output_layouts, output_aliases)
+}
+
+/// The boundary of a program handed over in process, read off the program
+/// alone: `(arguments, output leaves, written tensors)`. See
+/// `CompiledGraph.input_slots` and `output_slots` for the first two rows;
+/// a written tensor is `(graph name, mutation target, returned)`.
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+fn boundary_plan(
+    program: &[u8],
+) -> PyResult<(
+    Vec<(String, String, bool, Option<String>)>,
+    Vec<(String, String, Option<usize>)>,
+    Vec<(String, Option<String>, bool)>,
+)> {
+    let parsed = luminal_pytorch_utils::parse_program(program).map_err(to_py)?;
+    let plan = luminal_pytorch_utils::boundary::plan(&parsed).map_err(to_py)?;
+    Ok((plan.input_rows(), plan.output_rows(), plan.written_rows()))
+}
+
+/// Translate a parsed program, declare its boundary, and load it on the
+/// cuda-lite runtime.
+fn load(
+    parsed: &luminal_pytorch_utils::ParsedPT2,
+    input_layouts: Vec<(String, String, Vec<String>)>,
+    output_layouts: Vec<(String, String, Vec<String>)>,
+    output_aliases: Vec<(String, String)>,
+) -> PyResult<CompiledGraph> {
+    let translation = translate(parsed).map_err(to_py)?;
+    let bounds = luminal_pytorch_utils::symbol_bounds(&translation, parsed).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let inputs = layout_table(&translation, "input", &input_layouts).map_err(to_py)?;
     let outputs = layout_table(&translation, "output", &output_layouts).map_err(to_py)?;
@@ -867,6 +992,8 @@ fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledGraph>()?;
     m.add_class::<ExecutionStaging>()?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_graph, m)?)?;
+    m.add_function(wrap_pyfunction!(boundary_plan, m)?)?;
     Ok(())
 }
 
@@ -911,6 +1038,7 @@ mod tests {
         Translation {
             graph: cx,
             inputs,
+            boundary: Default::default(),
             outputs,
             dims: std::collections::HashMap::new(),
             symbols: std::collections::HashMap::new(),
@@ -982,6 +1110,7 @@ mod tests {
                     shape: shape.clone(),
                 })
                 .collect(),
+            boundary: Default::default(),
             outputs: vec![TranslatedOutput {
                 graph_name: "out".to_string(),
                 tensor: out.id,
@@ -1062,7 +1191,7 @@ mod tests {
             IntExpr::from(symbol),
         ]));
         let err = graph
-            .bind_dims(&call(&[("x", &[3, 5])]))
+            .bind_dims(&call(&[("x", &[3, 5])]), &[])
             .expect_err("s0 cannot be both 3 and 5");
         let text = format!("{err:#}");
         assert!(text.contains("s0"), "{text}");
@@ -1086,7 +1215,7 @@ mod tests {
             IntExpr::from(4i64),
         ]));
         let err = graph
-            .bind_dims(&call(&[("x", &[6, 4])]))
+            .bind_dims(&call(&[("x", &[6, 4])]), &[])
             .expect_err("nothing on this call states s0");
         let text = format!("{err:#}");
         assert!(text.contains("s0"), "{text}");
@@ -1112,7 +1241,7 @@ mod tests {
         ];
         let mut graph = compiled(declaring(shape.clone()));
         let err = graph
-            .bind_dims(&call(&[("x", &[3, 7])]))
+            .bind_dims(&call(&[("x", &[3, 7])]), &[])
             .expect_err("s0 is 3, so axis 1 is 6, not 7");
         let text = format!("{err:#}");
         assert!(text.contains("axis 1"), "{text}");
@@ -1120,7 +1249,7 @@ mod tests {
 
         let mut graph = compiled(declaring(shape));
         graph
-            .bind_dims(&call(&[("x", &[3, 6])]))
+            .bind_dims(&call(&[("x", &[3, 6])]), &[])
             .expect("3 and 2*3 agree");
         assert_eq!(graph.dims.get(&symbol), Some(&3));
     }
@@ -1145,13 +1274,13 @@ mod tests {
             let mut graph = compiled(declaring_inputs(&rows));
             let shapes = call(&[("a", &[6, 4]), ("b", &[3, 4])]);
             let shapes: Vec<_> = order.iter().map(|i| shapes[*i].clone()).collect();
-            graph.bind_dims(&shapes).expect("6 is 2*3");
+            graph.bind_dims(&shapes, &[]).expect("6 is 2*3");
             assert_eq!(graph.dims.get(&symbol), Some(&3));
 
             let mut graph = compiled(declaring_inputs(&rows));
             let shapes = call(&[("a", &[6, 4]), ("b", &[2, 4])]);
             let shapes: Vec<_> = order.iter().map(|i| shapes[*i].clone()).collect();
-            let err = graph.bind_dims(&shapes).expect_err("2*2 is not 6");
+            let err = graph.bind_dims(&shapes, &[]).expect_err("2*2 is not 6");
             let text = format!("{err:#}");
             assert!(text.contains("\"a\"") && text.contains("axis 0"), "{text}");
             assert!(text.contains('4') && text.contains('6'), "{text}");
@@ -1161,6 +1290,59 @@ mod tests {
                 "a refused call recorded a dimension"
             );
         }
+    }
+
+    /// AN INTEGER ARGUMENT THAT IS A DIMENSION DEFINES IT, ahead of any
+    /// tensor axis: with no tensor carrying the dimension the argument
+    /// alone states it, a tensor axis that carries it must agree, and a
+    /// negative value is refused by name.
+    #[test]
+    fn an_integer_argument_defines_its_dimension() {
+        let symbol = Symbol::new("s0");
+        let with_int = |rows: &[(&str, Vec<IntExpr>)]| {
+            let mut translation = declaring_inputs(rows);
+            translation.symbols.insert("s0".to_string(), symbol);
+            translation
+                .boundary
+                .inputs
+                .push(luminal_pytorch_utils::InputSlot {
+                    graph_name: "n".to_string(),
+                    kind: luminal_pytorch_utils::SlotKind::Int,
+                    read: true,
+                    binds: Some("s0".to_string()),
+                });
+            compiled(translation)
+        };
+        let int = |value: i64| vec![("n".to_string(), value)];
+
+        let mut graph = with_int(&[("x", vec![IntExpr::from(2i64), IntExpr::from(3i64)])]);
+        graph
+            .bind_dims(&call(&[("x", &[2, 3])]), &int(5))
+            .expect("the argument alone states s0");
+        assert_eq!(graph.dims.get(&symbol), Some(&5));
+
+        let mut graph = with_int(&[("x", vec![IntExpr::from(symbol), IntExpr::from(3i64)])]);
+        graph
+            .bind_dims(&call(&[("x", &[5, 3])]), &int(5))
+            .expect("the argument and the axis agree");
+        let err = graph
+            .bind_dims(&call(&[("x", &[4, 3])]), &int(5))
+            .expect_err("s0 cannot be both 5 and 4");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("integer argument \"n\"") && text.contains("\"x\""),
+            "{text}"
+        );
+
+        let err = graph
+            .bind_dims(&call(&[("x", &[5, 3])]), &int(-1))
+            .expect_err("a symbol's value is unsigned");
+        assert!(format!("{err:#}").contains("LUM-1337"), "{err:#}");
+        assert_eq!(
+            graph.dims.get(&symbol),
+            Some(&5),
+            "a refused call recorded a dimension"
+        );
     }
 
     /// ONE DIMENSION, ONE EXTENT ACROSS THE CALL: two inputs that give one
@@ -1175,7 +1357,7 @@ mod tests {
         ];
         let mut graph = compiled(declaring_inputs(&rows));
         let err = graph
-            .bind_dims(&call(&[("a", &[3, 4]), ("b", &[5, 4])]))
+            .bind_dims(&call(&[("a", &[3, 4]), ("b", &[5, 4])]), &[])
             .expect_err("s0 cannot be both 3 and 5");
         let text = format!("{err:#}");
         assert!(text.contains("\"a\"") && text.contains("\"b\""), "{text}");
@@ -1429,6 +1611,7 @@ mod tests {
                 dtype: DType::F32,
                 shape: shape.clone(),
             }],
+            boundary: Default::default(),
             outputs: vec![TranslatedOutput {
                 graph_name: "out".to_string(),
                 tensor: out.id,

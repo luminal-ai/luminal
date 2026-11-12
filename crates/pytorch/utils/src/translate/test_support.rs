@@ -151,6 +151,8 @@ pub(crate) fn parsed_nodes(
                 nodes,
                 tensor_values,
                 sym_int_values: HashMap::new(),
+                sym_bool_values: HashMap::new(),
+                sym_float_values: HashMap::new(),
             },
             signature: Signature {
                 input_specs: Vec::new(),

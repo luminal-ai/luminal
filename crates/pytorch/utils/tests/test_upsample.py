@@ -108,6 +108,17 @@ def test_upsample_nearest_downsample_nonintegral(device):
     assert torch.equal(model_compiled(x), model(x))
 
 
+@pytest.mark.xfail(
+    reason=(
+        "LUM-1245: AOTAutograd traces nearest upsampling through torch's own "
+        "Python decomposition (registered on the Autograd dispatch key, ahead of "
+        "any decomposition table), which maps indices by floor(j / scale); the "
+        "ATen kernel's same-size fast path returns the input unchanged. Both "
+        "backends compile the decomposed form, so they match the decomposition, "
+        "not the kernel."
+    ),
+    strict=False,
+)
 def test_upsample_nearest_noninteger_scale_same_size(device):
     """scale=1.05, in=10 -> out=10: ATen's out==in kernel fast path ignores
     the scale — identity, NOT floor(j/1.05)."""
