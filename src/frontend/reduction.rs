@@ -108,7 +108,27 @@ impl GraphTensor {
 
     /// Reduce a dimension of the tensor by taking the minimum of all elements along that axis.
     pub fn min(self, axes: impl ToAxes) -> GraphTensor {
-        -(-self).max(axes)
+        self.order_reversed().max(axes).order_reversed()
+    }
+
+    /// An order-reversing involution, so min/argmin can reuse max/argmax.
+    /// Floats negate (NaN stays NaN). Integers take the bitwise complement
+    /// `-x - 1`: plain negation wraps on their asymmetric ranges (u8
+    /// `-0 == 0` sorts below `-1 == 255`; i8 `-(-128) == -128`), so it does
+    /// not reverse their order, while the complement never overflows.
+    pub(crate) fn order_reversed(self) -> GraphTensor {
+        match self.dtype {
+            DType::Int
+            | DType::I64
+            | DType::U64
+            | DType::I4
+            | DType::U4
+            | DType::I8
+            | DType::U8
+            | DType::I16
+            | DType::U16 => -self - IntExpr::from(1),
+            _ => -self,
+        }
     }
 
     /// Reduce a dimension of the tensor by taking the mean of all elements along that axis.
