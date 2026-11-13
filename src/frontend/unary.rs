@@ -314,7 +314,7 @@ impl GraphTensor {
 
     /// Get the indices of the min elements along an axis
     pub fn argmin(self, axis: usize) -> GraphTensor {
-        (-self).argmax(axis)
+        self.order_reversed().argmax(axis)
     }
 
     /// Compute the sample variance along axes
@@ -1027,6 +1027,27 @@ pub(super) mod tests {
         let rt = luminal_reference::harness::run_reference(&cx, &[(x.id, values.into())]);
         assert_exact(rt.get_f32(row.id).unwrap(), &expected);
         assert_exact(rt.get_f32(column.id).unwrap(), &expected);
+    }
+
+    #[test]
+    fn min_and_argmin_reverse_integer_order() {
+        // Negation wraps on integers: u8 -0 == 0 sorts below -3 == 253 and
+        // i8 -(-128) == -128, so -(-x).max() is not the minimum there.
+        use luminal_reference::typed_buffer::TypedBuffer;
+        for (dtype, values, min, argmin) in [
+            (DType::U8, TypedBuffer::U8(vec![3, 0, 5]), 0., 1.),
+            (DType::I8, vec![5_i8, -128, 0].into(), -128., 1.),
+            (DType::I16, vec![5_i16, i16::MIN, 0].into(), -32768., 1.),
+            (DType::U64, vec![3_u64, 0, 5].into(), 0., 1.),
+        ] {
+            let mut cx = Graph::new();
+            let x = cx.tensor(vec![3], dtype);
+            let m = x.min(vec![0]).cast(DType::F32);
+            let a = x.argmin(0).cast(DType::F32);
+            let rt = luminal_reference::harness::run_reference(&cx, &[(x.id, values)]);
+            assert_exact(rt.get_f32(m.id).unwrap(), &[min]);
+            assert_exact(rt.get_f32(a.id).unwrap(), &[argmin]);
+        }
     }
 
     #[test]
