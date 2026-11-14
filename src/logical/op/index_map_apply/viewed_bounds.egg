@@ -1,0 +1,68 @@
+; Viewed bounds (constructor.egg): the demanded bounds of a tensor over what
+; a view of it reads, as facts. The generic arms: a tensor's value bounds
+; bound every view of it (a view reads a subset); a view of a view is the
+; operand under the composite of the maps (the composed literal is the key;
+; only a map is minted for it, never a view of the tensor).
+(rule
+  (
+    (viewed-bounds-demand ?tensor ?map)
+    (= ?lower (value-lower-bound-of ?tensor))
+  )
+  ((set (viewed-lower-bound-of ?tensor ?map) ?lower))
+  :ruleset main_ruleset
+  :name "index_map_apply/viewed_bounds: a tensor's lower bound bounds every view of it"
+)
+(rule
+  (
+    (viewed-bounds-demand ?tensor ?map)
+    (= ?upper (value-upper-bound-of ?tensor))
+  )
+  ((set (viewed-upper-bound-of ?tensor ?map) ?upper))
+  :ruleset main_ruleset
+  :name "index_map_apply/viewed_bounds: a tensor's upper bound bounds every view of it"
+)
+; The demand is for the composite of the two literals; the bounds are read
+; under it once it exists.
+(rule
+  (
+    (viewed-bounds-demand ?view ?map)
+    (= ?map (IndexMapLit ?outer_entries ?outer_tag))
+    (= ?view (LogicalIndexMapApply ?operand ?inner_map ?inner_shape))
+    (= ?inner_map (IndexMapLit ?entries ?tag))
+  )
+  ((index-map-compose-demand ?inner_map ?map))
+  :ruleset main_ruleset
+  :name "index_map_apply/viewed_bounds: a view of a view demands the composite"
+)
+(rule
+  (
+    (viewed-bounds-demand ?view ?map)
+    (= ?view (LogicalIndexMapApply ?operand ?inner_map ?inner_shape))
+    (index-map-composed ?inner_map ?map ?composite)
+  )
+  ((viewed-bounds-demand ?operand ?composite))
+  :ruleset main_ruleset
+  :name "index_map_apply/viewed_bounds: a view of a view is the operand under the composite"
+)
+(rule
+  (
+    (viewed-bounds-demand ?view ?map)
+    (= ?view (LogicalIndexMapApply ?operand ?inner_map ?inner_shape))
+    (index-map-composed ?inner_map ?map ?composite)
+    (= ?lower (viewed-lower-bound-of ?operand ?composite))
+  )
+  ((set (viewed-lower-bound-of ?view ?map) ?lower))
+  :ruleset main_ruleset
+  :name "index_map_apply/viewed_bounds: lower bound of a view of a view"
+)
+(rule
+  (
+    (viewed-bounds-demand ?view ?map)
+    (= ?view (LogicalIndexMapApply ?operand ?inner_map ?inner_shape))
+    (index-map-composed ?inner_map ?map ?composite)
+    (= ?upper (viewed-upper-bound-of ?operand ?composite))
+  )
+  ((set (viewed-upper-bound-of ?view ?map) ?upper))
+  :ruleset main_ruleset
+  :name "index_map_apply/viewed_bounds: upper bound of a view of a view"
+)

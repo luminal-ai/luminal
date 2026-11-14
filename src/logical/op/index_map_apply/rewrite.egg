@@ -1,0 +1,128 @@
+; Rewrite : a view through the identity map is its operand. The map's tag
+; is the operand's shape, the view's shape is that same shape, and each
+; entry is the box's own coordinate for its axis (entries run highest axis
+; first, so the k-th entry from the end is axis k), or the literal 0 on an
+; axis of extent 1 (a squeeze undone by the expand that reads it back: the
+; extent-1 collapse zeroes a coordinate only where that coordinate exists
+; as a term). Such a view reads every element at its own coordinate: it is
+; the operand. Composed maps that cancel (a clamp the bounds collapse, a
+; pad undone by the slice that reads back the padded operand, a permute
+; undone by the permute back) end here. Shape and dtype of the two agree,
+; so no function merges.
+(rule
+  ((= ?view (LogicalIndexMapApply ?operand (IndexMapLit ?entries ?shape) ?shape)))
+  ((index-map-identity-suffix (IntExprNil) ?shape))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: the empty entry suffix is the identity on no axis"
+)
+(rule
+  (
+    (index-map-identity-suffix ?tail ?shape)
+    (= ?list (IntExprCons (CoordVar ?shape ?axis) ?tail))
+    (= ?axis (expr-list-length-of ?tail))
+  )
+  ((index-map-identity-suffix ?list ?shape))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: a suffix led by its own axis coordinate stays the identity"
+)
+(rule
+  (
+    (index-map-identity-suffix ?tail ?shape)
+    (= ?list (IntExprCons ?entry ?tail))
+    (= ?entry (IntLit 0))
+    (= ?axis (expr-list-length-of ?tail))
+    (= ?shape (ShapeLit ?dims))
+    (= ?extent (expr-list-nth-from-end ?dims ?axis))
+    (= ?lower (lower-bound-of ?extent))
+    (>= ?lower (bigint 1))
+    (= ?upper (upper-bound-of ?extent))
+    (<= ?upper (bigint 1))
+  )
+  ((index-map-identity-suffix ?list ?shape))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: a suffix led by the literal 0 on a unit axis stays the identity"
+)
+(rule
+  (
+    (= ?view (LogicalIndexMapApply ?operand (IndexMapLit ?entries ?shape) ?shape))
+    (index-map-identity-suffix ?entries ?shape)
+  )
+  ((union ?view ?operand))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: a view through the identity map is its operand"
+)
+
+; Rewrite : a view of a view is the view through the composite of its maps.
+; The outer map's tag is the inner view's shape (map-tag coherence), so the
+; composite reads the operand through the inner map, over the inner's tag.
+; Composition is not one step: the pair demands its composite, the walk
+; substitutes the inner's entries under the outer map one entry at a time,
+; and the view is unioned with the composed view once the whole literal
+; exists (so no layout rule ever reads an unresolved image).
+(rule
+  (
+    (= ?outer_view (LogicalIndexMapApply ?inner_view ?outer_map ?outer_shape))
+    (= ?outer_map (IndexMapLit ?outer_entries ?inner_shape))
+    (= ?inner_view (LogicalIndexMapApply ?operand ?inner_map ?inner_shape))
+    (= ?inner_map (IndexMapLit ?inner_entries ?operand_shape))
+  )
+  ((index-map-compose-demand ?inner_map ?outer_map))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: a view of a view demands the composite of its maps"
+)
+(rule
+  (
+    (= ?outer_view (LogicalIndexMapApply ?inner_view ?outer_map ?outer_shape))
+    (= ?inner_view (LogicalIndexMapApply ?operand ?inner_map ?inner_shape))
+    (index-map-composed ?inner_map ?outer_map ?composite)
+  )
+  ((union ?outer_view (LogicalIndexMapApply ?operand ?composite ?outer_shape)))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: a view of a view is the view through the composite of its maps"
+)
+
+; The composite of two literal maps: the inner's entries substituted under
+; the outer map, the composed list rebuilt by the walk below, as a literal
+; over the inner's tag.
+(rule
+  (
+    (index-map-compose-demand ?inner ?outer)
+    (= ?inner (IndexMapLit ?inner_entries ?inner_tag))
+    (= ?outer (IndexMapLit ?outer_entries ?outer_tag))
+  )
+  ((composed-entries-demand ?inner_entries ?outer))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: a demanded composite of literals demands its composed entries"
+)
+(rule
+  ((composed-entries-demand (IntExprNil) ?map))
+  ((composed-entries (IntExprNil) ?map (IntExprNil)))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: no entries compose to no entries"
+)
+(rule
+  ((composed-entries-demand (IntExprCons ?entry ?tail) ?map))
+  ((int-subst-demand ?entry ?map) (composed-entries-demand ?tail ?map))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: composing demands each entry's image and the tail's"
+)
+(rule
+  (
+    (composed-entries-demand (IntExprCons ?entry ?tail) ?map)
+    (= ?image (int-subst-of ?entry ?map))
+    (composed-entries ?tail ?map ?composed_tail)
+  )
+  ((composed-entries (IntExprCons ?entry ?tail) ?map (IntExprCons ?image ?composed_tail)))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: an entry's image leads the composed tail"
+)
+(rule
+  (
+    (index-map-compose-demand ?inner ?outer)
+    (= ?inner (IndexMapLit ?inner_entries ?inner_tag))
+    (composed-entries ?inner_entries ?outer ?composed)
+  )
+  ((index-map-composed ?inner ?outer (IndexMapLit ?composed ?inner_tag)))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: a composite whose composed entries are known is that literal"
+)

@@ -1,2 +1,35 @@
 ; All view ops
 (constructor LogicalIndexMapApply (LogicalTensor IndexMap Shape) LogicalTensor)
+
+; The relations of rewrite.egg, declared with the constructor so every op's
+; rewrites can name them whatever the splice order.
+; The identity-map fold.
+(relation index-map-identity-suffix (IntExprList Shape))
+; COMPOSITION. An index map is a lambda: the apply's out shape binds the
+; coordinates, the entries are the body, the tag is the parent shape it
+; reads. A view of a view reads its operand through the composite of the two
+; maps: first the outer (the view's coordinates into the intermediate box),
+; then the inner (the intermediate box into the parent). The composite is
+; computed, as a literal: the inner's entries substituted under the outer map
+; (`int-subst-of`, one row per entry), over the inner's tag.
+; `index-map-compose-demand inner outer` asks for it, the entry walk builds
+; it, and `index-map-composed inner outer composite` publishes it.
+(relation index-map-compose-demand (IndexMap IndexMap))
+(relation index-map-composed (IndexMap IndexMap IndexMap))
+(relation composed-entries-demand (IntExprList IndexMap))
+(relation composed-entries (IntExprList IndexMap IntExprList))
+; VIEWED BOUNDS: the value bounds of a tensor restricted to what a view of
+; it reads, keyed by the view's map, derived ON DEMAND (`viewed-bounds-demand`)
+; and only as facts: no view of the tensor is minted. A view of a select
+; demands its condition's viewed bounds; the demand descends the
+; condition's pointwise chain (comparison, cast, sum, a view) to its
+; sources (an iota: the bounds of its expression substituted under the map;
+; anything with value bounds: those, a view reads a subset); the comparison
+; is decided where its operands' viewed bounds separate; a select whose
+; condition is decided over the view is, through that view, the view of
+; the decided branch (select/rewrite.egg). This is how a slice of a
+; concatenation (a select on a mask over clamped padding views) reaches the
+; operand it reads, without distributing the view into the condition.
+(relation viewed-bounds-demand (LogicalTensor IndexMap))
+(function viewed-lower-bound-of (LogicalTensor IndexMap) BigInt :merge (max old new))
+(function viewed-upper-bound-of (LogicalTensor IndexMap) BigInt :merge (min old new))

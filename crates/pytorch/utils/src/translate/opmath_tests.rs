@@ -825,3 +825,28 @@ fn uint64_rounded_division_does_not_pass_through_float32() {
         LogicalOp::TruncCast(_) | LogicalOp::Recip
     )));
 }
+
+/// `torch.min(a, b)` and `torch.max(a, b)` export as `min.other` and
+/// `max.other`, the binary aliases of `minimum` and `maximum`: the same
+/// opmath classification and the same recorded graph (T5's relative
+/// position buckets spell `torch.min`).
+#[test]
+fn binary_min_and_max_overloads_record_as_minimum_and_maximum() {
+    for (alias, op) in [("min.other", "minimum.default"), ("max.other", "maximum.default")] {
+        assert_eq!(opmath_target(alias), opmath_target(op), "{alias}");
+        let render = |target: &str| {
+            let t = translate_one(
+                node(
+                    &format!("torch.ops.aten.{target}"),
+                    vec![tensor_input("self", "a"), tensor_input("other", "b")],
+                    &["out"],
+                ),
+                &[("a", BFLOAT16, &[4, 8]), ("b", BFLOAT16, &[4, 8]), ("out", BFLOAT16, &[4, 8])],
+                &["a", "b"],
+                &["out"],
+            );
+            t.graph.logical.render_all().unwrap()
+        };
+        assert_eq!(render(alias), render(op), "{alias}");
+    }
+}

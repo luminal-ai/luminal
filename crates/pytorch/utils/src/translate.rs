@@ -26,6 +26,8 @@ use rustc_hash::FxHashMap;
 mod add_sub_tests;
 #[cfg(test)]
 mod all_gather_tests;
+#[cfg(test)]
+mod all_reduce_tests;
 mod array_extra;
 mod attention;
 mod cat;
@@ -41,6 +43,10 @@ mod frexp;
 mod gcd_tests;
 #[cfg(test)]
 mod gelu_tests;
+#[cfg(test)]
+mod view_compose_tests;
+#[cfg(test)]
+mod cat_slice_tests;
 mod grouped_mm;
 mod index;
 #[cfg(test)]
@@ -1216,6 +1222,27 @@ impl Translator<'_> {
                 );
                 input.all_gather(group, width, sequence)
             }
+            // The elementwise sum over the group in the operand's own dtype,
+            // the order unspecified (c10d's all_reduce; a bf16 operand stays
+            // bf16 and is not widened: its rounding is the op's contract, see
+            // `LogicalOp::rounds_by_contract`).
+            "luminal_collective.all_reduce.default" => {
+                let input = self.operand(&n[0])?;
+                let crate::pt2_schema::Argument::Other(ref encoded) = n[1].arg else {
+                    bail!("AllReduce group must be a string")
+                };
+                let group = encoded
+                    .get("as_string")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("AllReduce group must be a string"))?;
+                let width = usize::try_from(self.get_int_arg(node, 2)?)?;
+                let sequence = usize::try_from(self.get_int_arg(node, 3)?)?;
+                ensure!(
+                    !group.is_empty() && width > 0,
+                    "AllReduce needs a named, nonempty group"
+                );
+                input.all_reduce(group, width, sequence)
+            }
             "_operator.add" => self.python_scalar_binary(node, |a, b| a + b)?,
             "_operator.sub" => self.python_scalar_binary(node, |a, b| a - b)?,
             "_operator.mul" => self.python_scalar_binary(node, |a, b| a * b)?,
@@ -1437,8 +1464,11 @@ impl Translator<'_> {
                 self.torch_mul(a, b)
             }
             "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
-            "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
-            "minimum.default" => self.binary(n, |a, b| a.minimum(b))?,
+            // `torch.max(a, b)` / `torch.min(a, b)` export as the binary `.other`
+            // overloads: aliases of `maximum` / `minimum` (NaN-propagating), so
+            // they record identically
+            "maximum.default" | "max.other" => self.binary(n, |a, b| a.maximum(b))?,
+            "minimum.default" | "min.other" => self.binary(n, |a, b| a.minimum(b))?,
             // ---- movement ----
             "t.default" => self.operand(&n[0])?.t(),
             "transpose.int" => {
@@ -2165,6 +2195,8 @@ fn opmath_target(target: &str) -> bool {
             | "floor_divide.default"
             | "maximum.default"
             | "minimum.default"
+            | "max.other"
+            | "min.other"
             | "fmax.default"
             | "fmin.default"
             | "pow.Tensor_Scalar"

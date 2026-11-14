@@ -1,11 +1,8 @@
-; Compose adjacent logical views before implementation selection.  The entry
-; walk is deliberately split into demand, per-entry substitution completion,
-; and the final logical union: each rule matches one small semantic marker,
-; while the existing guarded int-subst machinery remains the authority for
-; whether every coordinate substitution is valid.
-(relation index-map-entry-subst-demand (IntExprList IndexMap))
-(relation index-map-entry-subst-complete (IntExprList IndexMap))
-(relation index-map-entry-subst-result (IntExprList IndexMap IntExprList))
+; Boundary markers for logical views: which inputs sit on read-only buffers
+; and which logical values are bound outputs (and, of those, which alias a
+; read-only input buffer). Backends read these to scope boundary-only proofs.
+; Composition of adjacent views is not here: every view of a view composes
+; (rewrite.egg), bound output or not.
 (relation index-map-input-list (BufferTensorList))
 (relation index-map-read-only-input-buffer (BufferId))
 (relation index-map-bound-output-list (BufferTensorList))
@@ -72,82 +69,4 @@
   ((index-map-bound-read-only-alias-output ?logical))
   :ruleset main_ruleset
   :name "index_map_apply/compose: mark a bound read-only alias output"
-)
-
-(rule
-  ((index-map-entry-subst-demand (IntExprNil) ?map))
-  ((index-map-entry-subst-result (IntExprNil) ?map (IntExprNil))
-   (index-map-entry-subst-complete (IntExprNil) ?map))
-  :ruleset main_ruleset
-  :name "index_map_apply/compose: empty entry substitution is complete"
-)
-
-(rule
-  ((index-map-entry-subst-demand (IntExprCons ?head ?tail) ?map))
-  ((int-subst-demand ?head ?map)
-   (index-map-entry-subst-demand ?tail ?map))
-  :ruleset main_ruleset
-  :name "index_map_apply/compose: demand one entry and the remaining suffix"
-)
-
-(rule
-  (
-    (index-map-entry-subst-demand (IntExprCons ?head ?tail) ?map)
-    (int-subst-closed ?head ?map)
-    (index-map-entry-subst-complete ?tail ?map)
-    (index-map-entry-subst-result ?tail ?map ?tail-image)
-  )
-  (
-    (index-map-entry-subst-result
-      (IntExprCons ?head ?tail)
-      ?map
-      (IntExprCons (int-subst-of ?head ?map) ?tail-image))
-    (index-map-entry-subst-complete (IntExprCons ?head ?tail) ?map)
-  )
-  :ruleset main_ruleset
-  :name "index_map_apply/compose: complete one substituted entry"
-)
-
-; Seed only from an actually adjacent pair whose outer map states the inner
-; view's output shape as its source domain, and only when the result is a
-; bound output value.  Interior views already compose at the layout level;
-; publishing every logical prefix of every interior chain is quadratic and
-; needlessly expands saturation.  A malformed cross-domain pair therefore
-; never files substitution demands.
-(rule
-  (
-    (= ?inner (LogicalIndexMapApply ?root ?inner-map ?inner-shape))
-    (= ?outer (LogicalIndexMapApply ?inner ?outer-map ?out-shape))
-    (index-map-bound-output ?outer)
-    (= ?inner-map (IndexMapLit ?inner-entries ?root-shape))
-    (= ?outer-map (IndexMapLit ?outer-entries ?inner-shape))
-    (= ?root-shape (shape-of ?root))
-    (= ?inner-shape (shape-of ?inner))
-    (= ?out-shape (shape-of ?outer))
-  )
-  ((index-map-entry-subst-demand ?inner-entries ?outer-map))
-  :ruleset main_ruleset
-  :name "index_map_apply/compose: adjacent views demand entry composition"
-)
-
-(rule
-  (
-    (= ?inner (LogicalIndexMapApply ?root ?inner-map ?inner-shape))
-    (= ?outer (LogicalIndexMapApply ?inner ?outer-map ?out-shape))
-    (= ?inner-map (IndexMapLit ?inner-entries ?root-shape))
-    (= ?outer-map (IndexMapLit ?outer-entries ?inner-shape))
-    (= ?root-shape (shape-of ?root))
-    (= ?inner-shape (shape-of ?inner))
-    (= ?out-shape (shape-of ?outer))
-    (index-map-entry-subst-complete ?inner-entries ?outer-map)
-    (index-map-entry-subst-result ?inner-entries ?outer-map ?composed-entries)
-  )
-  ((union
-     ?outer
-     (LogicalIndexMapApply
-       ?root
-       (IndexMapLit ?composed-entries ?root-shape)
-       ?out-shape)))
-  :ruleset main_ruleset
-  :name "index_map_apply/compose: adjacent views equal one composed view"
 )

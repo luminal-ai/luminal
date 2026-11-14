@@ -1,0 +1,68 @@
+; Rewrite : a view of a select whose condition is decided over the view is
+; the view of the decided branch. The condition's VIEWED bounds (its value
+; bounds restricted to what the view reads, index_map_apply/constructor.egg)
+; are demanded for the view's map and derived as facts down the condition's
+; chain; a lower bound of 1 is true everywhere the view reads, an upper
+; bound of 0 false everywhere. Nothing is minted for an undecided
+; condition. The view of the branch is a view of a view where the branch is
+; one (`cat` and `pad` spell their operands as clamped padding views), so it
+; composes (index_map_apply/rewrite.egg): a slice reading one operand of a
+; concatenation whole composes to the identity and the fold ends it.
+(rule
+  (
+    (= ?view (LogicalIndexMapApply ?select ?map ?shape))
+    (= ?select (LogicalSelect ?condition ?if_true ?if_false))
+  )
+  ((viewed-bounds-demand ?condition ?map))
+  :ruleset main_ruleset
+  :name "select/rewrite: a view of a select demands its condition's viewed bounds"
+)
+(rule
+  (
+    (= ?view (LogicalIndexMapApply ?select ?map ?shape))
+    (= ?select (LogicalSelect ?condition ?if_true ?if_false))
+    (= ?lower (viewed-lower-bound-of ?condition ?map))
+    (>= ?lower (bigint 1))
+  )
+  ((union ?view (LogicalIndexMapApply ?if_true ?map ?shape)))
+  :ruleset main_ruleset
+  :name "select/rewrite: a view of a select true everywhere it reads is the view of the first branch"
+)
+(rule
+  (
+    (= ?view (LogicalIndexMapApply ?select ?map ?shape))
+    (= ?select (LogicalSelect ?condition ?if_true ?if_false))
+    (= ?upper (viewed-upper-bound-of ?condition ?map))
+    (<= ?upper (bigint 0))
+  )
+  ((union ?view (LogicalIndexMapApply ?if_false ?map ?shape)))
+  :ruleset main_ruleset
+  :name "select/rewrite: a view of a select false everywhere it reads is the view of the second branch"
+)
+
+
+; Rewrite : a select whose condition is decided everywhere is that branch.
+; A Bool tensor's value bounds are its truth bounds (less_than/value_bounds
+; .egg): a lower bound of 1 is true everywhere, an upper bound of 0 false
+; everywhere. Shape and dtype of the select and the branch agree, so no
+; function merges.
+(rule
+  (
+    (= ?select (LogicalSelect ?condition ?if_true ?if_false))
+    (= ?lower (value-lower-bound-of ?condition))
+    (>= ?lower (bigint 1))
+  )
+  ((union ?select ?if_true))
+  :ruleset main_ruleset
+  :name "select/rewrite: a select on a condition true everywhere is its first branch"
+)
+(rule
+  (
+    (= ?select (LogicalSelect ?condition ?if_true ?if_false))
+    (= ?upper (value-upper-bound-of ?condition))
+    (<= ?upper (bigint 0))
+  )
+  ((union ?select ?if_false))
+  :ruleset main_ruleset
+  :name "select/rewrite: a select on a condition false everywhere is its second branch"
+)

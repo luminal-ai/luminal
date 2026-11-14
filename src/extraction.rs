@@ -440,13 +440,15 @@ impl<'a> ExtractionSession<'a> {
                 None => format!("{} ({class})", class_label(class)),
             })
             .collect();
+        let chains = extractor.dead_end_chains();
         let summary = format!(
-            "{} unplanned classes; choice-cycles: {} {:?}; dead-ends: {} {:?}",
+            "{} unplanned classes; choice-cycles: {} {:?}; dead-ends: {} {:?}; why: {:?}",
             extractor.blocked.len() + extractor.no_candidates.len(),
             cycles.len(),
             cycles.iter().take(3).collect::<Vec<_>>(),
             dead_ends.len(),
-            dead_ends.iter().take(5).collect::<Vec<_>>()
+            dead_ends.iter().take(5).collect::<Vec<_>>(),
+            chains.iter().take(3).collect::<Vec<_>>()
         );
         (!cycles.is_empty(), !dead_ends.is_empty(), summary)
     }
@@ -1155,6 +1157,268 @@ impl<'a> Extractor<'a> {
     /// extraction needs this (the plain derivation walk backtracks past dead
     /// candidates on its own), and the fixpoint is too expensive to pay
     /// on every plain extraction.
+    /// Why each dead end has no candidate. The viability filter prunes every
+    /// producer one of whose inputs no live producer can make, so a dead end
+    /// is often only where the walk from the outputs stopped: the cause is
+    /// upstream, a class whose every producer was retired (subsumed) or is not
+    /// registered. For each dead end, the chain of producers that lost
+    /// viability, each naming the input it waits on, down to that class and
+    /// its producers' ops and states. The viability fixpoint is recomputed
+    /// here (the filter keeps no record of it).
+    fn dead_end_chains(&self) -> Vec<String> {
+        let matched = |op_class: &ClassId| {
+            self.class_nodes.get(op_class).into_iter().flatten().any(|node_id| {
+                self.egraph.nodes.get(node_id).is_some_and(|node| !node.subsumed && self.matchers.contains_key(node.op.as_str()))
+            })
+        };
+        let mut viable: HashSet<ClassId> = self.input_terminals.keys().cloned().collect();
+        loop {
+            let mut changed = false;
+            for (op_class, specs) in &self.op_specs {
+                if !matched(op_class) {
+                    continue;
+                }
+                for spec in specs {
+                    if spec.inputs.iter().all(|class| viable.contains(class)) {
+                        for output in &spec.outputs {
+                            changed |= viable.insert(output.clone());
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let op_of = |op_class: &ClassId| -> String {
+            let ops: Vec<String> = self
+                .class_nodes
+                .get(op_class)
+                .into_iter()
+                .flatten()
+                .filter_map(|node_id| self.egraph.nodes.get(node_id))
+                .filter(|node| node.op != "LayoutTensorOpLit")
+                .map(|node| {
+                    let state = if node.subsumed {
+                        "retired"
+                    } else if self.matchers.contains_key(node.op.as_str()) {
+                        "live"
+                    } else {
+                        "unregistered"
+                    };
+                    format!("{} [{state}]", node.op.trim_start_matches("LayoutTensorOp"))
+                })
+                .collect();
+            if ops.is_empty() { format!("{op_class}") } else { ops.join(" | ") }
+        };
+        let producers_of = |class: &ClassId| -> Vec<(&ClassId, &OpSpec)> {
+            self.op_specs
+                .iter()
+                .flat_map(|(op_class, specs)| specs.iter().map(move |spec| (op_class, spec)))
+                .filter(|(_, spec)| spec.outputs.contains(class))
+                .collect()
+        };
+        // every producer of a class with its state or the input it waits on,
+        // following each waiting input a few levels (the first class reached
+        // twice is not expanded again)
+        fn explain(
+            class: &ClassId,
+            depth: usize,
+            seen: &mut HashSet<ClassId>,
+            producers_of: &dyn Fn(&ClassId) -> Vec<(ClassId, Option<ClassId>)>,
+            op_of: &dyn Fn(&ClassId) -> String,
+            out: &mut Vec<String>,
+        ) {
+            if !seen.insert(class.clone()) || depth > 4 {
+                return;
+            }
+            let producers = producers_of(class);
+            if producers.is_empty() {
+                out.push(format!("{class}: no producer"));
+                return;
+            }
+            for (op_class, waiting) in producers.iter().take(4) {
+                match waiting {
+                    Some(input) => out.push(format!("{class} <- {} waits on {input}", op_of(op_class))),
+                    None => out.push(format!("{class} <- {}", op_of(op_class))),
+                }
+            }
+            for (_, waiting) in producers.iter().take(4) {
+                if let Some(input) = waiting {
+                    explain(input, depth + 1, seen, producers_of, op_of, out);
+                }
+            }
+        }
+        let waits = |class: &ClassId| -> Vec<(ClassId, Option<ClassId>)> {
+            producers_of(class)
+                .into_iter()
+                .map(|(op_class, spec)| {
+                    let waiting = matched(op_class)
+                        .then(|| spec.inputs.iter().find(|input| !viable.contains(*input)).cloned())
+                        .flatten();
+                    (op_class.clone(), waiting)
+                })
+                .collect()
+        };
+        // Where the starvation starts. The dead class's cone: every unviable
+        // input of every matched producer, followed transitively. Its roots
+        // are the unviable classes no matched producer makes (every producer
+        // retired or unregistered, or none at all). A root is SUFFICIENT when
+        // making it alone viable makes the dead class viable: that is the
+        // class whose loss starved it (often one of many roots: the rest are
+        // alternatives a fusion retired on purpose).
+        let specs: Vec<&OpSpec> = self
+            .op_specs
+            .iter()
+            .filter(|(op_class, _)| matched(op_class))
+            .flat_map(|(_, specs)| specs.iter())
+            .collect();
+        let mut consumers: HashMap<&ClassId, Vec<usize>> = HashMap::default();
+        let mut missing: Vec<usize> = Vec::with_capacity(specs.len());
+        for (i, spec) in specs.iter().enumerate() {
+            let mut inputs: Vec<&ClassId> = spec.inputs.iter().collect();
+            inputs.sort();
+            inputs.dedup();
+            missing.push(inputs.iter().filter(|class| !viable.contains(**class)).count());
+            for class in inputs {
+                consumers.entry(class).or_default().push(i);
+            }
+        }
+        // the classes viable once `root` is: a worklist over the counts
+        let unblocked = |root: &ClassId, dead: &ClassId| -> bool {
+            let mut missing = missing.clone();
+            let mut reached: HashSet<&ClassId> = HashSet::default();
+            let mut work: Vec<&ClassId> = vec![root];
+            reached.insert(root);
+            while let Some(class) = work.pop() {
+                if class == dead {
+                    return true;
+                }
+                for &i in consumers.get(class).map(Vec::as_slice).unwrap_or(&[]) {
+                    missing[i] -= 1;
+                    if missing[i] == 0 {
+                        for output in &specs[i].outputs {
+                            if !viable.contains(output) && reached.insert(output) {
+                                work.push(output);
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        };
+        let mut chains = Vec::new();
+        for dead in &self.no_candidates {
+            let mut steps = Vec::new();
+            explain(dead, 0, &mut HashSet::default(), &waits, &op_of, &mut steps);
+            let mut parent: HashMap<ClassId, (ClassId, ClassId)> = HashMap::default();
+            let mut cone: Vec<ClassId> = vec![dead.clone()];
+            let mut visited: HashSet<ClassId> = std::iter::once(dead.clone()).collect();
+            let mut roots: Vec<ClassId> = Vec::new();
+            let mut head = 0;
+            while head < cone.len() && cone.len() < 200_000 {
+                let class = cone[head].clone();
+                head += 1;
+                let producers = producers_of(&class);
+                let live: Vec<_> = producers.iter().filter(|(op_class, _)| matched(op_class)).collect();
+                if live.is_empty() {
+                    roots.push(class);
+                    continue;
+                }
+                for (op_class, spec) in live {
+                    for input in &spec.inputs {
+                        if !viable.contains(input) && visited.insert(input.clone()) {
+                            parent.insert(input.clone(), (class.clone(), (*op_class).clone()));
+                            cone.push(input.clone());
+                        }
+                    }
+                }
+            }
+            // `LUMINAL_DEAD_END_DUMP=path`: the whole cone, every producer of
+            // every class with all the inputs it waits on, for offline reading
+            if let Some(path) = std::env::var_os("LUMINAL_DEAD_END_DUMP") {
+                let mut text = String::new();
+                for class in &cone {
+                    let producers = producers_of(class);
+                    if producers.is_empty() {
+                        // what the tensor is: its literal's value and layout classes,
+                        // and the logical ops in the value class
+                        let mut described = Vec::new();
+                        for node_id in self.class_nodes.get(class).into_iter().flatten() {
+                            let Some(node) = self.egraph.nodes.get(node_id) else { continue };
+                            if node.op != "LayoutTensorLit" || node.children.len() < 2 {
+                                continue;
+                            }
+                            let child = |i: usize| self.egraph.nodes.get(&node.children[i]).map(|n| n.eclass.clone());
+                            if let (Some(value), Some(layout)) = (child(0), child(1)) {
+                                let ops: Vec<String> = self
+                                    .class_nodes
+                                    .get(&value)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|id| self.egraph.nodes.get(id))
+                                    .map(|n| format!("{}{}", n.op, if n.subsumed { "[retired]" } else { "" }))
+                                    .collect();
+                                described.push(format!("value={value} layout={layout} value_ops={}", ops.join("|")));
+                            }
+                        }
+                        text.push_str(&format!("{class} NONE {}\n", described.join(" ")));
+                    }
+                    for (op_class, spec) in producers {
+                        let waiting: Vec<String> =
+                            spec.inputs.iter().filter(|input| !viable.contains(*input)).map(|c| c.to_string()).collect();
+                        let inputs: Vec<String> = spec.inputs.iter().map(|c| c.to_string()).collect();
+                        text.push_str(&format!(
+                            "{class} {op_class} {} live={} inputs={} waits={}\n",
+                            op_of(op_class).replace(' ', "_"),
+                            matched(op_class),
+                            inputs.join(","),
+                            waiting.join(",")
+                        ));
+                    }
+                }
+                let _ = std::fs::write(&path, text);
+            }
+            // a root some producer of which was retired is one the cleanup
+            // made (a policy starved it); one nothing ever produced is an
+            // alternative that never was viable, and says nothing
+            let retired_root = |class: &ClassId| {
+                producers_of(class).iter().any(|(op_class, _)| {
+                    self.class_nodes.get(*op_class).into_iter().flatten().any(|node_id| {
+                        self.egraph.nodes.get(node_id).is_some_and(|node| node.subsumed && node.op != "LayoutTensorOpLit")
+                    })
+                })
+            };
+            let made: Vec<&ClassId> = roots.iter().filter(|root| retired_root(root)).collect();
+            let sufficient: Vec<&ClassId> = made.iter().copied().take(256).filter(|root| unblocked(root, dead)).take(4).collect();
+            steps.push(format!(
+                "cone of {} classes, {} roots ({} of them retired by a cleanup), {} of the first {} retired roots sufficient alone",
+                cone.len(),
+                roots.len(),
+                made.len(),
+                sufficient.len(),
+                made.len().min(256)
+            ));
+            for root in sufficient {
+                let producers: Vec<String> = producers_of(root).iter().map(|(op_class, _)| op_of(op_class)).collect();
+                let mut path = Vec::new();
+                let mut class = root.clone();
+                while let Some((consumer, op_class)) = parent.get(&class) {
+                    path.push(format!("{class} -> {} = {consumer}", op_of(op_class)));
+                    class = consumer.clone();
+                }
+                let depth = path.len();
+                let near: Vec<String> = path.into_iter().take(6).collect();
+                steps.push(format!(
+                    "SUFFICIENT ROOT {root} (producers {producers:?}), {depth} classes below the dead end, read as: {}",
+                    near.join(" / ")
+                ));
+            }
+            chains.push(steps.join("; "));
+        }
+        chains
+    }
+
     fn apply_viability_filter(&mut self) {
         // The candidate memo is keyed on the choice and reads the
         // producer index; this is the one place that edits it.

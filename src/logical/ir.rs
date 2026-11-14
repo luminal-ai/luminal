@@ -127,6 +127,14 @@ pub enum LogicalOp {
         width: usize,
         sequence: usize,
     },
+    /// Ordered-group all-reduce: the elementwise sum over the members of the
+    /// group, in the operand's dtype, the order of the additions unspecified
+    /// (c10d's contract). Same descriptor and effect identity as `AllGather`.
+    AllReduce {
+        group: String,
+        width: usize,
+        sequence: usize,
+    },
     Cast(DType),
     TruncCast(DType),
     /// The explicit rounding integer -> float conversion (nearest, ties to
@@ -223,6 +231,7 @@ impl LogicalOp {
             Self::ConstantF64(_) => "LogicalConstantF64",
             Self::Iota { .. } => "LogicalIota",
             Self::AllGather { .. } => "LogicalAllGather",
+            Self::AllReduce { .. } => "LogicalAllReduce",
             Self::Cast(_) => "LogicalCast",
             Self::TruncCast(_) => "LogicalTruncCast",
             Self::RoundingCast(_) => "LogicalRoundingCast",
@@ -282,6 +291,15 @@ impl LogicalOp {
     /// or scan, or a truncating float-to-integer conversion. The other
     /// ops move, select, compare, convert or create values and compute
     /// nothing a narrower format could round differently.
+    /// Whether this arithmetic op's rounding in a narrow float is fixed by
+    /// its own contract rather than left to a backend: an all-reduce sums in
+    /// its operand's dtype by definition (c10d's), so a bf16 operand is not
+    /// narrow-float arithmetic to refuse, whereas a bf16 `Add` would leave
+    /// the rounding unspecified and must be spelled widened.
+    pub fn rounds_by_contract(&self) -> bool {
+        matches!(self, Self::AllReduce { .. })
+    }
+
     pub fn is_arithmetic(&self) -> bool {
         match self {
             Self::Sqrt
@@ -313,7 +331,8 @@ impl LogicalOp {
             | Self::UnspecifiedOrderScanSum { .. }
             | Self::UnspecifiedOrderScanProd { .. }
             | Self::WrappingScanSum { .. }
-            | Self::WrappingScanProd { .. } => true,
+            | Self::WrappingScanProd { .. }
+            | Self::AllReduce { .. } => true,
             Self::Input { .. }
             | Self::Constant(_)
             | Self::ConstantF64(_)
@@ -339,6 +358,7 @@ impl LogicalOp {
         Some(match self {
             Self::Input { .. } | Self::Constant(_) | Self::ConstantF64(_) | Self::Iota { .. } => 0,
             Self::AllGather { .. }
+            | Self::AllReduce { .. }
             | Self::Cast(_)
             | Self::TruncCast(_)
             | Self::RoundingCast(_)
@@ -742,6 +762,28 @@ impl LogicalGraph {
                 .collect();
             if expected != out_dims || source.dtype != out_dtype {
                 self.refuse("AllGather must prepend group size and preserve dtype");
+            }
+        }
+        if let LogicalOp::AllReduce {
+            group,
+            width,
+            sequence,
+        } = &op
+        {
+            if group.is_empty()
+                || *width == 0
+                || i64::try_from(*width).is_err()
+                || i64::try_from(*sequence).is_err()
+            {
+                self.refuse("AllReduce requires a named, nonempty group and an i64 sequence");
+            }
+            if self.graph.node_weights().any(|node| matches!(&node.op,
+                LogicalOp::AllReduce { group: old, sequence: seq, .. } if old == group && seq == sequence)) {
+                self.refuse("AllReduce sequence must be unique within its group");
+            }
+            let source = &self.graph[ids[0]];
+            if source.dims != out_dims || source.dtype != out_dtype {
+                self.refuse("AllReduce must preserve shape and dtype");
             }
         }
         self.push(op, &ids, out_dims, out_dtype)
@@ -1312,6 +1354,11 @@ impl LogicalGraph {
                         group,
                         width,
                         sequence,
+                    }
+                    | LogicalOp::AllReduce {
+                        group,
+                        width,
+                        sequence,
                     } => {
                         parts.push(serde_json::to_string(group).expect("group string"));
                         parts.push(width.to_string());
@@ -1498,7 +1545,7 @@ impl LogicalGraph {
             if matches!(node.op, LogicalOp::RoundDecimals(_)) {
                 continue;
             }
-            if !node.op.is_arithmetic() {
+            if !node.op.is_arithmetic() || node.op.rounds_by_contract() {
                 continue;
             }
             let narrow = std::iter::once(node.dtype)
@@ -1706,6 +1753,32 @@ mod logical_petgraph_tests {
         let all = cx.logical.render_all().expect("renders");
         assert!(all.contains("LogicalMul"));
         assert_eq!(cx.logical.let_name(x.id), "v0");
+    }
+
+    /// A bf16 all-reduce keeps its operand's shape and dtype, renders its
+    /// descriptor for egglog, and is not narrow-float arithmetic to refuse:
+    /// its bf16 rounding is its contract. A bf16 add next to it still is.
+    #[test]
+    fn a_bf16_all_reduce_renders_and_is_not_refused_as_narrow_arithmetic() {
+        use crate::egglog_snippet::{assembled_program_for, new_egraph};
+        let mut cx = Graph::new();
+        let x = cx.named_tensor("x", vec![4usize, 3], DType::Bf16);
+        let group = r#"{"groups":[[0,1]],"world":2}"#;
+        let a = x.all_reduce(group, 2, 0);
+        let b = x.all_reduce(group, 2, 1);
+        assert_ne!(a.id, b.id);
+        assert_eq!((a.dims(), a.dtype), (x.dims(), DType::Bf16));
+        let text = cx.logical.render(&[a.id, b.id]).expect("renders");
+        assert!(
+            text.contains(r#"(LogicalAllReduce v0 "{\"groups\":[[0,1]],\"world\":2}" 2 0)"#),
+            "{text}"
+        );
+        new_egraph()
+            .parse_and_run_program(None, &format!("{}\n{text}", assembled_program_for(&[])))
+            .expect("egglog reads the rendered all-reduce");
+        let sum = a + b;
+        let narrow = cx.logical.narrow_float_arithmetic([a.id, b.id, sum.id]);
+        assert_eq!(narrow, vec![(sum.id, DType::Bf16)]);
     }
 
     /// A duplicated name would silently union two distinct values, so it

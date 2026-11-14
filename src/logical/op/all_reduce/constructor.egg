@@ -1,0 +1,10 @@
+; Logical AllReduce: every member of an ordered communication group
+; contributes `x`; every member receives the elementwise sum of the members'
+; tensors, of `x`'s shape and dtype. The sum is computed in that dtype and
+; the order of its additions is unspecified (c10d's all_reduce contract: a
+; bf16 operand sums in bf16, rounding at each step of whatever algorithm the
+; collective runs). `group` is the communicator descriptor (JSON over
+; logical ranks: {"world": W, "groups": [[..], ..]}); `width` is the group's
+; size; `sequence` is the effect identity: distinct sequences are distinct
+; communications and never union, even over equal operands.
+(constructor LogicalAllReduce (LogicalTensor String i64 i64) LogicalTensor)
