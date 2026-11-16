@@ -452,3 +452,26 @@ fn row_slices_sink_through_reductions_over_earlier_axes_and_permutes() {
     let summed_exp = a.exp().sum(vec![0]).permute(vec![1, 0]);
     holds(&cx, &[same(&cx, summed.slice_along(..A, 0), summed_exp)]);
 }
+
+/// select/concat_views.egg: a row-indexed table read by a concatenation's
+/// stream is the table of that stream's rows, through the table's own views
+/// and a conversion between them (a rotary table repeated per pair, widened,
+/// broadcast over the heads).
+#[test]
+fn a_rotary_table_read_by_a_stream_is_the_table_of_its_rows() {
+    let mut cx = Graph::new();
+    let a = cx.named_tensor("a", vec![1, A, H, D], DType::F32);
+    let b = cx.named_tensor("b", vec![1, B, H, D], DType::F32);
+    let t = cx.named_tensor("t", vec![S, D / 2], DType::Bf16);
+    let table = |t: GraphTensor| {
+        t.expand_dim(2, 2)
+            .merge_dims(1, 2)
+            .cast(DType::F32)
+            .expand_dim(1, H)
+            .expand_dim(0, 1)
+    };
+    let x = a.concat_along(b, 1);
+    let product = x * table(t);
+    let expected = (a * table(t.slice_along(..A, 0))).concat_along(b * table(t.slice_along(A.., 0)), 1);
+    holds(&cx, &[same(&cx, product, expected)]);
+}

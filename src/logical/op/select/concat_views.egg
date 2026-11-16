@@ -1,0 +1,96 @@
+
+; Rewrite : a row slice of a view that reads the sliced axis at one of its own
+; coordinates of the same extent (and no other entry at it) is the view,
+; rebased, of its operand's row slice. A table the concatenation rules read
+; through a row slice (a rotary embedding's table repeated to the head width
+; and broadcast over the heads, read by each stream's rows) is then the same
+; chain of views over the table's own rows, as the stream would read a table
+; of its own. Same values: each element is the same element of the operand.
+(relation view-row-slice (LogicalTensor LogicalTensor IntExprList Shape i64 i64))
+(rule
+  (
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?s (LogicalIndexMapApply ?t ?map ?sliced))
+    (= ?t (LogicalIndexMapApply ?u ?t_map ?shape))
+    (= ?t_map (IndexMapLit ?entries ?u_shape))
+    (= ?entry (expr-list-nth-from-end ?entries ?u_axis))
+    (= ?entry (CoordVar ?shape ?axis))
+    (= ?shape (ShapeLit ?dims))
+    (= ?u_shape (ShapeLit ?u_dims))
+    (= ?n (expr-list-nth-from-end ?dims ?axis))
+    (= ?n (expr-list-nth-from-end ?u_dims ?u_axis))
+  )
+  (
+    (row-free-demand ?entries ?u_axis ?axis)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_views: a row slice of a view reading the axis at its own coordinate asks the other entries to be free of it"
+)
+(rule
+  (
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?s (LogicalIndexMapApply ?t ?map ?sliced))
+    (= ?t (LogicalIndexMapApply ?u ?t_map ?shape))
+    (= ?t_map (IndexMapLit ?entries ?u_shape))
+    (= ?entry (expr-list-nth-from-end ?entries ?u_axis))
+    (= ?entry (CoordVar ?shape ?axis))
+    (= ?shape (ShapeLit ?dims))
+    (= ?u_shape (ShapeLit ?u_dims))
+    (= ?n (expr-list-nth-from-end ?dims ?axis))
+    (= ?n (expr-list-nth-from-end ?u_dims ?u_axis))
+    (row-free ?entries ?u_axis ?axis)
+  )
+  (
+    (view-row-slice ?s ?u ?entries ?u_shape ?u_axis ?axis)
+    (row-slice-demand ?u_shape ?u_axis ?offset ?extent)
+    (row-slice-demand ?shape ?axis 0 ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_views: a row slice of a row-reading view demands the operand's slice and the rebasing"
+)
+(rule
+  (
+    (view-row-slice ?s ?u ?entries ?u_shape ?u_axis ?axis)
+    (= ?s (LogicalIndexMapApply ?t ?map ?sliced))
+    (= ?t (LogicalIndexMapApply ?u ?t_map ?shape))
+    (row-slice ?shape ?axis 0 ?extent ?rebase ?sliced)
+  )
+  (
+    (composed-entries-demand ?entries ?rebase)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_views: a row slice of a row-reading view demands the rebased entries"
+)
+(rule
+  (
+    (view-row-slice ?s ?u ?entries ?u_shape ?u_axis ?axis)
+    (= ?s (LogicalIndexMapApply ?t ?map ?sliced))
+    (= ?t (LogicalIndexMapApply ?u ?t_map ?shape))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (row-slice ?shape ?axis 0 ?extent ?rebase ?sliced)
+    (composed-entries ?entries ?rebase ?rebased)
+    (row-slice ?u_shape ?u_axis ?offset ?extent ?u_map ?u_sliced)
+  )
+  (
+    (union ?s
+      (LogicalIndexMapApply
+        (LogicalIndexMapApply ?u ?u_map ?u_sliced)
+        (IndexMapLit ?rebased ?u_sliced)
+        ?sliced))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_views: a row slice of a row-reading view is the rebased view of the operand's slice"
+)
+; ... and a row slice of a conversion is the conversion of the slice (a table
+; widened to the opmath type between its views).
+(rule
+  (
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?s (LogicalIndexMapApply ?t ?map ?sliced))
+    (= ?t (LogicalCast ?u ?dtype))
+    (= ?shape (shape-of ?u))
+  )
+  ((union ?s (LogicalCast (LogicalIndexMapApply ?u ?map ?sliced) ?dtype)))
+  :ruleset main_ruleset
+  :name "select/concat_views: a row slice of a conversion is the conversion of the operand's slice"
+)

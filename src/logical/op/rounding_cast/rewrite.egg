@@ -1,0 +1,28 @@
+; Rewrite : a rounding conversion of an integer literal that the target float
+; represents exactly is the lossless conversion. Rounding to nearest, ties to
+; even, of an integer of magnitude at most 2^24 into F32 (2^53 into F64) is that
+; integer, so the explicit rounding cast and LogicalCast agree on every
+; element. A mean's count divisor (frontend/reduction.rs::mean:
+; `rounding_cast(iota(n))`) is such a literal.
+(rule
+  (
+    (= ?y (LogicalRoundingCast ?x (F32)))
+    (= ?x (LogicalIota (IntLit ?n) ?shape))
+    (<= ?n 16777216)
+    (>= ?n -16777216)
+  )
+  ((union ?y (LogicalCast ?x (F32))))
+  :ruleset main_ruleset
+  :name "rounding_cast/rewrite: an integer literal F32 represents exactly converts losslessly"
+)
+(rule
+  (
+    (= ?y (LogicalRoundingCast ?x (F64)))
+    (= ?x (LogicalIota (IntLit ?n) ?shape))
+    (<= ?n 9007199254740992)
+    (>= ?n -9007199254740992)
+  )
+  ((union ?y (LogicalCast ?x (F64))))
+  :ruleset main_ruleset
+  :name "rounding_cast/rewrite: an integer literal F64 represents exactly converts losslessly"
+)

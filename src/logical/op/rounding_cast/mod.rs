@@ -48,6 +48,39 @@ impl LogicalOp for LogicalRoundingCast {
                 category: SpliceCategory::Forward,
                 text: include_str!("forward_layout.egg"),
             },
+            EgglogSnippet {
+                category: SpliceCategory::Rewrites,
+                text: include_str!("rewrite.egg"),
+            },
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::egglog_snippet::{assembled_program_for, new_egraph};
+
+    /// A mean's count divisor: the rounding conversion of a literal F32 (or F64) represents
+    /// exactly is the lossless cast; past 2^24 the F32 rounding stays its own op.
+    #[test]
+    fn an_exact_integer_literal_rounds_to_its_lossless_cast() {
+        let mut graph = new_egraph();
+        graph.parse_and_run_program(None, &assembled_program_for(&[])).unwrap();
+        graph
+            .parse_and_run_program(
+                None,
+                r#"
+(let count (LogicalIota (IntLit 128) (ShapeLit (IntExprNil))))
+(let big (LogicalIota (IntLit 16777217) (ShapeLit (IntExprNil))))
+(let r32 (LogicalRoundingCast count (F32)))
+(let r64 (LogicalRoundingCast big (F64)))
+(let rbig (LogicalRoundingCast big (F32)))
+(run-schedule (saturate (run main_ruleset) (run prop)))
+(check (= r32 (LogicalCast count (F32))))
+(check (= r64 (LogicalCast big (F64))))
+(fail (check (= rbig (LogicalCast big (F32)))))
+"#,
+            )
+            .unwrap();
     }
 }
