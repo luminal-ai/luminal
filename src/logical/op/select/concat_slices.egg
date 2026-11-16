@@ -1,0 +1,270 @@
+; CONCATENATIONS AND THEIR ROW SLICES. Core spells `cat(a, b)` along an
+; axis as a select on a mask iota over two clamped padding views,
+; `Select(c, View(a, ma, S), View(b, mb, S))` (frontend/movement.rs::
+; concat_along): c is the truth test of `IntCastFromBool(coord_k < A)`, ma
+; clamps the axis to A - 1, mb shifts it by -A and clamps at 0. The rules
+; here work on that spelling; there is no concatenation node.
+;
+; Axes are FROM-END indices throughout, as CoordVar and the reductions
+; count them. A row slice of a shape S is the view reading `ext` rows from
+; `off` along axis k, spelled as the frontend's slice spells it: each entry
+; the slice's own coordinate, axis k's plus the literal offset when it is
+; not 0, over S. Both slices of a concatenation, `[0, A)` and `[A, n)`, are
+; row slices, so a split the model already holds and a slice minted here
+; are one term.
+(relation row-slice-demand (Shape i64 i64 i64))
+(relation row-slice (Shape i64 i64 i64 IndexMap Shape))
+(relation row-slice-dims-demand (IntExprList i64 i64))
+(relation row-slice-dims (IntExprList i64 i64 IntExprList))
+(relation row-slice-entries-demand (IntExprList Shape i64 i64))
+(relation row-slice-entries (IntExprList Shape i64 i64 IntExprList))
+; A select on a one-sided mask iota, its spelling not yet checked.
+(relation concat-candidate (LogicalTensor i64 i64))
+; A CERTIFIED concatenation `X = Select(c, View(a, ma, S), View(b, mb, S))`
+; = cat(a, b) along k at A (the certificate below). It is a fact about c,
+; ma and mb alone, so the same select over ANY parts of a's and b's shapes
+; is their concatenation.
+(relation concat-template (LogicalTensor i64 i64 LogicalTensor IndexMap IndexMap Shape))
+(relation concat-parts (LogicalTensor i64 i64 LogicalTensor LogicalTensor))
+
+; The row slice of S along k: the sliced dims (axis k's extent the literal
+; `ext`), then the entries over the sliced shape.
+(rule
+  ((row-slice-demand ?shape ?axis ?offset ?extent) (= ?shape (ShapeLit ?dims)))
+  ((row-slice-dims-demand ?dims ?axis ?extent))
+  :ruleset main_ruleset
+  :name "select/concat_slices: a row slice demands its sliced dims"
+)
+(rule
+  ((row-slice-dims-demand ?list ?axis ?extent) (= ?list (IntExprNil)))
+  ((row-slice-dims ?list ?axis ?extent (IntExprNil)))
+  :ruleset main_ruleset
+  :name "select/concat_slices: no dims slice to no dims"
+)
+(rule
+  ((row-slice-dims-demand ?list ?axis ?extent) (= ?list (IntExprCons ?dim ?tail)))
+  ((row-slice-dims-demand ?tail ?axis ?extent))
+  :ruleset main_ruleset
+  :name "select/concat_slices: slicing dims demands the tail's"
+)
+(rule
+  (
+    (row-slice-dims-demand ?list ?axis ?extent)
+    (= ?list (IntExprCons ?dim ?tail))
+    (= ?axis (expr-list-length-of ?tail))
+    (row-slice-dims ?tail ?axis ?extent ?sliced_tail)
+  )
+  ((row-slice-dims ?list ?axis ?extent (IntExprCons (IntLit ?extent) ?sliced_tail)))
+  :ruleset main_ruleset
+  :name "select/concat_slices: the sliced axis takes the slice's extent"
+)
+(rule
+  (
+    (row-slice-dims-demand ?list ?axis ?extent)
+    (= ?list (IntExprCons ?dim ?tail))
+    (= ?index (expr-list-length-of ?tail))
+    (!= ?index ?axis)
+    (row-slice-dims ?tail ?axis ?extent ?sliced_tail)
+  )
+  ((row-slice-dims ?list ?axis ?extent (IntExprCons ?dim ?sliced_tail)))
+  :ruleset main_ruleset
+  :name "select/concat_slices: every other axis keeps its extent"
+)
+(rule
+  (
+    (row-slice-demand ?shape ?axis ?offset ?extent)
+    (= ?shape (ShapeLit ?dims))
+    (row-slice-dims ?dims ?axis ?extent ?sliced)
+  )
+  ((row-slice-entries-demand ?sliced (ShapeLit ?sliced) ?axis ?offset))
+  :ruleset main_ruleset
+  :name "select/concat_slices: a row slice demands its entries over the sliced shape"
+)
+(rule
+  ((row-slice-entries-demand ?list ?out ?axis ?offset) (= ?list (IntExprNil)))
+  ((row-slice-entries ?list ?out ?axis ?offset (IntExprNil)))
+  :ruleset main_ruleset
+  :name "select/concat_slices: no axes read through no entries"
+)
+(rule
+  ((row-slice-entries-demand ?list ?out ?axis ?offset) (= ?list (IntExprCons ?dim ?tail)))
+  ((row-slice-entries-demand ?tail ?out ?axis ?offset))
+  :ruleset main_ruleset
+  :name "select/concat_slices: the entries demand the tail's"
+)
+(rule
+  (
+    (row-slice-entries-demand ?list ?out ?axis ?offset)
+    (= ?list (IntExprCons ?dim ?tail))
+    (= ?index (expr-list-length-of ?tail))
+    (row-slice-entries ?tail ?out ?axis ?offset ?entries)
+    (!= ?index ?axis)
+  )
+  ((row-slice-entries ?list ?out ?axis ?offset (IntExprCons (CoordVar ?out ?index) ?entries)))
+  :ruleset main_ruleset
+  :name "select/concat_slices: an unsliced axis reads its own coordinate"
+)
+(rule
+  (
+    (row-slice-entries-demand ?list ?out ?axis ?offset)
+    (= ?list (IntExprCons ?dim ?tail))
+    (= ?axis (expr-list-length-of ?tail))
+    (row-slice-entries ?tail ?out ?axis ?offset ?entries)
+    (= ?offset 0)
+  )
+  ((row-slice-entries ?list ?out ?axis ?offset (IntExprCons (CoordVar ?out ?axis) ?entries)))
+  :ruleset main_ruleset
+  :name "select/concat_slices: a slice from row 0 reads the axis at its own coordinate"
+)
+(rule
+  (
+    (row-slice-entries-demand ?list ?out ?axis ?offset)
+    (= ?list (IntExprCons ?dim ?tail))
+    (= ?axis (expr-list-length-of ?tail))
+    (row-slice-entries ?tail ?out ?axis ?offset ?entries)
+    (!= ?offset 0)
+  )
+  (
+    (row-slice-entries ?list ?out ?axis ?offset
+      (IntExprCons (IntAdd (CoordVar ?out ?axis) (IntLit ?offset)) ?entries))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_slices: a slice from a later row reads the axis shifted by its offset"
+)
+(rule
+  (
+    (row-slice-demand ?shape ?axis ?offset ?extent)
+    (= ?shape (ShapeLit ?dims))
+    (row-slice-dims ?dims ?axis ?extent ?sliced)
+    (row-slice-entries ?sliced (ShapeLit ?sliced) ?axis ?offset ?entries)
+  )
+  ((row-slice ?shape ?axis ?offset ?extent (IndexMapLit ?entries ?shape) (ShapeLit ?sliced)))
+  :ruleset main_ruleset
+  :name "select/concat_slices: a row slice is the literal map over the sliced shape"
+)
+
+; Certificate: a select is a concatenation along k at A when it is spelled
+; exactly as the frontend spells one: its condition the to-Bool truth test
+; `0 < (float(0 < m) + float(m < 0))` of the mask iota
+; `m = int(coord_k < A)` over its shape S, A strictly inside a literal
+; extent n; its first branch a view of a (S's shape with A rows on k)
+; through the clamp `min(coord_k, A - 1)`, its second a view of b (n - A
+; rows) through `max(coord_k - A, 0)`, every other axis read at its own
+; coordinate. Where coord_k < A the condition is true and the first branch
+; reads a at the same coordinate; elsewhere the second reads b at
+; coord_k - A: the select is cat(a, b), and the same select over ANY parts
+; of a's and b's shapes is theirs. Matched structurally, so no slice of the
+; concatenation is minted (composing a slice into a part's reshape chain
+; is the integer algebra's most expensive work).
+(relation concat-clamp-demand (IntExprList Shape i64 i64))
+(relation concat-clamp (IntExprList Shape i64 i64 IntExprList IntExprList))
+(rule
+  (
+    (= ?select (LogicalSelect ?condition ?true_view ?false_view))
+    (= ?true_view (LogicalIndexMapApply ?a ?true_map ?shape))
+    (= ?false_view (LogicalIndexMapApply ?b ?false_map ?shape))
+    (= ?condition (LogicalLessThan ?float_zero (LogicalAdd (LogicalCast (LogicalLessThan ?int_zero ?mask) (F32)) (LogicalCast (LogicalLessThan ?mask ?int_zero) (F32)))))
+    (= ?mask (LogicalIota (IntCastFromBool (BoolLessThanInt (CoordVar ?shape ?axis) (IntLit ?split))) ?shape))
+    (= ?shape (ShapeLit ?dims))
+    (= ?extent_expr (expr-list-nth-from-end ?dims ?axis))
+    (= ?extent_expr (IntLit ?extent))
+    (> ?split 0)
+    (> ?extent ?split)
+  )
+  (
+    (concat-candidate ?select ?axis ?split)
+    (concat-clamp-demand ?dims ?shape ?axis ?split)
+    (row-slice-demand ?shape ?axis 0 ?split)
+    (row-slice-demand ?shape ?axis ?split (- ?extent ?split))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_slices: a select on a one-sided mask iota is a candidate concatenation"
+)
+(rule
+  ((concat-clamp-demand ?list ?shape ?axis ?split) (= ?list (IntExprNil)))
+  ((concat-clamp ?list ?shape ?axis ?split (IntExprNil) (IntExprNil)))
+  :ruleset main_ruleset
+  :name "select/concat_slices: no axes clamp to no entries"
+)
+(rule
+  ((concat-clamp-demand ?list ?shape ?axis ?split) (= ?list (IntExprCons ?dim ?tail)))
+  ((concat-clamp-demand ?tail ?shape ?axis ?split))
+  :ruleset main_ruleset
+  :name "select/concat_slices: the clamp entries demand the tail's"
+)
+(rule
+  (
+    (concat-clamp-demand ?list ?shape ?axis ?split)
+    (= ?list (IntExprCons ?dim ?tail))
+    (= ?index (expr-list-length-of ?tail))
+    (!= ?index ?axis)
+    (concat-clamp ?tail ?shape ?axis ?split ?low ?high)
+  )
+  (
+    (concat-clamp ?list ?shape ?axis ?split
+      (IntExprCons (CoordVar ?shape ?index) ?low)
+      (IntExprCons (CoordVar ?shape ?index) ?high))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_slices: an axis other than the concatenated one reads its own coordinate"
+)
+(rule
+  (
+    (concat-clamp-demand ?list ?shape ?axis ?split)
+    (= ?list (IntExprCons ?dim ?tail))
+    (= ?axis (expr-list-length-of ?tail))
+    (concat-clamp ?tail ?shape ?axis ?split ?low ?high)
+  )
+  (
+    (concat-clamp ?list ?shape ?axis ?split
+      (IntExprCons (IntMin (CoordVar ?shape ?axis) (IntLit (- ?split 1))) ?low)
+      (IntExprCons (IntMax (IntAdd (CoordVar ?shape ?axis) (IntLit (- 0 ?split))) (IntLit 0)) ?high))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_slices: the concatenated axis is clamped into each part"
+)
+(rule
+  (
+    (concat-candidate ?select ?axis ?split)
+    (= ?select (LogicalSelect ?condition ?true_view ?false_view))
+    (= ?true_view (LogicalIndexMapApply ?a ?true_map ?shape))
+    (= ?false_view (LogicalIndexMapApply ?b ?false_map ?shape))
+    (= ?condition (LogicalLessThan ?float_zero ?indicator))
+    (= ?float_zero (LogicalIndexMapApply (LogicalConstant 0.0) (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape))
+    (= ?indicator (LogicalAdd (LogicalCast (LogicalLessThan ?int_zero ?mask) (F32)) (LogicalCast (LogicalLessThan ?mask ?int_zero) (F32))))
+    (= ?int_zero (LogicalIndexMapApply (LogicalIota (IntLit 0) (ShapeLit (IntExprNil))) (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape))
+    (= ?mask (LogicalIota (IntCastFromBool (BoolLessThanInt (CoordVar ?shape ?axis) (IntLit ?split))) ?shape))
+    (= ?shape (ShapeLit ?dims))
+    (concat-clamp ?dims ?shape ?axis ?split ?low_entries ?high_entries)
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (= ?true_map (IndexMapLit ?low_entries ?low_shape))
+    (= ?false_map (IndexMapLit ?high_entries ?high_shape))
+  )
+  (
+    (concat-template ?select ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?select ?axis ?split ?a ?b)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_slices: a select spelled as a concatenation is one"
+)
+
+; Rewrite : the concatenation of a tensor's two row slices is the tensor,
+; `cat(x[:A], x[A:]) = x` (consecutive blocks that each split two streams
+; on exit and join them on entry). The parts are the two row slices of one
+; x of the concatenation's own shape, and the certificate makes the
+; select their concatenation.
+(rule
+  (
+    (concat-template ?select ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?select ?axis ?split ?low_part ?high_part)
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (= ?low_part (LogicalIndexMapApply ?x ?low ?low_shape))
+    (= ?high_part (LogicalIndexMapApply ?x ?high ?high_shape))
+    (= ?shape (shape-of ?x))
+  )
+  ((union ?select ?x))
+  :ruleset main_ruleset
+  :name "select/concat_slices: the concatenation of a tensor's two row slices is the tensor"
+)

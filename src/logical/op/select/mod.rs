@@ -50,6 +50,10 @@ impl LogicalOp for LogicalSelect {
                 text: include_str!("rewrite.egg"),
             },
             EgglogSnippet {
+                category: SpliceCategory::Rewrites,
+                text: include_str!("concat_slices.egg"),
+            },
+            EgglogSnippet {
                 category: SpliceCategory::Shape,
                 text: include_str!("shape.egg"),
             },
@@ -137,3 +141,7 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "concat_tests.rs"]
+mod concat_tests;
