@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from luminal_reference import Compiler
+from luminal_torch_reference_compiler import Compiler
 
 
 class Model(torch.nn.Module):
@@ -34,17 +34,17 @@ def test_compiler_logging_and_aot(logging, capfd):
 
 
 def test_only_compiler_is_public():
-    import luminal_reference
+    import luminal_torch_reference_compiler
 
-    assert luminal_reference.__all__ == ["Compiler"]
-    assert not callable(luminal_reference)
+    assert luminal_torch_reference_compiler.__all__ == ["Compiler"]
+    assert not callable(luminal_torch_reference_compiler)
     for removed in (
         "compile_model",
         "compile",
         "register_backend",
         "ReferenceAOTBackend",
     ):
-        assert not hasattr(luminal_reference, removed)
+        assert not hasattr(luminal_torch_reference_compiler, removed)
 
 
 def test_compiler_memory_budget_reaches_search():

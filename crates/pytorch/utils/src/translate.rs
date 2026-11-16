@@ -227,6 +227,14 @@ struct Translator<'a> {
 /// exported program states its shapes in, so a caller whose storage is
 /// shaped by a dynamic dimension names that dimension rather than the
 /// number one example call happened to have.
+/// Read a sympy `srepr` expression over the caller's own symbols: each name
+/// the expression may use, and the symbol it stands for. `None` when the
+/// expression names another symbol or uses a sympy form the parser does not
+/// read.
+pub fn parse_expr(symbols: &HashMap<String, Symbol>, expr: &str) -> Option<IntExpr> {
+    sympy::parse_sympy_expr(expr, symbols)
+}
+
 pub fn parse_dim_expr(translation: &Translation, expr: &str) -> Result<IntExpr> {
     sympy::parse_sympy_expr(expr, &translation.symbols).ok_or_else(|| {
         anyhow!(

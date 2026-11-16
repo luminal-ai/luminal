@@ -5,12 +5,12 @@ use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
     CONSTRUCTOR as IN_PLACE_CONSTRUCTOR, CublasLtAccumulateInPlace,
     CublasLtAccumulateInPlaceMatcher,
 };
-use luminal_cuda_lite::ops::cublaslt::approved::{
-    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST,
-};
 use luminal_cuda_lite::ops::cublaslt::exec::{LtActivation, LtCall, LtOrder};
+use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+    CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher, WHITELIST,
+};
 
-pub fn key(call: &ApprovedCublasLt) -> String {
+pub fn key(call: &CublasLtOutOfPlace) -> String {
     resolved_key(&call.resolve(&Default::default()), call.scale)
 }
 pub fn in_place_key(call: &CublasLtAccumulateInPlace) -> String {
@@ -155,7 +155,7 @@ fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
     graphs
 }
 
-pub fn witnesses() -> std::collections::BTreeMap<String, ApprovedCublasLt> {
+pub fn witnesses() -> std::collections::BTreeMap<String, CublasLtOutOfPlace> {
     let mut all = std::collections::BTreeMap::new();
     for graph in witness_graphs() {
         let index = SerializedIndex::new(&graph);
@@ -163,13 +163,13 @@ pub fn witnesses() -> std::collections::BTreeMap<String, ApprovedCublasLt> {
             if node.op != CONSTRUCTOR || node.subsumed {
                 continue;
             }
-            let op = ApprovedCublasLtMatcher.extract(&ExtractionSite {
+            let op = CublasLtOutOfPlaceMatcher.extract(&ExtractionSite {
                 egraph: &graph,
                 node_id: id,
                 node,
                 index: &index,
             });
-            let call = op.as_any().downcast_ref::<ApprovedCublasLt>().unwrap();
+            let call = op.as_any().downcast_ref::<CublasLtOutOfPlace>().unwrap();
             all.entry(key(call)).or_insert_with(|| call.clone());
         }
     }
@@ -409,7 +409,7 @@ pub fn table_registry(table: &'static str) -> Vec<luminal_cuda_lite::RegisteredO
             let snippets = if self.in_place {
                 CublasLtAccumulateInPlaceMatcher.snippets()
             } else {
-                ApprovedCublasLtMatcher.snippets()
+                CublasLtOutOfPlaceMatcher.snippets()
             };
             snippets
                 .into_iter()
@@ -425,14 +425,14 @@ pub fn table_registry(table: &'static str) -> Vec<luminal_cuda_lite::RegisteredO
             if self.in_place {
                 CublasLtAccumulateInPlaceMatcher.metadata_slots()
             } else {
-                ApprovedCublasLtMatcher.metadata_slots()
+                CublasLtOutOfPlaceMatcher.metadata_slots()
             }
         }
         fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
             if self.in_place {
                 CublasLtAccumulateInPlaceMatcher.extract(site)
             } else {
-                ApprovedCublasLtMatcher.extract(site)
+                CublasLtOutOfPlaceMatcher.extract(site)
             }
         }
     }

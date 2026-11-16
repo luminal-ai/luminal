@@ -1,10 +1,12 @@
 [project]
-name = "luminal_cuda_lite"
+name = "luminal_torch_cuda_lite_compiler"
 version = "0.1.0"
 description = "Luminal CUDA-lite torch.compile backend"
 requires-python = ">=3.10"
 # luminal_torch_common: the torch.compile frontend every backend shares.
-dependencies = ["torch>=2.14.0", "luminal_torch_common"]
+# luminal_torch_cuda_lite_runtime: the code object this compiler produces, and
+# the only package a saved program needs.
+dependencies = ["torch>=2.14.0", "luminal_torch_common", "luminal_torch_cuda_lite_runtime"]
 
 # PyTorch 2.14 wheels require the CUDA 13.0 index; cu128 stops before 2.14.
 [[tool.uv.index]]
@@ -17,6 +19,7 @@ torch = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 luminal_torch_common = { path = "../utils", editable = true }
+luminal_torch_cuda_lite_runtime = { path = "../cuda_lite_runtime", editable = true }
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
@@ -25,7 +28,7 @@ build-backend = "maturin"
 [tool.maturin]
 python-source = "python"
 manifest-path = "Cargo.toml"
-module-name = "luminal_cuda_lite._luminal"
+module-name = "luminal_torch_cuda_lite_compiler._luminal"
 # A CUDA backend is not useful without device execution, so the wheel always
 # builds with it on. `cargo check`/clippy on CUDA-free hosts still work because
 # the *crate* default is off.

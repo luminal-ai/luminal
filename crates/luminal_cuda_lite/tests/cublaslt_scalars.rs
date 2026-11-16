@@ -6,11 +6,11 @@ use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
     CONSTRUCTOR as IN_PLACE, CublasLtAccumulateInPlace, CublasLtAccumulateInPlaceMatcher,
 };
-use luminal_cuda_lite::ops::cublaslt::approved::{
-    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, Scalars, WHITELIST,
-};
 #[cfg(feature = "device")]
 use luminal_cuda_lite::ops::cublaslt::exec::LtScalars;
+use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+    CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher, Scalars, WHITELIST,
+};
 #[cfg(feature = "device")]
 mod support;
 #[path = "support/whitelist.rs"]
@@ -170,7 +170,7 @@ fn saturate(graph: &Graph, table: &str) -> EGraph {
         .unwrap();
     egraph.serialize(Default::default()).egraph
 }
-fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
+fn calls(graph: &EGraph) -> (Vec<CublasLtOutOfPlace>, Vec<CublasLtAccumulateInPlace>) {
     let index = SerializedIndex::new(graph);
     let mut separate = Vec::new();
     let mut in_place = Vec::new();
@@ -186,10 +186,10 @@ fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlac
         };
         match node.op.as_str() {
             CONSTRUCTOR => separate.push(
-                ApprovedCublasLtMatcher
+                CublasLtOutOfPlaceMatcher
                     .extract(&site)
                     .as_any()
-                    .downcast_ref::<ApprovedCublasLt>()
+                    .downcast_ref::<CublasLtOutOfPlace>()
                     .unwrap()
                     .clone(),
             ),
@@ -491,7 +491,7 @@ mod execution {
         let mut calls = 0;
         for node in runtime.plan().unwrap().dag.node_weights() {
             if let BufferNode::Compute { op, .. } = node {
-                let resolved = if let Some(op) = op.as_any().downcast_ref::<ApprovedCublasLt>() {
+                let resolved = if let Some(op) = op.as_any().downcast_ref::<CublasLtOutOfPlace>() {
                     assert!(!in_place);
                     Some(op.resolve(&Default::default()))
                 } else if let Some(op) = op.as_any().downcast_ref::<CublasLtAccumulateInPlace>() {

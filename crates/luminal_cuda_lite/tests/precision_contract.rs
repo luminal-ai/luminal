@@ -23,8 +23,8 @@ fn native_bf16() -> bool {
 /// The production egglog rules still provide every op and descriptor.
 fn run_bf16_candidate(graph: &Graph, inputs: &FxHashMap<NodeIndex, HostBuffer>) -> Vec<f32> {
     use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
-    use luminal_cuda_lite::ops::cublaslt::approved::{
-        ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR,
+    use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+        CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher,
     };
 
     let runtime = CudaRuntime::load(graph).unwrap();
@@ -37,13 +37,13 @@ fn run_bf16_candidate(graph: &Graph, inputs: &FxHashMap<NodeIndex, HostBuffer>) 
             if node.op != CONSTRUCTOR || node.subsumed {
                 return None;
             }
-            let op = ApprovedCublasLtMatcher.extract(&ExtractionSite {
+            let op = CublasLtOutOfPlaceMatcher.extract(&ExtractionSite {
                 egraph: &egraph,
                 node_id,
                 node,
                 index: &index,
             });
-            let spec = op.as_any().downcast_ref::<ApprovedCublasLt>()?;
+            let spec = op.as_any().downcast_ref::<CublasLtOutOfPlace>()?;
             (spec.a.dtype == PlanDtype::Bf16 && spec.b.dtype == PlanDtype::Bf16)
                 .then_some(node_id.clone())
         })
@@ -87,7 +87,7 @@ fn run_bf16_candidate(graph: &Graph, inputs: &FxHashMap<NodeIndex, HostBuffer>) 
             return false;
         };
         op.as_any()
-            .downcast_ref::<luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt>()
+            .downcast_ref::<luminal_cuda_lite::ops::cublaslt::out_of_place::CublasLtOutOfPlace>()
             .is_some_and(|op| op.a.dtype == PlanDtype::Bf16)
     }));
     let device = luminal_cuda_lite::device::CudaDevice::new(0).unwrap();
@@ -97,7 +97,7 @@ fn run_bf16_candidate(graph: &Graph, inputs: &FxHashMap<NodeIndex, HostBuffer>) 
         .unwrap();
     let mut arena = support::Allocation::new(
         device.stream().clone(),
-        executable.memory_plan().unwrap().slab_bytes,
+        executable.program().unwrap().arena_bytes,
     )
     .unwrap();
     let bindings = luminal_cuda_lite::CudaBindings::leaves(&graph.logical)
@@ -109,7 +109,7 @@ fn run_bf16_candidate(graph: &Graph, inputs: &FxHashMap<NodeIndex, HostBuffer>) 
             .values()
             .find(|buffer| buffer.lit == Some(binding.buffer))
             .unwrap();
-        let home = executable.memory_plan().unwrap().slices[&buffer.id];
+        let home = executable.program().unwrap().slice(&buffer.id).unwrap();
         let data = &inputs[&binding.value];
         assert_eq!(buffer.layout.dtype, Some(data.dtype));
         assert_eq!(
@@ -160,8 +160,8 @@ fn run(
             };
             let Some(dps) = op
                 .as_any()
-                .downcast_ref::<luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt>()
-            else {
+                .downcast_ref::<luminal_cuda_lite::ops::cublaslt::out_of_place::CublasLtOutOfPlace>(
+            ) else {
                 return false;
             };
             let spec = dps;

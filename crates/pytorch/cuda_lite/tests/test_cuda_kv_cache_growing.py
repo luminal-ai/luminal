@@ -1,7 +1,8 @@
 import pytest
 import torch
 import torch._dynamo
-from luminal_cuda_lite import Compiler
+from luminal_torch_cuda_lite_compiler import Compiler
+
 from reference.tests.models.test_kv_cache_growing import NUM_DECODE_STEPS
 
 luminal_backend = Compiler()

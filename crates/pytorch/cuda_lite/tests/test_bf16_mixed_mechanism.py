@@ -11,7 +11,7 @@ cuBLASLt C/beta input). Compiles each many times; reports broken rate.
 import pytest
 import torch
 import torch._dynamo
-from luminal_cuda_lite import Compiler
+from luminal_torch_cuda_lite_compiler import Compiler
 
 luminal_backend = Compiler()
 

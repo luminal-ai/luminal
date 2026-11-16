@@ -42,7 +42,7 @@ def test_package_imports_enforce_minimum_before_native_loading():
 import importlib
 import torch
 torch.__version__ = "2.13.0"
-for package in ("luminal_reference", "luminal_cuda_lite"):
+for package in ("luminal_torch_reference_compiler", "luminal_torch_cuda_lite_compiler"):
     try:
         importlib.import_module(package)
     except ImportError as error:

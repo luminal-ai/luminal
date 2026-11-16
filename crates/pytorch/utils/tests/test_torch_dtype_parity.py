@@ -16,7 +16,7 @@ from torch._export.serde.schema import ScalarType
 # one that exports the map, so the check runs wherever that extension is
 # installed.
 _torch_dtype_codes = pytest.importorskip(
-    "luminal_reference._luminal",
+    "luminal_torch_reference_compiler._luminal",
     reason="the dtype code map is exported by the reference extension",
 )._torch_dtype_codes
 

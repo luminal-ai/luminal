@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from luminal_reference import Compiler
+from luminal_torch_reference_compiler import Compiler
 from test_dtype_boundary import BoundaryNoopModel, EmptyWeightModel
 
 luminal_backend = Compiler()
@@ -53,13 +53,17 @@ def test_empty_cpu_weight_preserves_shape_and_dtype() -> None:
     assert torch.equal(actual, expected)
 
 
-def test_cpu_input_rejects_non_bytes_payload():
-    """The native boundary accepts owned bytes, never arbitrary host pointers."""
-    compiler = Compiler()
-    compiled = torch.compile(BoundaryNoopModel(), backend=compiler, fullgraph=True)
+def test_cpu_input_rejects_non_bytes_payload(monkeypatch):
+    """The compiler's staging boundary accepts owned bytes, never arbitrary
+    host pointers."""
+    from backend_test_utils import record_lowered_graphs
+    from luminal_torch_reference_compiler import _luminal
+
+    lowered = record_lowered_graphs(monkeypatch)
+    compiled = torch.compile(BoundaryNoopModel(), backend=Compiler(), fullgraph=True)
     compiled(torch.ones(1))
 
-    (record,) = compiler.graphs
-    graph = record.program._graph
+    (program,) = lowered
+    graph = _luminal.compile_graph(program.program_json())
     with pytest.raises(TypeError):
         graph.set_input(graph.input_names[0], None, [1])

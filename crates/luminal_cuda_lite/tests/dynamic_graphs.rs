@@ -477,7 +477,7 @@ fn dynamic_cublas_bias_uses_elected_symbolic_descriptors() {
     let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
     let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let before = rt.graph_stats().unwrap();
-    assert!(rt.plan().unwrap().dag.node_weights().any(|node|matches!(node,luminal::bufferize::BufferNode::Compute{op,..} if luminal_cuda_lite::as_host_op(op.as_ref()).is_some()&&op.as_any().downcast_ref::<luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt>().is_some_and(|call| call.bias.is_some()))));
+    assert!(rt.plan().unwrap().dag.node_weights().any(|node|matches!(node,luminal::bufferize::BufferNode::Compute{op,..} if luminal_cuda_lite::as_host_op(op.as_ref()).is_some()&&op.as_any().downcast_ref::<luminal_cuda_lite::ops::cublaslt::out_of_place::CublasLtOutOfPlace>().is_some_and(|call| call.bias.is_some()))));
     for (m, n) in [(2, 3), (9, 7), (4, 9), (2, 3)] {
         let av: Vec<_> = (0..m * 4).map(|i| (i % 5) as f32 - 2.).collect();
         let bv: Vec<_> = (0..4 * n).map(|i| (i % 7) as f32 * 0.25 - 0.5).collect();

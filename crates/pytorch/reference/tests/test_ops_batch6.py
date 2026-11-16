@@ -1,7 +1,7 @@
 """Translator batch 7/8: elementwise specials, squeeze/triangle, reductions,
 and the addmm family."""
 
-import luminal_reference
+import luminal_torch_reference_compiler
 import pytest
 import torch
 import torch.nn as nn
@@ -11,7 +11,7 @@ import torch.nn.functional as F
 def _check(model: nn.Module, *inputs: torch.Tensor, atol: float = 1e-4) -> None:
     torch.manual_seed(0)
     eager = model(*inputs)
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
     out = compiled(*inputs)
     inputs = tuple(t.clone() for t in inputs)
     if isinstance(eager, (tuple, list)):
@@ -257,7 +257,9 @@ def test_addmm_family_bool_coefficients_are_literal_zero_and_one(
     inputs = (matrix_input, vector_input, mat1, mat2, vec, batch1, batch2)
     model = BoolCoefficientAddmmFamily(beta=beta, alpha=alpha)
     eager = model(*inputs)
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())(*inputs)
+    compiled = torch.compile(
+        model, backend=luminal_torch_reference_compiler.Compiler()
+    )(*inputs)
     assert len(compiled) == len(eager)
     for got, want in zip(compiled, eager):
         assert got.dtype == want.dtype

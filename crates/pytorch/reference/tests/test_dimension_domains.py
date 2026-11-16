@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from luminal_reference import Compiler
+from luminal_torch_reference_compiler import Compiler
 from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
 
 

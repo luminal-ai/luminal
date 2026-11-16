@@ -443,7 +443,7 @@ impl KernelSource {
 
 /// Optional live launch geometry. Only nodes depending on changed dimensions
 /// are patched. Zero grids disable a node; block extents must stay positive.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KernelLaunch {
     pub grid: [Expr; 3],
     pub block: [Expr; 3],
@@ -464,7 +464,6 @@ impl KernelLaunch {
             shared_bytes: 0usize.into(),
         }
     }
-    #[cfg(feature = "device")]
     pub(crate) fn expressions(&self) -> impl Iterator<Item = &Expr> {
         self.grid
             .iter()
@@ -506,7 +505,6 @@ pub(crate) fn cuda_type(dtype: PlanDtype) -> Result<&'static str> {
 /// The NVRTC `#include` directives a kernel needs for the dtypes it mentions.
 /// `cuda_fp16.h`/`cuda_bf16.h` are not built into NVRTC; the build script
 /// embeds the toolkit's header closure so these always resolve.
-#[cfg(feature = "device")]
 pub(crate) fn dtype_includes(dtypes: &[PlanDtype]) -> String {
     let mut includes = String::new();
     if dtypes.contains(&PlanDtype::F16) {

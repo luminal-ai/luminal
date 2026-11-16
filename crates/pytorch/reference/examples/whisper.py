@@ -2,7 +2,7 @@
 
 Implements a small PyTorch port of ``openai/whisper-tiny.en`` that mirrors the
 logical Whisper model, loads the official HuggingFace weights, and runs greedy
-decoding through ``torch.compile`` with ``luminal_reference.Compiler``.
+decoding through ``torch.compile`` with ``luminal_torch_reference_compiler.Compiler``.
 
 Usage::
 
@@ -402,7 +402,7 @@ def download_default_audio() -> Path:
 
 
 def main() -> None:
-    from luminal_reference import Compiler
+    from luminal_torch_reference_compiler import Compiler
     from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
 
     device = torch.device("cpu")

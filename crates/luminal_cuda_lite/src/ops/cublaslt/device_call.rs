@@ -183,6 +183,26 @@ impl Drop for Desc {
 
 pub use crate::host::DeviceRange;
 
+impl super::exec::LtCallTemplate {
+    /// Prepare the call at a call's dimensions and addresses. Both cuBLASLt
+    /// operations and a lowered program's host step prepare through here.
+    pub fn prepare(
+        &self,
+        dims: &luminal::shape::DynMap,
+        operands: &[DeviceRange],
+        dest: DeviceRange,
+        workspace: DeviceRange,
+    ) -> Result<PreparedCall> {
+        if let Some(operand) = self.in_place {
+            anyhow::ensure!(
+                operands.get(operand).is_some_and(|c| c.ptr == dest.ptr),
+                "in-place cuBLASLt accumulation requires C and the result to share storage"
+            );
+        }
+        prepare(&self.resolve(dims), operands, dest, workspace)
+    }
+}
+
 /// Dispatch one resolved call, stream-ordered on `stream` (the same
 /// stream the surrounding kernels use). `operands` are the Lit operand
 /// buffers `[a, b, c?, bias?]`; `dest` is the D buffer — the range the

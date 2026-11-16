@@ -1,0 +1,32 @@
+[project]
+name = "luminal_torch_cuda_lite_runtime"
+version = "0.1.0"
+description = "Runtime for programs compiled by the Luminal CUDA-lite torch.compile backend"
+requires-python = ">=3.10"
+# Everything a saved program needs at load. No compiler: the parser, the
+# translator, search and the kernel compiler are in
+# luminal_torch_cuda_lite_compiler, which depends on this.
+dependencies = ["torch>=2.14.0"]
+
+# PyTorch 2.14 wheels require the CUDA 13.0 index; cu128 stops before 2.14.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+manifest-path = "Cargo.toml"
+module-name = "luminal_torch_cuda_lite_runtime._runtime"
+# A CUDA runtime is not useful without device execution, so the wheel always
+# builds with it on.
+features = ["device"]

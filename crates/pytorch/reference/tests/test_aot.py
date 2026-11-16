@@ -1,9 +1,9 @@
 """AOT contract tests: gradients, saved tensors, and runtime parameter binding."""
 
-import luminal_reference
+import luminal_torch_reference_compiler
 import pytest
 import torch
-from luminal_reference import Compiler
+from luminal_torch_reference_compiler import Compiler
 
 
 def test_forward_backward_and_optimizer_update():
@@ -105,14 +105,17 @@ def test_compiler_trains_with_dynamic_shapes():
 
 
 def test_default_backend_dynamic_mutation_and_alias():
-    import luminal_reference
+    import luminal_torch_reference_compiler
 
     def model(x):
         x.add_(2)
         return x.view(-1), x * 3
 
     compiled = torch.compile(
-        model, backend=luminal_reference.Compiler(), fullgraph=True, dynamic=True
+        model,
+        backend=luminal_torch_reference_compiler.Compiler(),
+        fullgraph=True,
+        dynamic=True,
     )
     for size in (3, 7):
         x = torch.randn(size, 4)
@@ -125,11 +128,11 @@ def test_default_backend_dynamic_mutation_and_alias():
 
 
 def test_dynamic_scalar_shape_output():
-    import luminal_reference
+    import luminal_torch_reference_compiler
 
     compiled = torch.compile(
         lambda x: (x + 1, x.shape[0] // 2),
-        backend=luminal_reference.Compiler(),
+        backend=luminal_torch_reference_compiler.Compiler(),
         fullgraph=True,
         dynamic=True,
     )
@@ -228,7 +231,7 @@ def test_symbolic_scalar_outputs_keep_their_python_type():
                 gm,
                 inputs,
                 device_type="cpu",
-                boundary_plan=luminal_reference._luminal.boundary_plan,
+                boundary_plan=luminal_torch_reference_compiler._luminal.boundary_plan,
             )
 
             def run(*args):
@@ -320,7 +323,7 @@ def test_every_placeholder_and_output_leaf_has_a_slot():
                     gm,
                     inputs,
                     device_type="cpu",
-                    boundary_plan=luminal_reference._luminal.boundary_plan,
+                    boundary_plan=luminal_torch_reference_compiler._luminal.boundary_plan,
                 )
                 return make_boxed_func(gm.forward)
 

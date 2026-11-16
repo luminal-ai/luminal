@@ -7,7 +7,7 @@ tensor, and a model that returns the mutated input returns the SAME storage
 
 from typing import Any, Tuple
 
-import luminal_reference
+import luminal_torch_reference_compiler
 import torch
 import torch.nn as nn
 
@@ -78,7 +78,7 @@ def _run(cls: type, inputs: Tuple[torch.Tensor, ...]) -> Tuple[Any, ...]:
     eager_inputs = [t.clone() for t in inputs]
     eager = model(*eager_inputs)
 
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
     compiled_inputs = [t.clone() for t in base]
     out = compiled(*compiled_inputs)
 
@@ -131,7 +131,7 @@ def test_buffer_mutation() -> None:
     eager = eager_model(x.clone())
 
     model = BufferAdd()
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
     out = compiled(x.clone())
 
     assert torch.allclose(out, eager, atol=1e-5)

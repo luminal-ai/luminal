@@ -6,16 +6,16 @@ use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
     CONSTRUCTOR as IN_PLACE_CONSTRUCTOR, CublasLtAccumulateInPlace,
     CublasLtAccumulateInPlaceMatcher,
 };
-use luminal_cuda_lite::ops::cublaslt::approved::{
-    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR,
-};
 use luminal_cuda_lite::ops::cublaslt::exec::{LtDesc, LtOrder};
+use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+    CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher,
+};
 fn matchers() -> Vec<Box<dyn OpMatcher>> {
     let mut matchers: Vec<Box<dyn OpMatcher>> = luminal_cuda_lite::cuda_registry_without_cublaslt()
         .into_iter()
         .map(|row| row.matcher)
         .collect();
-    matchers.push(Box::new(ApprovedCublasLtMatcher));
+    matchers.push(Box::new(CublasLtOutOfPlaceMatcher));
     matchers.push(Box::new(CublasLtAccumulateInPlaceMatcher));
     matchers
 }
@@ -233,7 +233,7 @@ fn direct_products_require_an_explicitly_admitted_arithmetic_dtype() {
     }
 }
 
-fn calls(graph: &EGraph) -> Vec<ApprovedCublasLt> {
+fn calls(graph: &EGraph) -> Vec<CublasLtOutOfPlace> {
     let index = luminal::layout_ir::SerializedIndex::new(graph);
     graph
         .nodes
@@ -246,10 +246,10 @@ fn calls(graph: &EGraph) -> Vec<ApprovedCublasLt> {
                 node,
                 index: &index,
             };
-            ApprovedCublasLtMatcher
+            CublasLtOutOfPlaceMatcher
                 .extract(&site)
                 .as_any()
-                .downcast_ref::<ApprovedCublasLt>()
+                .downcast_ref::<CublasLtOutOfPlace>()
                 .unwrap()
                 .clone()
         })
@@ -286,7 +286,7 @@ fn all_families_with_layouts(layouts: &str) -> EGraph {
     run(&format!("{body}\n{layouts}"), "")
 }
 
-fn configuration_key(op: &ApprovedCublasLt) -> (bool, bool, bool, bool, bool, bool) {
+fn configuration_key(op: &CublasLtOutOfPlace) -> (bool, bool, bool, bool, bool, bool) {
     (
         op.c.is_some(),
         op.bias.is_some(),
@@ -482,7 +482,7 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                     let ExtractedNode::LayoutOp(node) = node else {
                         return None;
                     };
-                    node.op.as_any().downcast_ref::<ApprovedCublasLt>()
+                    node.op.as_any().downcast_ref::<CublasLtOutOfPlace>()
                 })
                 .collect();
             assert_eq!(selected.len(), 1, "one complete fused expression");
@@ -521,7 +521,7 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                 else {
                     continue;
                 };
-                let Some(op) = op.as_any().downcast_ref::<ApprovedCublasLt>() else {
+                let Some(op) = op.as_any().downcast_ref::<CublasLtOutOfPlace>() else {
                     continue;
                 };
                 let call = op.resolve(&Default::default());
@@ -636,14 +636,14 @@ fn in_place_accumulation_requires_identical_layouts_and_bufferizer_honors_the_ti
             else {
                 continue;
             };
-            let (call, in_place) = if let Some(op) = op.as_any().downcast_ref::<ApprovedCublasLt>()
-            {
-                (op.resolve(&Default::default()), false)
-            } else if let Some(op) = op.as_any().downcast_ref::<CublasLtAccumulateInPlace>() {
-                (op.resolve(&Default::default()), true)
-            } else {
-                continue;
-            };
+            let (call, in_place) =
+                if let Some(op) = op.as_any().downcast_ref::<CublasLtOutOfPlace>() {
+                    (op.resolve(&Default::default()), false)
+                } else if let Some(op) = op.as_any().downcast_ref::<CublasLtAccumulateInPlace>() {
+                    (op.resolve(&Default::default()), true)
+                } else {
+                    continue;
+                };
             count += 1;
             assert_eq!(
                 in_place, !padded,

@@ -95,7 +95,14 @@ impl<T: 'static> AsAnyOp for T {
 /// supertrait); planner-synthesized ops like [`BufferCopy`] implement ONLY
 /// this trait — they have no logical semantics, no egglog constructor, and
 /// never meet the analyzer.
-pub trait BufferTensorIrOp: OpSlotNames + CloneBufferTensorIrOp + AsAnyOp + Debug {
+///
+/// An op is plain state: it may be moved to, and read from, any thread. A
+/// plan that holds ops can therefore be handed between threads, which is
+/// what lets a compiled program be called on a thread other than the one
+/// that built it.
+pub trait BufferTensorIrOp:
+    OpSlotNames + CloneBufferTensorIrOp + AsAnyOp + Debug + Send + Sync
+{
     /// The op's IR name (see the label policy in `luminal_reference::ops`).
     fn label(&self) -> &str;
 

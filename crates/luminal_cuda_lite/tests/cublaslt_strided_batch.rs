@@ -9,10 +9,10 @@ use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
     CONSTRUCTOR as IN_PLACE, CublasLtAccumulateInPlace, CublasLtAccumulateInPlaceMatcher,
 };
-use luminal_cuda_lite::ops::cublaslt::approved::{
-    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST,
-};
 use luminal_cuda_lite::ops::cublaslt::exec::{LtActivation, LtDesc, LtOrder, validate_ld_bounds};
+use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+    CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher, WHITELIST,
+};
 
 #[path = "support/broadcast_batch.rs"]
 mod broadcast_batch;
@@ -25,7 +25,7 @@ mod support;
 #[path = "support/whitelist.rs"]
 mod whitelist;
 
-fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
+fn calls(graph: &EGraph) -> (Vec<CublasLtOutOfPlace>, Vec<CublasLtAccumulateInPlace>) {
     let index = SerializedIndex::new(graph);
     let mut separate = Vec::new();
     let mut in_place = Vec::new();
@@ -41,10 +41,10 @@ fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlac
         };
         match node.op.as_str() {
             CONSTRUCTOR => separate.push(
-                ApprovedCublasLtMatcher
+                CublasLtOutOfPlaceMatcher
                     .extract(&site)
                     .as_any()
-                    .downcast_ref::<ApprovedCublasLt>()
+                    .downcast_ref::<CublasLtOutOfPlace>()
                     .unwrap()
                     .clone(),
             ),

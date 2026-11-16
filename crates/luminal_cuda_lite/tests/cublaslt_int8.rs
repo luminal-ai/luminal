@@ -6,8 +6,8 @@ use luminal_cuda_lite::ops::cublaslt::{
     accumulate_in_place::{
         CONSTRUCTOR as IN_PLACE, CublasLtAccumulateInPlace, CublasLtAccumulateInPlaceMatcher,
     },
-    approved::{ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST},
     exec::{LtActivation, LtComputation, LtScalars},
+    out_of_place::{CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher, WHITELIST},
 };
 #[cfg(feature = "device")]
 mod support;
@@ -63,11 +63,11 @@ fn fixture(batch: bool, sharing: (bool, bool), device: bool, view_before_cast: b
     let _out = _scaled + c * beta.expand_rhs(c.dims());
     graph
 }
-fn is_int8(op: &ApprovedCublasLt) -> bool {
+fn is_int8(op: &CublasLtOutOfPlace) -> bool {
     op.a.dtype == PlanDtype::I8 || op.b.dtype == PlanDtype::I8
 }
 
-fn calls(graph: &Graph, table: &str) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
+fn calls(graph: &Graph, table: &str) -> (Vec<CublasLtOutOfPlace>, Vec<CublasLtAccumulateInPlace>) {
     let matchers: Vec<_> = luminal_cuda_lite::cuda_registry()
         .into_iter()
         .map(|row| row.matcher)
@@ -104,10 +104,10 @@ fn calls(graph: &Graph, table: &str) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccu
         };
         match node.op.as_str() {
             CONSTRUCTOR => separate.push(
-                ApprovedCublasLtMatcher
+                CublasLtOutOfPlaceMatcher
                     .extract(&site)
                     .as_any()
-                    .downcast_ref::<ApprovedCublasLt>()
+                    .downcast_ref::<CublasLtOutOfPlace>()
                     .unwrap()
                     .clone(),
             ),
@@ -453,7 +453,7 @@ fn compiled_int8_calls_match_reference_preserve_narrowing_and_read_live_scalars(
                                 let BufferNode::Compute { op, .. } = node else {
                                     return None;
                                 };
-                                if let Some(op) = op.as_any().downcast_ref::<ApprovedCublasLt>() {
+                                if let Some(op) = op.as_any().downcast_ref::<CublasLtOutOfPlace>() {
                                     Some(op.resolve(&Default::default()))
                                 } else {
                                     op.as_any()
@@ -601,13 +601,13 @@ fn symbolic_int8_batch_descriptors_keep_byte_storage_and_positive_geometry() {
         if node.subsumed || node.op != CONSTRUCTOR {
             continue;
         }
-        let op = ApprovedCublasLtMatcher.extract(&ExtractionSite {
+        let op = CublasLtOutOfPlaceMatcher.extract(&ExtractionSite {
             egraph: &egraph,
             node_id,
             node,
             index: &index,
         });
-        let op = op.as_any().downcast_ref::<ApprovedCublasLt>().unwrap();
+        let op = op.as_any().downcast_ref::<CublasLtOutOfPlace>().unwrap();
         if !is_int8(op) {
             continue;
         }

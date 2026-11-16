@@ -8,11 +8,13 @@ name = "luminal_reference_py"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-half = { version = "2.7.1", features = ["num-traits", "bytemuck"] }
-float8 = { version = "0.7", features = ["bytemuck", "num-traits"] }
 luminal = { path = "../../.." }
 luminal_reference = { path = "../../luminal_reference" }
 luminal_pytorch_utils = { path = "../utils" }
+luminal_torch_slots = { path = "../slots", features = ["python"] }
+luminal_torch_reference_runtime = { path = "../reference_runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 anyhow = "1"
 rustc-hash = "2.1.1"
 

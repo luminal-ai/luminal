@@ -5,8 +5,8 @@ use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
     CONSTRUCTOR as IN_PLACE, CublasLtAccumulateInPlace, CublasLtAccumulateInPlaceMatcher,
 };
-use luminal_cuda_lite::ops::cublaslt::approved::{
-    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST,
+use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+    CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher, WHITELIST,
 };
 #[cfg(feature = "device")]
 mod support;
@@ -36,7 +36,7 @@ fn saturate(model: &Graph, table: &str) -> EGraph {
         .unwrap();
     graph.serialize(Default::default()).egraph
 }
-fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
+fn calls(graph: &EGraph) -> (Vec<CublasLtOutOfPlace>, Vec<CublasLtAccumulateInPlace>) {
     let index = SerializedIndex::new(graph);
     let mut separate = Vec::new();
     let mut in_place = Vec::new();
@@ -52,10 +52,10 @@ fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlac
         };
         match node.op.as_str() {
             CONSTRUCTOR => separate.push(
-                ApprovedCublasLtMatcher
+                CublasLtOutOfPlaceMatcher
                     .extract(&site)
                     .as_any()
-                    .downcast_ref::<ApprovedCublasLt>()
+                    .downcast_ref::<CublasLtOutOfPlace>()
                     .unwrap()
                     .clone(),
             ),
@@ -576,7 +576,7 @@ mod execution {
         let mut found = false;
         for node in runtime.plan().unwrap().dag.node_weights() {
             if let BufferNode::Compute { op, .. } = node {
-                if let Some(call) = op.as_any().downcast_ref::<ApprovedCublasLt>() {
+                if let Some(call) = op.as_any().downcast_ref::<CublasLtOutOfPlace>() {
                     if !f.fallback {
                         if !with_c && !earlier_narrowing {
                             assert!(call.bias.is_none());

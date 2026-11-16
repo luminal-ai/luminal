@@ -82,9 +82,12 @@ def normalize_output(output: str) -> str:
 def contains_term(normalized_output: str, term: str) -> bool:
     """Match a word or phrase without accepting it inside a larger word."""
     normalized_term = normalize_output(term)
-    return re.search(
-        rf"(?<![^\W_]){re.escape(normalized_term)}(?![^\W_])", normalized_output
-    ) is not None
+    return (
+        re.search(
+            rf"(?<![^\W_]){re.escape(normalized_term)}(?![^\W_])", normalized_output
+        )
+        is not None
+    )
 
 
 def validate_output(example: str, output: str):
@@ -112,7 +115,9 @@ def validate_output(example: str, output: str):
 
     expected_phrases = EXPECTED_OUTPUT.get(example)
     if expected_phrases is None:
-        raise ValueError(f"No expected output phrases configured for example {example!r}")
+        raise ValueError(
+            f"No expected output phrases configured for example {example!r}"
+        )
 
     for phrase in expected_phrases:
         if contains_term(normalized_output, phrase):
@@ -186,9 +191,13 @@ def validate_perf(example: str, output: str):
         value = metrics[metric_key]
         bound = "<=" if worse_if_higher else ">="
         if value is None:
-            failures.append(f"{metric_key} not found in output (limit {bound} {limit} {unit})")
+            failures.append(
+                f"{metric_key} not found in output (limit {bound} {limit} {unit})"
+            )
         elif (value > limit) if worse_if_higher else (value < limit):
-            failures.append(f"{metric_key} {value:.2f} {unit} (limit {bound} {limit} {unit})")
+            failures.append(
+                f"{metric_key} {value:.2f} {unit} (limit {bound} {limit} {unit})"
+            )
         else:
             checks.append(f"{metric_key} {value:.2f} {bound} {limit} {unit}")
 

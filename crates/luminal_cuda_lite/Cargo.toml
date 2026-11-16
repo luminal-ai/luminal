@@ -20,6 +20,8 @@ device = ["dep:cudarc", "cudarc/cublaslt"]
 [dependencies]
 luminal = { path = "../.." }
 anyhow = "1"
+# A lowered program is plain data that can be written out and read back.
+serde = { version = "1", features = ["derive"] }
 # Native half-width cuBLASLt host scalar storage and conversion.
 half = "2.7.1"
 rustc-hash = "2"
@@ -39,6 +41,7 @@ colored = "2.0.4"
 cudarc = { git = "https://github.com/luminal-ai/cudarc.git", rev = "a42f3897b6d00aded8e6ac7ad258c72d8bad5596", optional = true, features = ["cuda-version-from-build-system", "fallback-latest"] }
 
 [dev-dependencies]
+serde_json = "1"
 # Step B: the reference inventory the subset test pins against now lives
 # in its own crate.
 luminal_reference = { path = "../luminal_reference" }

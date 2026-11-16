@@ -25,28 +25,9 @@ use luminal::prelude::{DynMap, IntExpr};
 use crate::pt2_parser::{InputKind, ParsedPT2};
 use crate::pt2_schema::{Argument, InputSpec, OutputSpec};
 
-/// What the value in a slot is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotKind {
-    Tensor,
-    Int,
-    Float,
-    Bool,
-    /// `None`, a string, or an opaque object.
-    Object,
-}
-
-impl SlotKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            SlotKind::Tensor => "tensor",
-            SlotKind::Int => "int",
-            SlotKind::Float => "float",
-            SlotKind::Bool => "bool",
-            SlotKind::Object => "object",
-        }
-    }
-}
+/// What the value in a slot is. Defined with the slot readers, which every
+/// backend's runtime shares; the boundary plan states one per argument.
+pub use luminal_torch_slots::SlotKind;
 
 /// One argument of the program: one placeholder, in call order. A tensor
 /// constant the program holds is not an argument and has no slot.
@@ -235,6 +216,9 @@ fn constant_kind_of_json(value: &serde_json::Value) -> Option<SlotKind> {
 
 /// Read a program's boundary off its serialized form.
 pub fn plan(parsed: &ParsedPT2) -> Result<BoundaryPlan> {
+    // TEMPORARY (LUM-1580): a size computed from tensor data is refused by
+    // name here, before anything is planned over it.
+    crate::data_dependent::refuse(parsed)?;
     let graph = &parsed.program.graph_module.graph;
     let signature = &parsed.program.graph_module.signature;
 
@@ -373,4 +357,93 @@ pub fn plan(parsed: &ParsedPT2) -> Result<BoundaryPlan> {
         });
     }
     Ok(plan)
+}
+
+/// The boundary tables of the code object of a translated program: what
+/// every backend's code object states the same way.
+///
+/// A tensor argument the program reads is input `i` of the translation's
+/// inputs, which is the order of every backend's own input table. `leaves`
+/// is the frontend's output leaf rows, and `dims` the value each dimension
+/// has when the code object is built.
+pub fn code_boundary(
+    translation: &crate::translate::Translation,
+    leaves: &str,
+    dims: impl IntoIterator<Item = (luminal::prelude::Symbol, usize)>,
+) -> Result<luminal_torch_code::Boundary> {
+    use luminal_torch_code::{Boundary, Check, SlotAction};
+    let plan = &translation.boundary;
+    let actions = plan
+        .inputs
+        .iter()
+        .map(|slot| {
+            Ok(match slot.kind {
+                SlotKind::Tensor if slot.read => SlotAction::Read {
+                    input: translation
+                        .inputs
+                        .iter()
+                        .position(|input| input.graph_name == slot.graph_name)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "argument {:?} is read by the program but is not one of its \
+                                 inputs",
+                                slot.graph_name
+                            )
+                        })?,
+                },
+                SlotKind::Int => match &slot.binds {
+                    Some(name) => SlotAction::Dimension {
+                        symbol: *translation.symbols.get(name).ok_or_else(|| {
+                            anyhow!(
+                                "integer argument {:?} defines unknown symbol {name}",
+                                slot.graph_name
+                            )
+                        })?,
+                    },
+                    None => SlotAction::Skip,
+                },
+                _ => SlotAction::Skip,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // In one order whatever the map they came from, so the same program
+    // gives the same bytes.
+    let mut dims: Vec<_> = dims.into_iter().collect();
+    dims.sort_by_key(|(symbol, _)| symbol.to_string());
+    Ok(Boundary {
+        slots: plan.inputs.iter().map(|slot| slot.kind).collect(),
+        slot_names: plan
+            .inputs
+            .iter()
+            .map(|slot| slot.graph_name.clone())
+            .collect(),
+        actions,
+        leaves: crate::leaves::parse(leaves)?,
+        checks: plan
+            .checks
+            .iter()
+            .map(|check| Check {
+                condition: check.condition,
+                message: check.message.clone(),
+            })
+            .collect(),
+        dims,
+    })
+}
+
+/// The boundary tables of the code object of a graph that computes
+/// nothing: it forwards arguments, sizes and constants, and no slot is read
+/// by a program.
+pub fn forwarding_boundary(
+    plan: &BoundaryPlan,
+    leaves: &str,
+) -> Result<luminal_torch_code::Boundary> {
+    Ok(luminal_torch_code::Boundary::forwarding(
+        plan.inputs.iter().map(|slot| slot.kind).collect(),
+        plan.inputs
+            .iter()
+            .map(|slot| slot.graph_name.clone())
+            .collect(),
+        crate::leaves::parse(leaves)?,
+    ))
 }

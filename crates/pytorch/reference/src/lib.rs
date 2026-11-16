@@ -1,20 +1,25 @@
-//! Python bindings for the reference-backend PyTorch package.
+//! The reference backend's compiler, as a Python extension.
 //!
-//! The split is deliberate: `luminal_pytorch_utils` owns parsing and
-//! translation; this crate owns the reference runtime behind a pyo3 class.
-//! The future `luminal_cuda_lite` package reuses the same utils and swaps
-//! the runtime.
+//! This crate is the COMPILER half: `luminal_pytorch_utils` parses and
+//! translates a program, the reference runtime searches for a plan, and the
+//! result is handed over as a code object's bytes
+//! (`luminal_torch_reference_runtime::Code`). A call does not run here: the
+//! runtime crate builds every executable from those bytes, and depends on
+//! nothing in this crate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow};
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 
 use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate};
 use luminal_reference::{CompileOptions, ReferenceBindings, ReferenceRuntime, TypedBuffer};
+use luminal_torch_reference_runtime as runtime;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use runtime::buffers::typed_buffer;
+use runtime::exec::bind_extent;
 use rustc_hash::FxHashMap;
 
 use luminal::shape::SymbolBounds;
@@ -39,163 +44,25 @@ fn torch_code(dtype: DType) -> Result<u32> {
         .code())
 }
 
-fn typed_buffer(dtype: DType, bytes: &[u8]) -> Result<TypedBuffer> {
-    macro_rules! prim {
-        ($t:ty, $variant:ident) => {{
-            ensure!(
-                bytes.len().is_multiple_of(std::mem::size_of::<$t>()),
-                "{dtype:?} input is {} bytes, not a multiple of {}",
-                bytes.len(),
-                std::mem::size_of::<$t>()
-            );
-            TypedBuffer::$variant(
-                bytes
-                    .chunks_exact(std::mem::size_of::<$t>())
-                    .map(|c| <$t>::from_ne_bytes(c.try_into().unwrap()))
-                    .collect(),
-            )
-        }};
-    }
-    Ok(match dtype {
-        DType::F32 => prim!(f32, F32),
-        DType::F64 => prim!(f64, F64),
-        DType::Int => prim!(i32, I32),
-        DType::I64 => prim!(i64, I64),
-        DType::I8 => prim!(i8, I8),
-        DType::U8 => TypedBuffer::U8(bytes.to_vec()),
-        DType::I16 => prim!(i16, I16),
-        DType::Bool => TypedBuffer::bool8(bytes.to_vec())?,
-        // Narrow floats stage as CODES (storage only; the translator
-        // computes them in F32). Every bit pattern is a legal code.
-        DType::F16 => {
-            ensure!(
-                bytes.len().is_multiple_of(2),
-                "F16 input is {} bytes, not even",
-                bytes.len()
-            );
-            TypedBuffer::F16(
-                bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| half::f16::from_bits(u16::from_ne_bytes(*c)))
-                    .collect(),
-            )
-        }
-        DType::Bf16 => {
-            ensure!(
-                bytes.len().is_multiple_of(2),
-                "Bf16 input is {} bytes, not even",
-                bytes.len()
-            );
-            TypedBuffer::Bf16(
-                bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| half::bf16::from_bits(u16::from_ne_bytes(*c)))
-                    .collect(),
-            )
-        }
-        DType::F8E4M3FN => TypedBuffer::F8E4M3FN(
-            bytes
-                .iter()
-                .map(|b| float8::F8E4M3::from_bits(*b))
-                .collect(),
-        ),
-        DType::F8E5M2 => TypedBuffer::F8E5M2(
-            bytes
-                .iter()
-                .map(|b| float8::F8E5M2::from_bits(*b))
-                .collect(),
-        ),
-        DType::F8E4M3FNUZ => TypedBuffer::F8E4M3FNUZ(
-            bytes
-                .iter()
-                .map(|b| luminal_reference::narrow_float::F8E4M3FNUZ(*b))
-                .collect(),
-        ),
-        DType::F8E5M2FNUZ => TypedBuffer::F8E5M2FNUZ(
-            bytes
-                .iter()
-                .map(|b| luminal_reference::narrow_float::F8E5M2FNUZ(*b))
-                .collect(),
-        ),
-        other => bail!("reference backend does not support {other:?} inputs yet"),
-    })
-}
-
-/// A compiled reference-backend graph with its boundary tables.
-#[pyclass(unsendable)]
+/// One compilation in progress: the translated program and the reference
+/// runtime searching for its plan. This is the compiler's working state,
+/// not a compiled graph a caller holds: the product is the bytes
+/// [`Self::code`] returns, and nothing here is in them.
+#[pyclass]
 pub struct CompiledGraph {
     translation: Translation,
     runtime: ReferenceRuntime,
     /// The buffer each output was bound on, parallel to
     /// `translation.outputs`.
     output_buffers: Vec<i64>,
-    /// Output values bound on more than one buffer: reading those by
-    /// tensor is ambiguous, so they are read by buffer instead.
-    shared_outputs: HashSet<NodeIndex>,
     staged: HashMap<String, TypedBuffer>,
-    dirty: HashSet<String>,
     searched: bool,
+    /// The memory budget the search ran under; a code object carries it.
+    memory_budget_bytes: usize,
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
     dims: DynMap,
     bounds: SymbolBounds,
-}
-
-/// Solve a boundary extent `a * symbol + b = value` exactly. Never bind
-/// every symbol to the whole extent: e.g. the size of `3*s` is not `s`.
-fn bind_extent(expr: &IntExpr, value: usize) -> Result<Option<(Symbol, usize)>> {
-    use luminal::shape::Term;
-    let mut symbols = expr.to_symbols();
-    symbols.sort();
-    symbols.dedup();
-    if symbols.is_empty() {
-        ensure!(
-            expr.to_usize() == Some(value),
-            "input extent {value} does not match {expr:?}"
-        );
-        return Ok(None);
-    }
-    ensure!(
-        symbols.len() == 1,
-        "cannot bind multivariate input extent {expr:?}"
-    );
-    let mut stack: Vec<(i128, i128)> = Vec::new();
-    for term in expr.terms.read().iter() {
-        match term {
-            Term::Num(n) => stack.push((0, i128::from(*n))),
-            Term::Var(_) => stack.push((1, 0)),
-            op => {
-                let (a, b) = stack.pop().ok_or_else(|| anyhow!("malformed extent"))?;
-                let (c, d) = stack.pop().ok_or_else(|| anyhow!("malformed extent"))?;
-                let pair = match op {
-                    Term::Add => a.checked_add(c).zip(b.checked_add(d)),
-                    Term::Sub => a.checked_sub(c).zip(b.checked_sub(d)),
-                    Term::Mul if c == 0 => a.checked_mul(d).zip(b.checked_mul(d)),
-                    Term::Mul if a == 0 => c.checked_mul(b).zip(d.checked_mul(b)),
-                    Term::Div if c == 0 && d != 0 && a % d == 0 && b % d == 0 => {
-                        Some((a / d, b / d))
-                    }
-                    _ => None,
-                }
-                .ok_or_else(|| {
-                    anyhow!("input extent {expr:?} is not a supported affine dimension")
-                })?;
-                stack.push(pair);
-            }
-        }
-    }
-    let (scale, offset) = stack.pop().ok_or_else(|| anyhow!("empty extent"))?;
-    let numerator = value as i128 - offset;
-    ensure!(
-        scale > 0 && numerator >= 0 && numerator % scale == 0,
-        "input extent {value} violates {expr:?}"
-    );
-    let root = usize::try_from(numerator / scale)?;
-    Ok(Some((symbols[0], root)))
 }
 
 /// Resolve a symbolic recorder shape to concrete extents. Literals and
@@ -278,15 +145,6 @@ impl CompiledGraph {
     }
 
     #[getter]
-    fn output_shapes(&self) -> Vec<Vec<usize>> {
-        self.translation
-            .outputs
-            .iter()
-            .map(|output| resolve_shape(&output.shape, &self.dims))
-            .collect()
-    }
-
-    #[getter]
     fn output_mutations(&self) -> Vec<Option<String>> {
         self.translation
             .outputs
@@ -347,7 +205,6 @@ impl CompiledGraph {
         }
         let buffer = typed_buffer(dtype, bytes).map_err(to_py)?;
         self.staged.insert(name.to_string(), buffer);
-        self.dirty.insert(name.to_string());
         Ok(())
     }
 
@@ -369,16 +226,6 @@ impl CompiledGraph {
             .iter()
             .map(|check| check.message.clone())
             .collect()
-    }
-
-    /// Evaluate the program's runtime checks at the symbol values the
-    /// current call bound, and raise the first one it breaks with torch's
-    /// own message. Binding does not depend on this having run.
-    fn check_assertions(&self) -> PyResult<()> {
-        match self.translation.boundary.failed_check(&self.dims) {
-            Some(check) => Err(PyRuntimeError::new_err(check.message.clone())),
-            None => Ok(()),
-        }
     }
 
     /// The program's output leaves, in order: `(kind, source, index)`.
@@ -454,72 +301,6 @@ impl CompiledGraph {
             .collect()
     }
 
-    /// The selected reference program and its declared dimension bounds.
-    fn serialize_compiled(&self) -> PyResult<Vec<u8>> {
-        if !self.searched {
-            return Err(PyRuntimeError::new_err(
-                "search() must run before serialization",
-            ));
-        }
-        let inputs: Vec<_> = self
-            .translation
-            .inputs
-            .iter()
-            .map(|input| input.tensor)
-            .collect();
-        self.runtime
-            .serialize_compiled(&inputs, &self.output_buffers)
-            .map_err(to_py)
-    }
-
-    /// Install leader-selected plans without running search on this rank.
-    #[pyo3(signature = (artifact, *, memory_budget_bytes = None))]
-    fn load_compiled(
-        &mut self,
-        artifact: &[u8],
-        memory_budget_bytes: Option<usize>,
-    ) -> PyResult<()> {
-        if self.searched {
-            return Err(PyRuntimeError::new_err("compiled plan already installed"));
-        }
-        let inputs: Vec<_> = self
-            .translation
-            .inputs
-            .iter()
-            .map(|input| input.tensor)
-            .collect();
-        let outputs: Vec<_> = self
-            .translation
-            .outputs
-            .iter()
-            .map(|output| output.tensor)
-            .collect();
-        for (&symbol, &value) in &self.dims {
-            self.runtime.set_dim(symbol, value);
-        }
-        self.output_buffers = self
-            .runtime
-            .deserialize_compiled(
-                artifact,
-                &inputs,
-                &outputs,
-                memory_budget_bytes
-                    .unwrap_or(luminal_reference::runtime::DEFAULT_MEMORY_BUDGET_BYTES),
-            )
-            .map_err(to_py)?;
-        let mut by_tensor: HashMap<NodeIndex, HashSet<i64>> = HashMap::new();
-        for (output, &buffer) in self.translation.outputs.iter().zip(&self.output_buffers) {
-            by_tensor.entry(output.tensor).or_default().insert(buffer);
-        }
-        self.shared_outputs = by_tensor
-            .into_iter()
-            .filter(|(_, buffers)| buffers.len() > 1)
-            .map(|(tensor, _)| tensor)
-            .collect();
-        self.searched = true;
-        Ok(())
-    }
-
     /// Saturate and search. Every input must be staged first.
     #[pyo3(signature = (generations = None, *, max_intermediate_bytes = None, memory_budget_bytes = None, search_log = false))]
     fn search(
@@ -556,6 +337,7 @@ impl CompiledGraph {
             options.memory_budget_bytes = bytes;
         }
         options.search_log = search_log;
+        self.memory_budget_bytes = options.memory_budget_bytes;
         let search = || -> PyResult<()> {
             self.runtime
                 .search(&self.bounds, &self.dims, &data, &options)
@@ -570,85 +352,128 @@ impl CompiledGraph {
         Ok(())
     }
 
-    fn execute(&mut self) -> PyResult<()> {
+    /// The compiled graph as a code object's bytes: everything a call needs
+    /// and nothing the compiler needed. `leaves` is the output leaf table
+    /// the shared frontend states, as JSON.
+    ///
+    /// This is the compiler's product. The runtime
+    /// (`luminal_torch_reference_runtime`) builds every executable from
+    /// these bytes, in this process or after a save and a load.
+    fn code(&self, leaves: &str) -> PyResult<Vec<u8>> {
         if !self.searched {
             return Err(PyRuntimeError::new_err(
-                "search() must run before execute()",
+                "search() must run before a code object exists",
             ));
         }
-        let updates: Vec<_> = self
-            .translation
-            .inputs
-            .iter()
-            .filter(|input| self.dirty.contains(&input.graph_name))
-            .map(|input| {
-                (
-                    input.tensor,
-                    self.staged.get(&input.graph_name).unwrap().clone(),
-                )
-            })
-            .collect();
-        for (tensor, buffer) in updates {
-            self.runtime.set_data(tensor, buffer);
-        }
-        self.dirty.clear();
-        luminal_reference::search::with_interrupt_check(
-            || Python::attach(|py| py.check_signals().map_err(anyhow::Error::from)),
-            || self.runtime.execute().map_err(to_py),
-        )
-    }
-
-    /// Raw bytes of one output, in its native storage width.
-    fn output_bytes(&self, index: usize) -> PyResult<Vec<u8>> {
-        let output = self
-            .translation
-            .outputs
-            .get(index)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("no output at {index}")))?;
-        // A value bound on two buffers has no unambiguous read by tensor:
-        // take the buffer THIS output was bound on.
-        let by_buffer = self.shared_outputs.contains(&output.tensor);
-        let buffer = self.output_buffers[index];
-        macro_rules! read {
-            ($by_tensor:ident, $by_id:ident) => {
-                if by_buffer {
-                    self.runtime.get_buffer(buffer).and_then(|b| b.$by_id())
-                } else {
-                    self.runtime.$by_tensor(output.tensor)
-                }
-            };
-        }
-        let bytes = match output.dtype {
-            DType::F32 => as_bytes(read!(get_f32, as_f32).map_err(to_py)?),
-            DType::F64 => as_bytes(read!(get_f64, as_f64).map_err(to_py)?),
-            DType::Int => as_bytes(read!(get_i32, as_i32).map_err(to_py)?),
-            DType::I64 => as_bytes(read!(get_i64, as_i64).map_err(to_py)?),
-            DType::I8 => as_bytes(read!(get_i8, as_i8).map_err(to_py)?),
-            DType::U8 => as_bytes(read!(get_u8, as_u8).map_err(to_py)?),
-            DType::I16 => as_bytes(read!(get_i16, as_i16).map_err(to_py)?),
-            DType::Bool => read!(get_bool8, as_bool8).map_err(to_py)?.to_vec(),
-            // Narrow floats read back as their codes, in storage width.
-            DType::F16 => as_bytes(read!(get_f16, as_f16).map_err(to_py)?),
-            DType::Bf16 => as_bytes(read!(get_bf16, as_bf16).map_err(to_py)?),
-            DType::F8E4M3FN => as_bytes(read!(get_f8e4m3, as_f8e4m3).map_err(to_py)?),
-            DType::F8E5M2 => as_bytes(read!(get_f8e5m2, as_f8e5m2).map_err(to_py)?),
-            DType::F8E4M3FNUZ => as_bytes(read!(get_f8e4m3fnuz, as_f8e4m3fnuz).map_err(to_py)?),
-            DType::F8E5M2FNUZ => as_bytes(read!(get_f8e5m2fnuz, as_f8e5m2fnuz).map_err(to_py)?),
-            other => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "reference backend cannot read {other:?} outputs yet"
-                )));
-            }
-        };
-        Ok(bytes)
+        self.build_code(leaves)
+            .and_then(|code| code.to_bytes())
+            .map_err(to_py)
     }
 }
 
-fn as_bytes<T>(values: &[T]) -> Vec<u8> {
-    unsafe {
-        std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
-            .to_vec()
+impl CompiledGraph {
+    fn build_code(&self, leaves: &str) -> Result<runtime::Code> {
+        let translation = &self.translation;
+        let boundary = &translation.boundary;
+        let inputs: Vec<NodeIndex> = translation
+            .inputs
+            .iter()
+            .map(|input| input.tensor)
+            .collect();
+        let saved = self
+            .runtime
+            .serialize_compiled(&inputs, &self.output_buffers)?;
+        // The buffer each input is staged on is the saved plan's own.
+        let input_buffers =
+            luminal_reference::compiled_artifact::deserialize(&saved)?.input_buffers;
+
+        let inputs = translation
+            .inputs
+            .iter()
+            .zip(&input_buffers)
+            .map(|(input, buffer)| {
+                // A constant the program holds was staged at compile time;
+                // its elements go into the code object.
+                let constant = match &input.kind {
+                    InputKind::UserInput { .. } => None,
+                    InputKind::Buffer { .. } => {
+                        let staged = self.staged.get(&input.graph_name).ok_or_else(|| {
+                            anyhow!("constant {:?} was never staged", input.graph_name)
+                        })?;
+                        Some(runtime::buffers::buffer_bytes(input.dtype, staged)?.to_vec())
+                    }
+                };
+                Ok(runtime::Input {
+                    name: input.graph_name.clone(),
+                    dtype: runtime::buffers::torch_dtype(input.dtype)?,
+                    shape: input.shape.clone(),
+                    buffer: *buffer,
+                    constant,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rows = translation
+            .outputs
+            .iter()
+            .zip(&self.output_buffers)
+            .map(|(output, buffer)| {
+                let writes_back = output
+                    .mutation_target
+                    .as_ref()
+                    .map(|target| {
+                        boundary
+                            .argument(target)
+                            .map(|(slot, _)| slot)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "output {:?} writes back into {target:?}, which is not an \
+                                     argument",
+                                    output.graph_name
+                                )
+                            })
+                    })
+                    .transpose()?;
+                Ok(runtime::Row {
+                    name: output.graph_name.clone(),
+                    dtype: runtime::buffers::torch_dtype(output.dtype)?,
+                    shape: output.shape.clone(),
+                    buffer: *buffer,
+                    writes_back,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(runtime::Code {
+            format: runtime::FORMAT,
+            boundary: luminal_pytorch_utils::boundary::code_boundary(
+                translation,
+                leaves,
+                self.dims.iter().map(|(symbol, value)| (*symbol, *value)),
+            )?,
+            inputs,
+            rows,
+            memory_budget_bytes: self.memory_budget_bytes,
+            plan: Some(serde_json::from_slice(&saved).context("nesting the saved plan")?),
+        })
     }
+}
+
+/// The code object of a graph that computes nothing: it forwards arguments,
+/// sizes and constants. There is no plan and no slot is read by a program.
+#[pyfunction]
+fn forwarding_code(program: &[u8], leaves: &str) -> PyResult<Vec<u8>> {
+    let parsed = luminal_pytorch_utils::parse_program(program).map_err(to_py)?;
+    let plan = luminal_pytorch_utils::boundary::plan(&parsed).map_err(to_py)?;
+    runtime::Code {
+        format: runtime::FORMAT,
+        boundary: luminal_pytorch_utils::boundary::forwarding_boundary(&plan, leaves)
+            .map_err(to_py)?,
+        inputs: Vec::new(),
+        rows: Vec::new(),
+        memory_budget_bytes: luminal_reference::runtime::DEFAULT_MEMORY_BUDGET_BYTES,
+        plan: None,
+    }
+    .to_bytes()
+    .map_err(to_py)
 }
 
 /// The reference runtime's boundary for a translated program: every
@@ -725,15 +550,6 @@ fn load(parsed: &luminal_pytorch_utils::ParsedPT2) -> PyResult<CompiledGraph> {
     let (bindings, output_buffers) = bind(&translation)
         .context("binding the translated program's boundary")
         .map_err(to_py)?;
-    let mut buffers_of: HashMap<NodeIndex, HashSet<i64>> = HashMap::new();
-    for (output, &buffer) in translation.outputs.iter().zip(&output_buffers) {
-        buffers_of.entry(output.tensor).or_default().insert(buffer);
-    }
-    let shared_outputs = buffers_of
-        .into_iter()
-        .filter(|(_, buffers)| buffers.len() > 1)
-        .map(|(tensor, _)| tensor)
-        .collect();
     let runtime = ReferenceRuntime::load_with(&translation.graph, bindings)
         .context("loading the translated graph on the reference runtime")
         .map_err(to_py)?;
@@ -741,10 +557,9 @@ fn load(parsed: &luminal_pytorch_utils::ParsedPT2) -> PyResult<CompiledGraph> {
         translation,
         runtime,
         output_buffers,
-        shared_outputs,
         staged: HashMap::new(),
-        dirty: HashSet::new(),
         searched: false,
+        memory_budget_bytes: luminal_reference::runtime::DEFAULT_MEMORY_BUDGET_BYTES,
         dims,
         bounds,
     })
@@ -764,6 +579,10 @@ fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_torch_dtype_codes, m)?)?;
     m.add_function(wrap_pyfunction!(compile_graph, m)?)?;
     m.add_function(wrap_pyfunction!(boundary_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(forwarding_code, m)?)?;
+    // Test hooks for the shared slot readers and writers; no call path
+    // goes through them.
+    luminal_torch_slots::debug::add_to(m)?;
     Ok(())
 }
 

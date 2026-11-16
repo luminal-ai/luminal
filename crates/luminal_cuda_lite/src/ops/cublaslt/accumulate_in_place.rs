@@ -1,12 +1,12 @@
 //! An approved read-modify-write GEMM. C is the destination; there is no
 //! independent D operand, D descriptor, or conditional alias permission.
 use super::CublasLtForm;
-use super::approved::{
+use super::exec::{
+    LtActivation, LtBiasTemplate, LtCall, LtCallTemplate, LtComputation, LtReductionSchemeMask,
+};
+use super::out_of_place::{
     Bias, DECLARATIONS, Matrix, RULES, Scalars, WHITELIST, activation, bias, capture_dimensions,
     computation, dtype, matrix, member, reduction_scheme_mask, scalars,
-};
-use super::exec::{
-    LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation, LtReductionSchemeMask,
 };
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
@@ -119,7 +119,7 @@ pub struct CublasLtAccumulateInPlace {
 
 impl CublasLtAccumulateInPlace {
     pub fn prototype() -> Self {
-        let base = super::approved::ApprovedCublasLt::prototype();
+        let base = super::out_of_place::CublasLtOutOfPlace::prototype();
         Self {
             configuration: base.configuration,
             computation: base.computation,
@@ -139,45 +139,42 @@ impl CublasLtAccumulateInPlace {
             activation: LtActivation::Identity,
         }
     }
-    /// Evaluate the shared descriptor once. The vendor receives identical C/D
-    /// geometry, and bufferization ties C's read pointer to the result pointer.
-    pub fn resolve(&self, dims: &luminal::shape::DynMap) -> LtCall {
-        let a = self.a.resolve(dims);
-        let b = self.b.resolve(dims);
-        let c_and_d = self.c_and_d.resolve(dims);
-        LtCall {
-            computation: self.computation,
-            reduction_scheme_mask: self.reduction_scheme_mask,
+    /// The call this operation is, as plain data: what a lowered program
+    /// holds in its place. The vendor receives identical C/D geometry, and C
+    /// is the destination's own storage.
+    pub fn template(&self) -> LtCallTemplate {
+        let scalars = self.scalars.resolve();
+        let c_and_d = self.c_and_d.template();
+        LtCallTemplate {
             form: if self.bias.is_some() {
                 CublasLtForm::AccumulateBias
             } else {
                 CublasLtForm::Accumulate
             },
-            m: c_and_d.rows,
-            n: c_and_d.cols,
-            k: if self.trans_a { a.rows } else { a.cols },
+            computation: self.computation,
+            reduction_scheme_mask: self.reduction_scheme_mask,
             trans_a: self.trans_a,
             trans_b: self.trans_b,
-            a_dtype: self.a.dtype,
-            b_dtype: self.b.dtype,
-            d_dtype: self.c_and_d.dtype,
-            a,
-            b,
-            c: Some(LtCMatrixInput {
-                descriptor: c_and_d,
-                data_type: self.c_and_d.dtype,
-                operand: self.destination_operand(),
-            }),
+            a: self.a.template(),
+            b: self.b.template(),
+            c: Some((c_and_d.clone(), self.destination_operand())),
             d: c_and_d,
             scale_dtype: self.scale,
-            scalars: self.scalars.resolve(),
+            scalars,
             activation: self.activation,
-            bias: self.bias.as_ref().map(|bias| LtBiasInput {
-                operand: 2 + self.scalars.resolve().input_count(),
+            bias: self.bias.as_ref().map(|bias| LtBiasTemplate {
+                operand: 2 + scalars.input_count(),
                 data_type: bias.dtype,
-                batch_stride_in_elements: bias.batch_stride_in_elements.eval_with_dims(&[], dims),
+                batch_stride_in_elements: bias.batch_stride_in_elements.clone(),
             }),
+            in_place: Some(self.destination_operand()),
         }
+    }
+
+    /// Evaluate the shared descriptor once. The vendor receives identical C/D
+    /// geometry, and bufferization ties C's read pointer to the result pointer.
+    pub fn resolve(&self, dims: &luminal::shape::DynMap) -> LtCall {
+        self.template().resolve(dims)
     }
 }
 impl CublasLtAccumulateInPlace {
@@ -238,14 +235,8 @@ impl crate::HostOp for CublasLtAccumulateInPlace {
         &self,
         ctx: &crate::host::HostOpContext<'_>,
     ) -> anyhow::Result<Box<dyn crate::host::PreparedHostOp>> {
-        anyhow::ensure!(
-            ctx.inputs
-                .get(self.destination_operand())
-                .is_some_and(|c| c.ptr == ctx.dest.ptr),
-            "in-place cuBLASLt accumulation requires C and the result to share storage"
-        );
-        let call = self.resolve(ctx.dims);
-        crate::ops::cublaslt::device_call::prepare(&call, ctx.inputs, ctx.dest, ctx.workspace)
+        self.template()
+            .prepare(ctx.dims, ctx.inputs, ctx.dest, ctx.workspace)
             .map(|prepared| Box::new(prepared) as Box<dyn crate::host::PreparedHostOp>)
     }
 }

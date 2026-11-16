@@ -91,7 +91,7 @@ pub fn download_plan(
         if let luminal::bufferize::BufferNode::BufferOutput { slots } = node {
             for slot in slots {
                 let buffer = &plan.buffers[&slot.buffer];
-                let home = device.memory_plan()?.slices[&slot.buffer];
+                let home = device.program()?.slice(&slot.buffer).unwrap();
                 let bytes = luminal_cuda_lite::symbolic::bytes(&buffer.layout, dims)?;
                 let mut slot = slot.clone();
                 slot.layout = luminal_cuda_lite::symbolic::resolve_layout(&slot.layout, dims)?;

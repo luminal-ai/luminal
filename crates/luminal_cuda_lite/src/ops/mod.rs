@@ -128,8 +128,8 @@ impl RegisteredOp {
 pub fn cuda_registry() -> Vec<RegisteredOp> {
     let mut registry = cuda_registry_without_cublaslt();
     registry.push(RegisteredOp {
-        matcher: Box::new(cublaslt::approved::ApprovedCublasLtMatcher),
-        prototype: Box::new(cublaslt::approved::ApprovedCublasLt::prototype()),
+        matcher: Box::new(cublaslt::out_of_place::CublasLtOutOfPlaceMatcher),
+        prototype: Box::new(cublaslt::out_of_place::CublasLtOutOfPlace::prototype()),
     });
     registry.push(RegisteredOp {
         matcher: Box::new(cublaslt::accumulate_in_place::CublasLtAccumulateInPlaceMatcher),

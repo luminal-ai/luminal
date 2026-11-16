@@ -15,7 +15,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 import torch._dynamo
-from luminal_reference import Compiler
+from luminal_torch_reference_compiler import Compiler
 
 luminal_backend = Compiler()
 
@@ -415,7 +415,7 @@ def test_mark_dynamic_two_dim_via_torch_compile_starts_dynamic(device: torch.dev
 
 @pytest.mark.parametrize("bounded", [False, True])
 def test_compiler_explicit_dynamic_float_input(device, bounded):
-    from luminal_reference import Compiler
+    from luminal_torch_reference_compiler import Compiler
 
     class Model(torch.nn.Module):
         def forward(self, x):

@@ -1,6 +1,6 @@
 """Translator batch 3: unary special functions and division modes."""
 
-import luminal_reference
+import luminal_torch_reference_compiler
 import torch
 import torch.nn as nn
 
@@ -8,7 +8,7 @@ import torch.nn as nn
 def _check(model: nn.Module, *inputs: torch.Tensor, atol: float = 1e-5) -> None:
     torch.manual_seed(0)
     eager = model(*inputs)
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
     out = compiled(*inputs)
     assert out.shape == eager.shape, f"{out.shape} != {eager.shape}"
     assert torch.allclose(out.to(torch.float32), eager.to(torch.float32), atol=atol), (
@@ -18,7 +18,7 @@ def _check(model: nn.Module, *inputs: torch.Tensor, atol: float = 1e-5) -> None:
 
 def _check_exact(model: nn.Module, *inputs: torch.Tensor) -> None:
     eager = model(*inputs)
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
     out = compiled(*inputs)
     assert torch.equal(out.to(torch.float32), eager.to(torch.float32)), (
         f"{out} != {eager}"

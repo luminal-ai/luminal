@@ -2,7 +2,7 @@
 
 Implements a small PyTorch port of ``openai/whisper-tiny.en`` that mirrors the
 logical Whisper model, loads the official HuggingFace weights, and runs greedy
-decoding through ``torch.compile`` with ``luminal_cuda_lite.Compiler``.
+decoding through ``torch.compile`` with ``luminal_torch_cuda_lite_compiler.Compiler``.
 
 Usage::
 
@@ -403,7 +403,7 @@ def download_default_audio() -> Path:
 
 
 def main() -> None:
-    from luminal_cuda_lite import Compiler
+    from luminal_torch_cuda_lite_compiler import Compiler
 
     device = torch.device("cuda")
     if not torch.cuda.is_available():

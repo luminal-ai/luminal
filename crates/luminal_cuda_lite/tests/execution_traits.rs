@@ -231,13 +231,13 @@ fn a_familiar_label_without_cuda_traits_is_not_claimed() {
 
 #[test]
 fn all_cublaslt_dps_forms_keep_the_host_interface_when_cloned() {
-    use luminal_cuda_lite::ops::cublaslt::{CublasLtForm, approved::ApprovedCublasLt};
+    use luminal_cuda_lite::ops::cublaslt::{CublasLtForm, out_of_place::CublasLtOutOfPlace};
     for form in CublasLtForm::ALL {
-        let mut functional = ApprovedCublasLt::prototype();
+        let mut functional = CublasLtOutOfPlace::prototype();
         functional.c = form.has_c().then(|| functional.d.clone());
         functional.bias =
             form.has_bias()
-                .then(|| luminal_cuda_lite::ops::cublaslt::approved::Bias {
+                .then(|| luminal_cuda_lite::ops::cublaslt::out_of_place::Bias {
                     tensor: "bias".into(),
                     dtype: luminal::dtype::PlanDtype::F32,
                     batch_stride_in_elements: luminal::index_expr::IotaExpr::Lit(0),

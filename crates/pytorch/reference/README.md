@@ -12,7 +12,7 @@ Reference compilation uses AOTAutograd for inference and training:
 
 ```python
 import torch
-from luminal_reference import Compiler
+from luminal_torch_reference_compiler import Compiler
 
 compiler = Compiler(
     search_iterations=10,
@@ -42,7 +42,7 @@ translator fails compilation by name.
 One compiler instance can compile multiple graphs. `Compiler` is the only public
 compilation entry point; pass it to `torch.compile`.
 
-CUDA users import `Compiler` from `luminal_cuda_lite`. It accepts `search_iterations`,
+CUDA users import `Compiler` from `luminal_torch_cuda_lite_compiler`. It accepts `search_iterations`,
 `search_log`, `device_budget_bytes`, and `max_intermediate_bytes`, and compiles
 through the same AOTAutograd adapter; `graphs` holds its records.
 
@@ -60,7 +60,7 @@ choose which callable to invoke:
 ```python
 import torch
 from torch.fx.experimental.dynamic_spec import ShapeVar, ShapesSpec, TensorSpec
-from luminal_reference import Compiler
+from luminal_torch_reference_compiler import Compiler
 
 def model(x):
     return x.sin()
@@ -141,19 +141,28 @@ declared range arrives this way and is also guarded by PyTorch before the
 graph is called. A check the user wrote, such as
 `torch._check(x.shape[0] != 5)`, is asserted nowhere else: the compiled
 program evaluates it at each call and raises PyTorch's own message. These
-checks are separate from binding. Set `CompiledModel.runtime_assertions =
-False`, on the class or on one compiled model, to run without them.
+checks are separate from binding. Set
+`luminal_torch_reference_runtime.Code.runtime_assertions = False`, on the
+class or on one compiled graph, to run without them.
 
 ### Saving a compiled function
 
 Each compiler returns an `OutputCode`, the object PyTorch's AOT machinery
 holds for a compiled graph. That is what `torch.compile(...).aot_compile(...)`
 needs to save a compiled function and `torch.compiler.load_compiled_function`
-to load it. On the reference backend the saved form of a graph is the JSON
-document above, the plan search selected for it, and the constants it holds.
-A loaded function translates the graph, installs the plan, and runs: no search
-runs after a load. Forward, backward and inference graphs are all saved, and a
+to load it.
+
+On the reference backend a compiled graph is a *code object*: plain bytes
+that hold the slot kinds, what a call does with each slot, the rows the
+program writes, the output leaves, the constants and the plan search
+selected. `luminal_torch_reference_runtime.Code` is that code object as the
+`OutputCode` PyTorch holds, and saving one writes its bytes. A loaded
+function builds its executable from those bytes and runs: nothing is parsed,
+translated or searched after a load, and the loading process imports only the
+runtime package. Forward, backward and inference graphs are all saved, and a
 dynamic dimension keeps working at new sizes.
+`luminal_torch_reference_runtime.describe(code)` returns a code object's
+tables as plain data.
 
 The CUDA runtime has no serialized form of a searched plan yet, so
 `aot_compile` on the CUDA backend is refused by name.

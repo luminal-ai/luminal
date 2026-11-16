@@ -5,7 +5,7 @@
 use super::CublasLtForm;
 use anyhow::{Result, bail};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LtOrder {
     /// `CUBLASLT_ORDER_ROW`: element `(r, c)` at `r*ld + c`; `ld` is the
     /// ROW pitch and the descriptor reaches `ld*(rows-1) + cols`.
@@ -88,7 +88,7 @@ pub struct LtBiasInput {
     pub batch_stride_in_elements: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LtActivation {
     Identity,
     RectifiedLinear,
@@ -96,7 +96,7 @@ pub enum LtActivation {
 }
 
 /// The explicitly admitted input-rounding and computation contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LtComputation {
     Float16,
     Float32,
@@ -121,7 +121,7 @@ impl LtComputation {
 
 /// Allowed reduction schemes, elected by the complete whitelist configuration.
 /// Both masks permit NONE (zero), so this does not require split-K execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LtReductionSchemeMask {
     All,
     ComputeType,
@@ -138,7 +138,7 @@ impl LtReductionSchemeMask {
 
 /// Host values retain their declared precision, including signed zero and NaN bits.
 /// Device values are ordinary read operands; replay reads their current bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LtScalars {
     HostF16 {
         alpha_bits: u16,
@@ -425,5 +425,110 @@ impl LtCall {
             }
         }
         Ok(())
+    }
+}
+
+/// One matrix of a call before a call's dimensions are known: its sizes are
+/// expressions over the program's dimensions. [`LtDesc`] is what it becomes
+/// once they are.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LtMatrixTemplate {
+    pub dtype: luminal::dtype::PlanDtype,
+    pub order: LtOrder,
+    pub rows: luminal::index_expr::IotaExpr,
+    pub cols: luminal::index_expr::IotaExpr,
+    pub ld: luminal::index_expr::IotaExpr,
+    pub batch_count: luminal::index_expr::IotaExpr,
+    pub batch_stride_in_elements: luminal::index_expr::IotaExpr,
+}
+
+impl LtMatrixTemplate {
+    pub fn resolve(&self, dims: &luminal::shape::DynMap) -> LtDesc {
+        LtDesc {
+            rows: self.rows.eval_with_dims(&[], dims),
+            cols: self.cols.eval_with_dims(&[], dims),
+            ld: self.ld.eval_with_dims(&[], dims),
+            order: self.order,
+            batch_count: self.batch_count.eval_with_dims(&[], dims),
+            batch_stride_in_elements: self.batch_stride_in_elements.eval_with_dims(&[], dims),
+        }
+    }
+}
+
+/// The optional bias of a call before a call's dimensions are known.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LtBiasTemplate {
+    pub data_type: luminal::dtype::PlanDtype,
+    pub operand: usize,
+    pub batch_stride_in_elements: luminal::index_expr::IotaExpr,
+}
+
+/// A complete vendor call as plain data, before a call's dimensions are
+/// known. It is everything either cuBLASLt operation is at run time: both
+/// state the same call, and differ only in whether C is the destination's
+/// own storage.
+///
+/// [`LtCallTemplate::resolve`] evaluates it at a call's dimensions into the
+/// [`LtCall`] dispatch issues. Nothing in it names an operation or the
+/// e-graph it was elected in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LtCallTemplate {
+    pub form: CublasLtForm,
+    pub computation: LtComputation,
+    pub reduction_scheme_mask: LtReductionSchemeMask,
+    pub trans_a: bool,
+    pub trans_b: bool,
+    pub a: LtMatrixTemplate,
+    pub b: LtMatrixTemplate,
+    /// C, with the input operand it is read from. Absent C is represented
+    /// explicitly, as it is in [`LtCall`].
+    pub c: Option<(LtMatrixTemplate, usize)>,
+    pub d: LtMatrixTemplate,
+    pub scale_dtype: luminal::dtype::PlanDtype,
+    pub scalars: LtScalars,
+    pub activation: LtActivation,
+    pub bias: Option<LtBiasTemplate>,
+    /// For an in-place call: the input operand that must be the
+    /// destination's own storage, so the result accumulates into C.
+    pub in_place: Option<usize>,
+}
+
+impl LtCallTemplate {
+    /// Evaluate already-approved descriptor expressions. No layout inference,
+    /// transpose flip, legality filter, destination rebinding, or dtype
+    /// fallback.
+    pub fn resolve(&self, dims: &luminal::shape::DynMap) -> LtCall {
+        let a = self.a.resolve(dims);
+        let b = self.b.resolve(dims);
+        let d = self.d.resolve(dims);
+        LtCall {
+            form: self.form,
+            computation: self.computation,
+            reduction_scheme_mask: self.reduction_scheme_mask,
+            m: d.rows,
+            n: d.cols,
+            k: if self.trans_a { a.rows } else { a.cols },
+            trans_a: self.trans_a,
+            trans_b: self.trans_b,
+            a_dtype: self.a.dtype,
+            b_dtype: self.b.dtype,
+            d_dtype: self.d.dtype,
+            a,
+            b,
+            c: self.c.as_ref().map(|(matrix, operand)| LtCMatrixInput {
+                descriptor: matrix.resolve(dims),
+                data_type: matrix.dtype,
+                operand: *operand,
+            }),
+            d,
+            scale_dtype: self.scale_dtype,
+            scalars: self.scalars,
+            activation: self.activation,
+            bias: self.bias.as_ref().map(|bias| LtBiasInput {
+                operand: bias.operand,
+                data_type: bias.data_type,
+                batch_stride_in_elements: bias.batch_stride_in_elements.eval_with_dims(&[], dims),
+            }),
+        }
     }
 }

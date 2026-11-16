@@ -229,7 +229,7 @@ pub fn bare_symbol_of_value(value: &serde_json::Value) -> Option<String> {
 }
 
 /// The name of every `Symbol('...')` a sympy `srepr` string mentions.
-fn symbol_names_in(expr_str: &str) -> Vec<String> {
+pub(crate) fn symbol_names_in(expr_str: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut rest = expr_str;
     while let Some(at) = rest.find("Symbol(") {

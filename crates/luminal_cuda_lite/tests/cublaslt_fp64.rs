@@ -6,8 +6,8 @@ use luminal_cuda_lite::ops::cublaslt::{
     accumulate_in_place::{
         CONSTRUCTOR as IN_PLACE, CublasLtAccumulateInPlace, CublasLtAccumulateInPlaceMatcher,
     },
-    approved::{ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST},
     exec::{LtActivation, LtComputation, LtOrder, LtScalars},
+    out_of_place::{CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher, WHITELIST},
 };
 #[cfg(feature = "device")]
 mod support;
@@ -167,7 +167,7 @@ fn epilogue_fixture(sources: [Source; 2], bias: bool, activation: usize) -> Fixt
     fixture_with_epilogue(None, (false, false), sources, false, bias, activation)
 }
 
-fn calls(graph: &Graph, table: &str) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
+fn calls(graph: &Graph, table: &str) -> (Vec<CublasLtOutOfPlace>, Vec<CublasLtAccumulateInPlace>) {
     let matchers: Vec<_> = luminal_cuda_lite::cuda_registry()
         .into_iter()
         .map(|row| row.matcher)
@@ -204,10 +204,10 @@ fn calls(graph: &Graph, table: &str) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccu
         };
         match node.op.as_str() {
             CONSTRUCTOR => separate.push(
-                ApprovedCublasLtMatcher
+                CublasLtOutOfPlaceMatcher
                     .extract(&site)
                     .as_any()
-                    .downcast_ref::<ApprovedCublasLt>()
+                    .downcast_ref::<CublasLtOutOfPlace>()
                     .unwrap()
                     .clone(),
             ),
@@ -562,7 +562,7 @@ mod execution {
                 let BufferNode::Compute { op, .. } = node else {
                     return None;
                 };
-                if let Some(op) = op.as_any().downcast_ref::<ApprovedCublasLt>() {
+                if let Some(op) = op.as_any().downcast_ref::<CublasLtOutOfPlace>() {
                     assert!(!alias);
                     Some(op.resolve(&dimensions))
                 } else if let Some(op) = op.as_any().downcast_ref::<CublasLtAccumulateInPlace>() {

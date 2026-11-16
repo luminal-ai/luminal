@@ -8,13 +8,13 @@
 //! F32 reduction reassociation and FMA contraction remain permitted. Explicit
 //! casts retain their rounding boundaries; unproved epilogues remain generic.
 pub mod accumulate_in_place;
-pub mod approved;
 #[cfg(feature = "device")]
 pub mod device_call;
 pub mod election;
 pub mod exec;
+pub mod out_of_place;
 /// Optional C and bias arguments of an approved complete call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CublasLtForm {
     Base,
     Bias,

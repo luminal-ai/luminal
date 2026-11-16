@@ -345,7 +345,7 @@ mod tests {
             let dims = [('n'.into(), n)].into_iter().collect();
             for buffer in graph.buffers.values() {
                 if let Some(data) = buffer.lit.and_then(|lit| data.get(&lit)) {
-                    let home = device.memory_plan().unwrap().slices[&buffer.id];
+                    let home = device.program().unwrap().slice(&buffer.id).unwrap();
                     arena.write(home.offset, &data.bytes).unwrap();
                 }
             }
@@ -355,7 +355,7 @@ mod tests {
                 if let BufferNode::BufferOutput { slots } = node {
                     for slot in slots {
                         let buffer = &graph.buffers[&slot.buffer];
-                        let home = device.memory_plan().unwrap().slices[&slot.buffer];
+                        let home = device.program().unwrap().slice(&slot.buffer).unwrap();
                         let bytes = crate::symbolic::bytes(&buffer.layout, &dims).unwrap();
                         outputs.insert(
                             slot.index,

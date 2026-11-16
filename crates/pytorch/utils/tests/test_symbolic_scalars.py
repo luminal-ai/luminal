@@ -83,7 +83,9 @@ ALL_CASES = {**CASES, **HOST_SCALAR_CASES}
 
 
 def _compiler():
-    return importlib.import_module(f"luminal_{selected_backend()}").Compiler()
+    return importlib.import_module(
+        f"luminal_torch_{selected_backend()}_compiler"
+    ).Compiler()
 
 
 def _case_params():
@@ -194,7 +196,7 @@ def test_an_integer_argument_is_bound_by_value(device):
 
     (record,) = compiler.graphs
     # One slot per argument: `(kind, name, read, symbol)`.
-    slots = record.program._graph.input_slots
+    slots = record.slots
     assert [(kind, read) for kind, _, read, _ in slots] == [
         ("tensor", True),
         ("int", True),
@@ -283,7 +285,7 @@ def test_a_runtime_check_the_user_wrote_is_enforced(device):
         compiled(broken)
 
     (record,) = compiler.graphs
-    assert record.program._graph.runtime_assertions == [
+    assert list(record.checks) == [
         "Runtime assertion failed for expression Ne(u0, 5) on node 'ne'"
     ], "the declared range is decided by the range itself and needs no check"
     # The checks are separate from binding: switched off, the call runs.

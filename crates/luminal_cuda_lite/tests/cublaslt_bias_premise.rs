@@ -7,10 +7,10 @@ mod support;
 #[cfg(feature = "device")]
 #[path = "support/whitelist.rs"]
 mod whitelist;
-use luminal_cuda_lite::ops::cublaslt::approved::{
-    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR,
-};
 use luminal_cuda_lite::ops::cublaslt::exec::LtOrder;
+use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+    CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher,
+};
 
 fn graph(m: usize, per_row: bool) -> (Graph, NodeIndex, NodeIndex, NodeIndex, NodeIndex) {
     let mut graph = Graph::new();
@@ -25,7 +25,7 @@ fn graph(m: usize, per_row: bool) -> (Graph, NodeIndex, NodeIndex, NodeIndex, No
         };
     (graph, a.id, b.id, bias.id, output.id)
 }
-fn calls(model: &Graph) -> Vec<ApprovedCublasLt> {
+fn calls(model: &Graph) -> Vec<CublasLtOutOfPlace> {
     let runtime = CudaRuntime::load(model).unwrap();
     let graph = runtime.saturated_egraph(&Default::default()).unwrap();
     let index = SerializedIndex::new(&graph);
@@ -36,7 +36,7 @@ fn calls(model: &Graph) -> Vec<ApprovedCublasLt> {
             if node.op != CONSTRUCTOR || node.subsumed {
                 return None;
             }
-            let op = ApprovedCublasLtMatcher.extract(&ExtractionSite {
+            let op = CublasLtOutOfPlaceMatcher.extract(&ExtractionSite {
                 egraph: &graph,
                 node_id: id,
                 node,
@@ -44,7 +44,7 @@ fn calls(model: &Graph) -> Vec<ApprovedCublasLt> {
             });
             Some(
                 op.as_any()
-                    .downcast_ref::<ApprovedCublasLt>()
+                    .downcast_ref::<CublasLtOutOfPlace>()
                     .unwrap()
                     .clone(),
             )
@@ -111,7 +111,7 @@ mod device {
         let mut found = false;
         for node in runtime.plan().unwrap().dag.node_weights() {
             if let luminal::bufferize::BufferNode::Compute { op, .. } = node
-                && let Some(call) = op.as_any().downcast_ref::<ApprovedCublasLt>()
+                && let Some(call) = op.as_any().downcast_ref::<CublasLtOutOfPlace>()
             {
                 assert!(call.bias.is_some());
                 assert_eq!(call.resolve(&Default::default()).d.order, LtOrder::Col);

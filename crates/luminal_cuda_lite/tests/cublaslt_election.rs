@@ -164,10 +164,10 @@ fn cublaslt_contracts_are_registered_host_call_claims() {
         CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
             .expect("load decomposed");
 
-    let ctor = luminal_cuda_lite::ops::cublaslt::approved::CONSTRUCTOR;
+    let ctor = luminal_cuda_lite::ops::cublaslt::out_of_place::CONSTRUCTOR;
     assert!(default.contains(&ctor));
     assert!(!decomposed.active_allow_list().contains(&ctor));
-    let proto = luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt::prototype();
+    let proto = luminal_cuda_lite::ops::cublaslt::out_of_place::CublasLtOutOfPlace::prototype();
     let dps = luminal::layout_ir::ToDps::to_dps(&proto).unwrap();
     assert!(luminal_cuda_lite::as_host_op(dps.as_ref()).is_some());
     assert!(luminal_cuda_lite::as_kernel_op(dps.as_ref()).is_none());
@@ -237,23 +237,23 @@ fn narrow_matmul_followed_by_widening_never_mints_f32_computation() {
             let runtime = CudaRuntime::load(&cx).unwrap();
             let egraph = runtime.saturated_egraph(&Default::default()).unwrap();
             use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
-            use luminal_cuda_lite::ops::cublaslt::approved::{
-                ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR,
-            };
             use luminal_cuda_lite::ops::cublaslt::exec::LtComputation;
+            use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+                CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher,
+            };
             let index = SerializedIndex::new(&egraph);
             let mut count = 0;
             for (node_id, node) in &egraph.nodes {
                 if node.subsumed || node.op != CONSTRUCTOR {
                     continue;
                 }
-                let op = ApprovedCublasLtMatcher.extract(&ExtractionSite {
+                let op = CublasLtOutOfPlaceMatcher.extract(&ExtractionSite {
                     egraph: &egraph,
                     node_id,
                     node,
                     index: &index,
                 });
-                let op = op.as_any().downcast_ref::<ApprovedCublasLt>().unwrap();
+                let op = op.as_any().downcast_ref::<CublasLtOutOfPlace>().unwrap();
                 assert_eq!(dtype, DType::F16);
                 assert_eq!(op.computation, LtComputation::Float16);
                 count += 1;
@@ -275,10 +275,12 @@ fn bf16_operands_widened_before_matmul_mint_cublaslt_candidate() {
         .saturated_egraph(&Default::default())
         .expect("saturate mixed BF16 graph");
     let index = luminal::layout_ir::SerializedIndex::new(&egraph);
-    let matcher = luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLtMatcher;
+    let matcher = luminal_cuda_lite::ops::cublaslt::out_of_place::CublasLtOutOfPlaceMatcher;
     assert!(
         egraph.nodes.iter().any(|(node_id, node)| {
-            if node.op != luminal_cuda_lite::ops::cublaslt::approved::CONSTRUCTOR || node.subsumed {
+            if node.op != luminal_cuda_lite::ops::cublaslt::out_of_place::CONSTRUCTOR
+                || node.subsumed
+            {
                 return false;
             }
             let op = luminal::layout_ir::OpMatcher::extract(
@@ -292,7 +294,8 @@ fn bf16_operands_widened_before_matmul_mint_cublaslt_candidate() {
             );
             let spec = op
                 .as_any()
-                .downcast_ref::<luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt>()
+                .downcast_ref::<luminal_cuda_lite::ops::cublaslt::out_of_place::CublasLtOutOfPlace>(
+                )
                 .unwrap();
             spec.a.dtype == luminal::dtype::PlanDtype::Bf16
                 && spec.b.dtype == luminal::dtype::PlanDtype::Bf16

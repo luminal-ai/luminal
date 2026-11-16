@@ -9,7 +9,7 @@ use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::*;
 use luminal_cuda_lite::device::{CudaDevice, CudaStaging};
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::CublasLtAccumulateInPlace;
-use luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt;
+use luminal_cuda_lite::ops::cublaslt::out_of_place::CublasLtOutOfPlace;
 use luminal_cuda_lite::{CompileOptions, CudaBindings, CudaRuntime, HostBuffer};
 use std::time::Instant;
 
@@ -271,7 +271,7 @@ fn prepare(
             } => {
                 if op.as_any().is::<CublasLtAccumulateInPlace>() {
                     in_place += 1;
-                } else if op.as_any().is::<ApprovedCublasLt>() {
+                } else if op.as_any().is::<CublasLtOutOfPlace>() {
                     separate += 1;
                 } else if matches!(op.label(), "CopyGeneric" | "IndexMapApplyMaterialize") {
                     materializations += 1;

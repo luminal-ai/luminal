@@ -1,22 +1,23 @@
 //! Persistent graph-only executor for one program. All GPU work
 //! is submitted against caller-supplied device buffers. Tensor transfers are explicit caller work.
 use crate::{
-    arena::{ArenaPlan, ArenaSlice, ArenaStep},
+    arena::ArenaSlice,
     cuda_graph::{CopyKind, Executable, Graph, Node, Pinned, PinnedRange, copy_params},
     host::{DeviceRange, HostOpContext, PreparedHostOp},
-    kernels::{CodegenCtx, KernelLaunch},
+    kernels::KernelLaunch,
     layouts::CudaPlan,
+    lowered::{self, ArgRef, CopyCheck, HostCall, KernelCode, LaunchRecord, LoweredProgram, Step},
     symbolic::{self, Bounds, Expr},
 };
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use cudarc::{
     driver::{CudaContext, CudaStream, result, sys as cu},
     nvrtc::{CompileOptions, compile_ptx_with_opts},
 };
 use luminal::{
-    bufferize::{BufferId, BufferNode, SlotDescriptor},
+    bufferize::{BufferId, SlotDescriptor},
     layouts::DecodedLayout,
-    prelude::{FxHashMap, NodeIndex},
+    prelude::FxHashMap,
     shape::{DynMap, Symbol},
 };
 use std::{
@@ -110,6 +111,25 @@ fn nvrtc_compile_options() -> CompileOptions {
         .clone()
 }
 
+/// Compile one kernel's CUDA source to PTX. It needs the compiler library
+/// and no device, and the same source is compiled once per process.
+pub fn compile_kernel(source: &str) -> Result<String> {
+    static COMPILED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let compiled = COMPILED.get_or_init(Default::default);
+    if let Some(ptx) = compiled.lock().unwrap().get(source) {
+        return Ok(ptx.clone());
+    }
+    let ptx = compile_ptx_with_opts(source, nvrtc_compile_options())
+        .map_err(|e| anyhow!("NVRTC: {e:?}\n{source}"))?
+        .to_src();
+    compiled
+        .lock()
+        .unwrap()
+        .insert(source.to_string(), ptx.clone());
+    Ok(ptx)
+}
+
 /// Cumulative counters for inspecting replay, dynamic updates, and arena reuse.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GraphStats {
@@ -129,10 +149,64 @@ pub struct GraphStats {
     pub arena_bytes: usize,
     pub staging_bytes: usize,
 }
-struct Module {
+pub(crate) struct Module {
     raw: cu::CUmodule,
     func: cu::CUfunction,
     ctx: Arc<CudaContext>,
+}
+// SAFETY: a module and its function belong to the CUDA context, not to a
+// thread. Every use of the handles, and the unload in `Drop`, binds that
+// context on the calling thread first, so a module may be moved to, and
+// read from, any thread. cudarc states the same for its own module type.
+unsafe impl Send for Module {}
+unsafe impl Sync for Module {}
+
+/// The kernels loaded on a device, by their code: shared by every handle to
+/// the device, on any thread.
+pub(crate) type ModuleCache = Arc<std::sync::Mutex<HashMap<String, Module>>>;
+
+/// Lock a module cache. A panic while it was held leaves a map of whole
+/// entries, so the lock is taken either way.
+pub(crate) fn lock_modules(
+    cache: &ModuleCache,
+) -> std::sync::MutexGuard<'_, HashMap<String, Module>> {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The loaded function of one kernel: from the device's module cache, or
+/// loaded into it now. A kernel that is still source is compiled first, and
+/// counted in `compilations`; one that was compiled ahead is loaded as it
+/// is.
+pub(crate) fn load_kernel(
+    cache: &mut HashMap<String, Module>,
+    ctx: &Arc<CudaContext>,
+    code: &KernelCode,
+    label: &str,
+    compilations: &mut u64,
+) -> Result<cu::CUfunction> {
+    if let Some(module) = cache.get(code.text()) {
+        return Ok(module.func);
+    }
+    let ptx = match code {
+        KernelCode::Source(source) => {
+            *compilations += 1;
+            compile_kernel(source).with_context(|| format!("compile {label}"))?
+        }
+        KernelCode::Ptx(ptx) => ptx.clone(),
+    };
+    let image = CString::new(ptx)?;
+    let raw = unsafe { result::module::load_data(image.as_ptr().cast()) }?;
+    let mut module = Module {
+        raw,
+        func: std::ptr::null_mut(),
+        ctx: ctx.clone(),
+    };
+    module.func = unsafe { result::module::get_function(raw, CString::new("k")?) }?;
+    let func = module.func;
+    cache.insert(code.text().to_string(), module);
+    Ok(func)
 }
 impl Drop for Module {
     fn drop(&mut self) {
@@ -143,19 +217,49 @@ impl Drop for Module {
     }
 }
 struct Installed {
-    plan: CudaPlan,
-    storage: ArenaPlan,
-    bounds: Bounds,
+    /// The program as the steps this device runs. Nothing else of it is
+    /// kept: not the plan it was lowered from, and not its arena plan.
+    lowered: LoweredProgram,
     compiled: Option<CompiledPlan>,
 }
 use crate::CudaArena;
+
+/// The context object of a device ordinal: one for the whole process, kept
+/// with a stream that is never dropped.
+///
+/// cudarc waits for the whole context when the first stream is created on a
+/// context object, and CUDA refuses a context-wide wait while any stream of
+/// the context is capturing a graph (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`).
+/// A context object per device handle repeated that wait on every
+/// [`CudaDevice::new`], so creating a handle on one thread failed whenever
+/// another thread was capturing. Here the wait happens once per ordinal,
+/// under the lock, before any handle exists to capture with; the kept stream
+/// holds the count of streams above zero from then on, so creating a handle
+/// never waits for the context again.
+fn shared_context(ordinal: usize) -> Result<Arc<CudaContext>> {
+    type Kept = (Arc<CudaContext>, Arc<CudaStream>);
+    static CONTEXTS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, Kept>>> =
+        std::sync::OnceLock::new();
+    let mut contexts = CONTEXTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((ctx, _)) = contexts.get(&ordinal) {
+        return Ok(ctx.clone());
+    }
+    let ctx = CudaContext::new(ordinal)?;
+    let kept = ctx.new_stream()?;
+    contexts.insert(ordinal, (ctx.clone(), kept));
+    Ok(ctx)
+}
+
 /// Shared CUDA context, stream and compiled-module cache. It owns no program
 /// or execution arena. Executables created from it have independent state.
 #[derive(Clone)]
 pub struct CudaDevice {
-    ctx: Arc<CudaContext>,
+    pub(crate) ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
-    cache: Rc<std::cell::RefCell<HashMap<String, Module>>>,
+    pub(crate) cache: ModuleCache,
 }
 impl CudaDevice {
     /// Native stream/context dependency. Applications use cudarc directly for storage.
@@ -164,16 +268,113 @@ impl CudaDevice {
     }
 
     pub fn new(ordinal: usize) -> Result<Self> {
-        let ctx = CudaContext::new(ordinal)?;
+        let ctx = shared_context(ordinal)?;
         let stream = ctx.new_stream()?;
         Ok(Self {
             ctx,
             stream,
-            cache: Rc::new(Default::default()),
+            cache: Default::default(),
         })
     }
     pub fn executable(&self) -> CudaExecutable {
         CudaExecutable::new(self)
+    }
+
+    /// Device memory allocated in stream order on a stream of this device,
+    /// and freed in stream order on it when dropped: memory for the work of
+    /// one call. `raw_stream` is the stream's handle; the null handle is the
+    /// device's default stream.
+    pub fn allocate_on(&self, raw_stream: u64, bytes: usize) -> Result<CudaMemory> {
+        self.ctx.bind_to_thread()?;
+        CudaMemory::new(self.borrowed(raw_stream), bytes)
+    }
+
+    /// Whether a stream of this device is recording a graph capture.
+    pub fn is_capturing(&self, raw_stream: u64) -> Result<bool> {
+        self.ctx.bind_to_thread()?;
+        let mut status = cu::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        // SAFETY: `status` is a valid place to write.
+        unsafe {
+            cu::cuStreamIsCapturing(raw_stream as usize as cu::CUstream, &mut status).result()?;
+        }
+        Ok(status != cu::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
+    }
+
+    /// Copy host bytes to device memory the caller owns, and wait for the
+    /// copy.
+    /// # Safety
+    /// `device_ptr` must be a live allocation of at least `bytes.len()`
+    /// bytes on this device.
+    pub unsafe fn upload(&self, device_ptr: u64, bytes: &[u8]) -> Result<()> {
+        self.ctx.bind_to_thread()?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: upheld by the caller.
+        Ok(unsafe { result::memcpy_htod_sync(device_ptr, bytes) }?)
+    }
+
+    /// A stream another library owns, as a handle this crate's calls take.
+    /// It is not destroyed when the handle is dropped.
+    pub(crate) fn borrowed(&self, raw_stream: u64) -> Arc<CudaStream> {
+        // SAFETY: the owner keeps the stream alive for as long as work is
+        // issued on it through this handle.
+        unsafe {
+            self.ctx
+                .wrap_borrowed_stream(raw_stream as usize as cu::CUstream)
+        }
+    }
+}
+
+/// Device memory an application owns: an execution arena, or scratch for
+/// its own transfers. It is freed when dropped.
+pub struct CudaMemory {
+    buffer: cudarc::driver::CudaSlice<u8>,
+    stream: Arc<CudaStream>,
+}
+impl CudaMemory {
+    pub fn new(stream: Arc<CudaStream>, bytes: usize) -> Result<Self> {
+        // SAFETY: the owner initializes what it reads; program operations
+        // initialize their destinations.
+        let buffer = unsafe { stream.alloc(bytes.max(1))? };
+        Ok(Self { buffer, stream })
+    }
+    /// The memory as the arena of one execution.
+    pub fn arena(&mut self) -> CudaArena<'_> {
+        // SAFETY: this exclusive borrow keeps the allocation alive through
+        // the execution.
+        unsafe { CudaArena::from_raw(self.ptr(), self.bytes()) }
+    }
+    pub fn ptr(&self) -> u64 {
+        use cudarc::driver::DevicePtr;
+        self.buffer.device_ptr(&self.stream).0
+    }
+    pub fn bytes(&self) -> usize {
+        self.buffer.len()
+    }
+    /// Copy `out.len()` bytes at `offset` back to the host, and wait for
+    /// the copy.
+    pub fn read(&self, offset: usize, out: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(out.len())
+            .ok_or_else(|| anyhow!("readback range overflow"))?;
+        ensure!(end <= self.bytes(), "readback exceeds allocation");
+        self.stream
+            .memcpy_dtoh(&self.buffer.slice(offset..end), out)?;
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Copy host bytes in at `offset`, and wait for the copy.
+    pub fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| anyhow!("upload range overflow"))?;
+        ensure!(end <= self.bytes(), "upload exceeds allocation");
+        self.stream
+            .memcpy_htod(data, &mut self.buffer.slice_mut(offset..end))?;
+        self.stream.synchronize()?;
+        Ok(())
     }
 }
 
@@ -197,7 +398,7 @@ pub struct CudaExecutable {
     /// submitted through it.
     stream_is_borrowed: bool,
     pending_async: bool,
-    cache: Rc<std::cell::RefCell<HashMap<String, Module>>>,
+    cache: ModuleCache,
     stream: Arc<CudaStream>,
     ctx: Arc<CudaContext>,
     stats: GraphStats,
@@ -321,28 +522,36 @@ impl CudaExecutable {
             budget.is_none_or(|limit| bytes <= limit),
             "CUDA arena needs {bytes} bytes, exceeding budget {budget:?}"
         );
+        // Lower the plan once: every op's code generator runs here, and the
+        // plan is dropped. Nothing at a call asks an op for source.
+        self.install_lowered(lowered::lower(&plan, &storage, &bounds)?)
+    }
+
+    /// Install a lowered program: the one way a program reaches a device,
+    /// whether it was lowered in this process or read back from bytes.
+    pub fn install_lowered(&mut self, lowered: LoweredProgram) -> Result<()> {
         self.stream.synchronize()?;
         self.pending_async = false;
         self.installed = None;
-        self.stats.staging_bytes = storage.staging_bytes.max(1);
-        self.stats.arena_bytes = bytes;
+        self.stats.staging_bytes = lowered.staging_bytes.max(1);
+        self.stats.arena_bytes = lowered.arena_bytes;
         self.installed = Some(Installed {
-            plan,
-            storage,
-            bounds,
+            lowered,
             compiled: None,
         });
         Ok(())
     }
 
-    /// Device offsets and capacities. The caller initializes inputs before execution
-    /// and consumes outputs afterwards; execution performs no tensor transfers.
-    pub fn memory_plan(&self) -> Result<&ArenaPlan> {
+    /// The installed program: device offsets and capacities of every buffer,
+    /// and where each output is left. The caller initializes inputs before
+    /// execution and consumes outputs afterwards; execution performs no
+    /// tensor transfers.
+    pub fn program(&self) -> Result<&LoweredProgram> {
         Ok(&self
             .installed
             .as_ref()
             .ok_or_else(|| anyhow!("program is not installed"))?
-            .storage)
+            .lowered)
     }
 
     pub fn is_installed(&self) -> bool {
@@ -415,19 +624,20 @@ impl CudaExecutable {
             .installed
             .as_ref()
             .ok_or_else(|| anyhow!("Cuda program is not installed"))?;
-        for (dim, (lo, hi)) in &installed.bounds {
-            let value = dims
-                .get(dim)
-                .ok_or_else(|| anyhow!("dimension `{dim}` is unset"))?;
+        for dim in &installed.lowered.dims {
+            let (symbol, lo, hi) = (dim.symbol, dim.min, dim.max);
+            let value = *dims
+                .get(&symbol)
+                .ok_or_else(|| anyhow!("dimension `{symbol}` is unset"))?;
             ensure!(
                 value >= lo && value <= hi,
-                "dimension `{dim}`={value} is outside [{lo}, {hi}]"
+                "dimension `{symbol}`={value} is outside [{lo}, {hi}]"
             );
         }
         let installed = self.installed.as_mut().unwrap();
         // Resolve the caller's buffer ids to the plan's buffer ids.
         let mut external = ExternalBuffers::default();
-        for (id, buffer) in &installed.plan.buffers {
+        for (id, buffer) in &installed.lowered.buffers {
             if let Some(lit) = buffer.lit
                 && let Some(ptr) = external_ptrs.get(&lit)
             {
@@ -456,9 +666,7 @@ impl CudaExecutable {
         }
         if stale {
             installed.compiled = Some(CompiledPlan::compile(
-                &installed.plan,
-                &installed.storage,
-                &installed.bounds,
+                &installed.lowered,
                 dims,
                 self.stats.arena_base,
                 &external,
@@ -466,7 +674,7 @@ impl CudaExecutable {
                 &self.stream,
                 &staging.storage,
                 Rc::downgrade(&staging.identity),
-                &mut self.cache.borrow_mut(),
+                &mut lock_modules(&self.cache),
                 &mut self.stats,
             )?);
         }
@@ -480,8 +688,7 @@ impl CudaExecutable {
         // addresses retain the executable for external graph capture.
         if !stale && (compiled.external != external || dimensions_changed) {
             compiled.rebind_addresses(
-                &installed.plan,
-                &installed.storage,
+                &installed.lowered,
                 dims,
                 self.stats.arena_base,
                 &external,
@@ -518,7 +725,8 @@ struct HostVariant {
     _prepared: Box<dyn PreparedHostOp>,
 }
 struct HostNode {
-    source: NodeIndex,
+    /// The host step of the lowered program this node runs.
+    step: usize,
     dims: Vec<Symbol>,
     all_dims: bool,
     variants: VecDeque<Rc<HostVariant>>,
@@ -537,42 +745,16 @@ enum Addr {
 }
 fn resolve(
     addr: &Addr,
-    plan: &CudaPlan,
-    storage: &ArenaPlan,
+    lowered: &LoweredProgram,
     base: u64,
     external: &FxHashMap<BufferId, ExternalPtr>,
     dims: &DynMap,
 ) -> Result<u64> {
     Ok(match addr {
         Addr::Fixed(ptr) => *ptr,
-        Addr::Buffer(id) => range(plan, storage, id, base, external, dims)?.ptr,
-        Addr::Params => base + storage.parameters.offset as u64,
+        Addr::Buffer(id) => range(lowered, id, base, external, dims)?.ptr,
+        Addr::Params => base + lowered.parameters.offset as u64,
     })
-}
-enum CopyCheck {
-    Equal(Expr),
-    Capacity(Expr, Expr),
-}
-impl CopyCheck {
-    fn check(&self, bytes: usize, dims: &DynMap) -> Result<()> {
-        match self {
-            Self::Equal(other) => ensure!(bytes == other.eval(dims)?, "copy length mismatch"),
-            Self::Capacity(source, dest) => ensure!(
-                bytes <= source.eval(dims)? && bytes <= dest.eval(dims)?,
-                "value copy exceeds buffer capacity"
-            ),
-        }
-        Ok(())
-    }
-    fn variables(&self, vars: &mut BTreeSet<Symbol>) {
-        match self {
-            Self::Equal(other) => symbolic::vars(&other.0, vars),
-            Self::Capacity(a, b) => {
-                symbolic::vars(&a.0, vars);
-                symbolic::vars(&b.0, vars);
-            }
-        }
-    }
 }
 enum Action {
     Copy {
@@ -595,13 +777,13 @@ enum Action {
     Host(HostNode),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Launch {
-    grid: [u32; 3],
-    block: [u32; 3],
-    shared: u32,
+pub(crate) struct Launch {
+    pub(crate) grid: [u32; 3],
+    pub(crate) block: [u32; 3],
+    pub(crate) shared: u32,
 }
 impl Launch {
-    fn eval(spec: &KernelLaunch, dims: &DynMap) -> Result<Self> {
+    pub(crate) fn eval(spec: &KernelLaunch, dims: &DynMap) -> Result<Self> {
         let grid = spec
             .grid
             .iter()
@@ -619,7 +801,7 @@ impl Launch {
             shared: u32::try_from(spec.shared_bytes.eval(dims)?)?,
         })
     }
-    fn enabled(self) -> bool {
+    pub(crate) fn enabled(self) -> bool {
         self.grid.iter().all(|v| *v != 0)
     }
     fn params(
@@ -670,21 +852,22 @@ struct CompiledPlan {
     base: u64,
     staging_identity: std::rc::Weak<()>,
 }
-fn size(layout: &DecodedLayout) -> Result<Expr> {
-    Ok(symbolic::span(layout)?
-        * Expr::from(crate::host_buffer::dtype_bytes(
-            layout.dtype.ok_or_else(|| anyhow!("missing dtype"))?,
-        )?))
-}
-fn range(
-    plan: &CudaPlan,
-    storage: &ArenaPlan,
+pub(crate) fn range(
+    lowered: &LoweredProgram,
     id: &BufferId,
     base: u64,
     external: &FxHashMap<BufferId, ExternalPtr>,
     dims: &DynMap,
 ) -> Result<DeviceRange> {
-    let bytes = symbolic::bytes(&plan.buffers[id].layout, dims)?;
+    let record = lowered
+        .buffers
+        .get(id)
+        .ok_or_else(|| anyhow!("unbound buffer {id:?}"))?;
+    let bytes = record
+        .size
+        .as_ref()
+        .ok_or_else(|| anyhow!("buffer {id:?} has no storage span"))?
+        .eval(dims)?;
     // CALLER-OWNED (zero-copy): the buffer lives at an absolute device
     // address baked in for this execution, so there is no arena offset to
     // add and no slab capacity to check it against — only the caller's
@@ -700,9 +883,8 @@ fn range(
             bytes,
         });
     }
-    let slice = storage
-        .slices
-        .get(id)
+    let slice = record
+        .slice
         .ok_or_else(|| anyhow!("unbound buffer {id:?}"))?;
     ensure!(
         bytes <= slice.bytes,
@@ -713,6 +895,53 @@ fn range(
         bytes,
     })
 }
+/// Prepare one host step's library call at a call's dimensions and
+/// addresses. Nothing is issued: the prepared call is recorded, or run, by
+/// whoever asked for it.
+pub(crate) fn prepare_host(
+    record: &lowered::HostRecord,
+    lowered: &LoweredProgram,
+    dims: &DynMap,
+    base: u64,
+    external: &ExternalBuffers,
+    stream: &Arc<CudaStream>,
+) -> Result<Box<dyn PreparedHostOp>> {
+    let inputs = record
+        .inputs
+        .iter()
+        .map(|id| range(lowered, id, base, external, dims))
+        .collect::<Result<Vec<_>>>()?;
+    let dest = range(lowered, &record.dest, base, external, dims)?;
+    let workspace = DeviceRange {
+        ptr: base + record.workspace.offset as u64,
+        bytes: record.workspace.bytes,
+    };
+    Ok(match &record.call {
+        HostCall::CublasLt(call) => Box::new(
+            call.prepare(dims, &inputs, dest, workspace)
+                .with_context(|| format!("prepare {}", record.label))?,
+        ),
+        HostCall::Op {
+            op,
+            operand_info,
+            result_info,
+        } => {
+            let host = crate::as_host_op(op.as_ref())
+                .ok_or_else(|| anyhow!("{}: not a host operation", record.label))?;
+            let ctx = HostOpContext {
+                stream,
+                inputs: &inputs,
+                dest,
+                workspace,
+                dims,
+                operand_info: &resolve_slots(operand_info, dims)?,
+                result_info: &resolve_slots(result_info, dims)?,
+            };
+            unsafe { host.prepare(&ctx) }.with_context(|| format!("prepare {}", record.label))?
+        }
+    })
+}
+
 fn resolve_slots(
     slots: &[SlotDescriptor<DecodedLayout>],
     dims: &DynMap,
@@ -747,8 +976,7 @@ impl HostNode {
     #[allow(clippy::too_many_arguments)]
     fn select(
         &mut self,
-        plan: &CudaPlan,
-        storage: &ArenaPlan,
+        lowered: &LoweredProgram,
         dims: &DynMap,
         base: u64,
         external: &ExternalBuffers,
@@ -765,14 +993,13 @@ impl HostNode {
             stats.host_cache_hits += 1;
             return Ok(());
         }
-        self.capture(key, plan, storage, dims, base, external, stream, stats)
+        self.capture(key, lowered, dims, base, external, stream, stats)
     }
     /// Re-record the library call against the current addresses, cache aside.
     #[allow(clippy::too_many_arguments)]
     fn recapture(
         &mut self,
-        plan: &CudaPlan,
-        storage: &ArenaPlan,
+        lowered: &LoweredProgram,
         dims: &DynMap,
         base: u64,
         external: &ExternalBuffers,
@@ -780,59 +1007,25 @@ impl HostNode {
         stats: &mut GraphStats,
     ) -> Result<()> {
         let key = self.key(dims)?;
-        self.capture(key, plan, storage, dims, base, external, stream, stats)
+        self.capture(key, lowered, dims, base, external, stream, stats)
     }
     #[allow(clippy::too_many_arguments)]
     fn capture(
         &mut self,
         key: Vec<(Symbol, usize)>,
-        plan: &CudaPlan,
-        storage: &ArenaPlan,
+        lowered: &LoweredProgram,
         dims: &DynMap,
         base: u64,
         external: &ExternalBuffers,
         stream: &Arc<CudaStream>,
         stats: &mut GraphStats,
     ) -> Result<()> {
-        let BufferNode::Compute {
-            op,
-            reads,
-            writes,
-            operand_info,
-            result_info,
-            ..
-        } = &plan.dag[self.source]
-        else {
-            unreachable!()
+        let Step::Host(record) = &lowered.steps[self.step] else {
+            unreachable!("a host node names a host step")
         };
-        let host = crate::as_host_op(op.as_ref()).unwrap();
-        let inputs = reads
-            .iter()
-            .enumerate()
-            .filter(|(operand, _)| op.operand_reads_memory(*operand))
-            .map(|(_, id)| range(plan, storage, id, base, external, dims))
-            .collect::<Result<Vec<_>>>()?;
-        let workspace = storage
-            .workspaces
-            .get(&self.source)
-            .copied()
-            .unwrap_or_default();
-        let ctx = HostOpContext {
-            stream,
-            inputs: &inputs,
-            dest: range(plan, storage, &writes[0], base, external, dims)?,
-            workspace: DeviceRange {
-                ptr: base + workspace.offset as u64,
-                bytes: workspace.bytes,
-            },
-            dims,
-            operand_info: &resolve_slots(operand_info, dims)?,
-            result_info: &resolve_slots(result_info, dims)?,
-        };
-        let prepared =
-            unsafe { host.prepare(&ctx) }.with_context(|| format!("prepare {}", op.label()))?;
+        let prepared = prepare_host(record, lowered, dims, base, external, stream)?;
         let graph = Graph::capture(stream, prepared.as_ref())
-            .with_context(|| format!("capture {}", op.label()))?;
+            .with_context(|| format!("capture {}", record.label))?;
         stats.host_captures += 1;
         self.variants.push_front(Rc::new(HostVariant {
             key,
@@ -846,9 +1039,7 @@ impl HostNode {
 impl CompiledPlan {
     #[allow(clippy::too_many_arguments)]
     fn compile(
-        plan: &CudaPlan,
-        storage: &ArenaPlan,
-        bounds: &Bounds,
+        lowered: &LoweredProgram,
         dims: &DynMap,
         base: u64,
         external: &ExternalBuffers,
@@ -859,12 +1050,12 @@ impl CompiledPlan {
         cache: &mut HashMap<String, Module>,
         stats: &mut GraphStats,
     ) -> Result<Self> {
-        let schema: Vec<_> = bounds.keys().copied().collect();
+        let schema = lowered.schema();
         ensure!(
-            storage.staging_bytes <= staging.bytes().len(),
+            lowered.staging_bytes <= staging.bytes().len(),
             "staging capacity exceeded"
         );
-        let params = storage.staging_parameters;
+        let params = lowered.staging_parameters;
         let mut out = Self {
             executable: None,
             graph: None,
@@ -884,7 +1075,7 @@ impl CompiledPlan {
         };
         out.actions.push(Action::Copy {
             src: out.params.ptr(staging),
-            dst: base + storage.parameters.offset as u64,
+            dst: base + lowered.parameters.offset as u64,
             src_ref: Addr::Fixed(out.params.ptr(staging)),
             dst_ref: Addr::Params,
             kind: CopyKind::HtoD,
@@ -892,163 +1083,95 @@ impl CompiledPlan {
             other_size: None,
             bytes: out.params.bytes,
         });
-        for step in &storage.steps {
+        for (index, step) in lowered.steps.iter().enumerate() {
             match step {
-                ArenaStep::Node(node) => match &plan.dag[*node] {
-                    BufferNode::Compute {
-                        op,
-                        reads,
-                        writes,
-                        operand_info,
-                        result_info,
-                        ..
-                    } => {
-                        let label = op.label();
-                        if matches!(label, "BufferAlloc" | "BufferFree") {
-                            continue;
-                        }
-                        ensure!(
-                            writes.len() == 1,
-                            "{label}: CUDA requires a single destination"
-                        );
-                        ensure!(
-                            operand_info.len() == reads.len() && result_info.len() == writes.len(),
-                            "{label}: missing slot descriptors"
-                        );
-                        if let Some(host) = crate::as_host_op(op.as_ref()) {
-                            let dependencies = host.capture_dims();
-                            let mut host = HostNode {
-                                source: *node,
-                                all_dims: dependencies.is_none(),
-                                dims: dependencies.unwrap_or_default(),
-                                variants: VecDeque::new(),
-                                resource_slot: out.live_resources.len(),
-                            };
-                            host.select(plan, storage, dims, base, external, stream, stats)?;
-                            out.live_resources
-                                .push(host.variants.front().unwrap().clone());
-                            out.actions.push(Action::Host(host));
-                        } else if let Some(kernel) = crate::as_kernel_op(op.as_ref()) {
-                            let codegen =
-                                CodegenCtx::from_descriptors(label, operand_info, result_info)?;
-                            let mut args = reads[..reads.len() - writes.len()]
-                                .iter()
-                                .map(|id| {
-                                    range(plan, storage, id, base, external, dims).map(|r| r.ptr)
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-                            args.push(range(plan, storage, &writes[0], base, external, dims)?.ptr);
-                            args.push(base + storage.parameters.offset as u64);
-                            let refs: Vec<Addr> = reads[..reads.len() - writes.len()]
-                                .iter()
-                                .map(|id| Addr::Buffer(id.clone()))
-                                .chain([Addr::Buffer(writes[0].clone()), Addr::Params])
-                                .collect();
-                            for generated in kernel.codegen(&codegen)? {
-                                let mut source = crate::kernels::dtype_includes(&{
-                                    let mut dtypes = codegen.operand_dtypes.clone();
-                                    dtypes.extend_from_slice(&codegen.dest_dtypes);
-                                    dtypes
-                                });
-                                source.push_str(symbolic::CUDA_HELPERS);
-                                for (i, s) in out.schema.iter().enumerate() {
-                                    source.push_str(&format!(
-                                        "#define {} params[{i}]\n",
-                                        symbolic::variable(&s.to_string())
-                                    ));
-                                }
-                                source.push_str(&generated.source);
-                                let func = if let Some(module) = cache.get(&source) {
-                                    module.func
-                                } else {
-                                    let ptx =
-                                        compile_ptx_with_opts(&source, nvrtc_compile_options())
-                                            .map_err(|e| {
-                                                anyhow!("NVRTC {label}: {e:?}\n{source}")
-                                            })?;
-                                    let image = CString::new(ptx.to_src())?;
-                                    let raw = unsafe {
-                                        result::module::load_data(image.as_ptr().cast())
-                                    }?;
-                                    let mut module = Module {
-                                        raw,
-                                        func: std::ptr::null_mut(),
-                                        ctx: ctx.clone(),
-                                    };
-                                    module.func = unsafe {
-                                        result::module::get_function(raw, CString::new("k")?)
-                                    }?;
-                                    let func = module.func;
-                                    cache.insert(source, module);
-                                    stats.kernel_compilations += 1;
-                                    func
-                                };
-                                let grid = u32::try_from(
-                                    generated.n.capacity(bounds)?.max(1).div_ceil(256),
-                                )?;
-                                ensure!(
-                                    grid <= i32::MAX as u32,
-                                    "kernel capacity exceeds CUDA grid limit"
-                                );
-                                let launch = if let Some(spec) = &generated.launch {
-                                    for expr in spec.expressions() {
-                                        expr.capacity(bounds)?;
-                                    }
-                                    let shared = spec.shared_bytes.capacity(bounds)?;
-                                    if shared > 48 * 1024 {
-                                        unsafe {
-                                            result::function::set_function_attribute(func,cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,i32::try_from(shared)?)
-                                        }?;
-                                    }
-                                    Launch::eval(spec, dims)?
-                                } else {
-                                    Launch {
-                                        grid: [grid, 1, 1],
-                                        block: [256, 1, 1],
-                                        shared: 0,
-                                    }
-                                };
-                                out.actions.push(Action::Kernel {
-                                    func,
-                                    args: args.clone(),
-                                    refs: refs.clone(),
-                                    geometry: generated.launch,
-                                    launch,
-                                });
+                Step::Host(record) => {
+                    let mut host = HostNode {
+                        step: index,
+                        all_dims: record.capture_dims.is_none(),
+                        dims: record.capture_dims.clone().unwrap_or_default(),
+                        variants: VecDeque::new(),
+                        resource_slot: out.live_resources.len(),
+                    };
+                    host.select(lowered, dims, base, external, stream, stats)?;
+                    out.live_resources
+                        .push(host.variants.front().unwrap().clone());
+                    out.actions.push(Action::Host(host));
+                }
+                Step::Kernel(record) => {
+                    let mut args = Vec::with_capacity(record.args.len());
+                    let mut refs = Vec::with_capacity(record.args.len());
+                    for arg in &record.args {
+                        match arg {
+                            ArgRef::Buffer(id) => {
+                                args.push(range(lowered, id, base, external, dims)?.ptr);
+                                refs.push(Addr::Buffer(id.clone()));
                             }
-                        } else {
-                            bail!("no CUDA execution interface for {label}");
+                            ArgRef::Params => {
+                                args.push(base + lowered.parameters.offset as u64);
+                                refs.push(Addr::Params);
+                            }
                         }
                     }
-                    BufferNode::BufferCopy { src, dst, .. }
-                    | BufferNode::BufferCopyValue { src, dst, .. } => {
-                        let value_layout = plan.dag[*node].copy_value_layout();
-                        let from = range(plan, storage, src, base, external, dims)?;
-                        let to = range(plan, storage, dst, base, external, dims)?;
-                        let copy_size = value_layout.unwrap_or(&plan.buffers[src].layout);
-                        let bytes = size(copy_size)?.eval(dims)?;
-                        let check = if value_layout.is_some() {
-                            CopyCheck::Capacity(
-                                size(&plan.buffers[src].layout)?,
-                                size(&plan.buffers[dst].layout)?,
-                            )
-                        } else {
-                            CopyCheck::Equal(size(&plan.buffers[dst].layout)?)
-                        };
-                        check.check(bytes, dims)?;
-                        out.actions.push(Action::Copy {
-                            src: from.ptr,
-                            dst: to.ptr,
-                            src_ref: Addr::Buffer(src.clone()),
-                            dst_ref: Addr::Buffer(dst.clone()),
-                            kind: CopyKind::DtoD,
-                            size: size(copy_size)?,
-                            other_size: Some(check),
-                            bytes,
-                        });
-                    }
-                    _ => {}
-                },
+                    let code = lowered.kernels.get(record.code).ok_or_else(|| {
+                        anyhow!(
+                            "{}: the program holds no kernel {}",
+                            record.label,
+                            record.code
+                        )
+                    })?;
+                    let func = load_kernel(
+                        cache,
+                        ctx,
+                        code,
+                        &record.label,
+                        &mut stats.kernel_compilations,
+                    )?;
+                    let (geometry, launch) = match &record.launch {
+                        LaunchRecord::Default { grid_x } => (
+                            None,
+                            Launch {
+                                grid: [*grid_x, 1, 1],
+                                block: [lowered::DEFAULT_BLOCK, 1, 1],
+                                shared: 0,
+                            },
+                        ),
+                        LaunchRecord::Custom {
+                            geometry,
+                            max_dynamic_shared,
+                        } => {
+                            if let Some(bytes) = max_dynamic_shared {
+                                unsafe {
+                                    result::function::set_function_attribute(func,cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,*bytes)
+                                }?;
+                            }
+                            (Some(geometry.clone()), Launch::eval(geometry, dims)?)
+                        }
+                    };
+                    out.actions.push(Action::Kernel {
+                        func,
+                        args,
+                        refs,
+                        geometry,
+                        launch,
+                    });
+                }
+                Step::Copy(record) => {
+                    let from = range(lowered, &record.src, base, external, dims)?;
+                    let to = range(lowered, &record.dst, base, external, dims)?;
+                    let bytes = record.size.eval(dims)?;
+                    record.check.check(bytes, dims)?;
+                    out.actions.push(Action::Copy {
+                        src: from.ptr,
+                        dst: to.ptr,
+                        src_ref: Addr::Buffer(record.src.clone()),
+                        dst_ref: Addr::Buffer(record.dst.clone()),
+                        kind: CopyKind::DtoD,
+                        size: record.size.clone(),
+                        other_size: Some(record.check.clone()),
+                        bytes,
+                    });
+                }
             }
         }
         for (i, action) in out.actions.iter().enumerate() {
@@ -1259,8 +1382,7 @@ impl CompiledPlan {
     #[allow(clippy::too_many_arguments)]
     fn rebind_addresses(
         &mut self,
-        plan: &CudaPlan,
-        storage: &ArenaPlan,
+        lowered: &LoweredProgram,
         dims: &DynMap,
         base: u64,
         external: &ExternalBuffers,
@@ -1280,8 +1402,8 @@ impl CompiledPlan {
                     bytes,
                     ..
                 } => {
-                    *src = resolve(src_ref, plan, storage, base, external, dims)?;
-                    *dst = resolve(dst_ref, plan, storage, base, external, dims)?;
+                    *src = resolve(src_ref, lowered, base, external, dims)?;
+                    *dst = resolve(dst_ref, lowered, base, external, dims)?;
                     if *bytes != 0
                         && self
                             .executable
@@ -1301,7 +1423,7 @@ impl CompiledPlan {
                     ..
                 } => {
                     for (arg, addr) in args.iter_mut().zip(refs.iter()) {
-                        *arg = resolve(addr, plan, storage, base, external, dims)?;
+                        *arg = resolve(addr, lowered, base, external, dims)?;
                     }
                     let mut args = args.clone();
                     let mut pointers: Vec<_> =
@@ -1317,7 +1439,7 @@ impl CompiledPlan {
                     }
                 }
                 Action::Host(host) => {
-                    host.recapture(plan, storage, dims, base, external, stream, stats)?;
+                    host.recapture(lowered, dims, base, external, stream, stats)?;
                     let variant = host.variants.front().unwrap().clone();
                     if self
                         .executable
@@ -1388,5 +1510,45 @@ impl CompiledPlan {
         }
         stats.launches += 1;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Creating a device handle waits for nothing on the context, so it
+    /// works while a stream of another thread is capturing a graph, when a
+    /// context-wide wait is an error.
+    #[test]
+    fn a_device_handle_is_created_while_another_stream_captures() {
+        let capturing = CudaDevice::new(0).expect("CUDA device 0");
+        capturing.ctx.bind_to_thread().unwrap();
+        // SAFETY: the stream is this handle's own, and the capture is ended
+        // below before the handle is dropped.
+        unsafe {
+            cu::cuStreamBeginCapture_v2(
+                capturing.stream.cu_stream(),
+                cu::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .result()
+            .expect("begin a capture");
+        }
+        let created = std::thread::spawn(|| CudaDevice::new(0).map(|_| ()))
+            .join()
+            .expect("the creating thread");
+        let mut graph = std::ptr::null_mut();
+        // SAFETY: the capture began above on this stream.
+        unsafe {
+            cu::cuStreamEndCapture(capturing.stream.cu_stream(), &mut graph)
+                .result()
+                .expect("end the capture");
+            if !graph.is_null() {
+                cu::cuGraphDestroy(graph)
+                    .result()
+                    .expect("destroy the captured graph");
+            }
+        }
+        created.expect("a device handle created while another stream captures");
     }
 }

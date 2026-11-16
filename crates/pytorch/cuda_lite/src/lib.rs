@@ -1,8 +1,10 @@
-//! Python bindings for the CUDA-lite PyTorch backend.
+//! The CUDA-lite PyTorch compiler.
 //!
 //! This is the GPU twin of the `luminal_reference_py` crate: the same
-//! translation seam (`luminal_pytorch_utils`), but the runtime behind the
-//! pyo3 class is [`luminal_cuda_lite::CudaRuntime`].
+//! translation seam (`luminal_pytorch_utils`), with
+//! [`luminal_cuda_lite::CudaRuntime`] doing the search. What it produces is
+//! a code object (`luminal_torch_cuda_lite_runtime::Code`) as bytes; nothing
+//! in this crate runs a call.
 //!
 //! THE BOUNDARY IS DECLARED AT LOAD. [`bind`] states every boundary tensor
 //! once, in the vocabulary of [`luminal_cuda_lite::CudaBindings`]: one buffer
@@ -16,12 +18,11 @@
 //! buffer at its own layout. A user-visible output is bound at eager's exact
 //! strides, so the tensor the caller receives is laid out the way the
 //! uncompiled program lays it out.
-//! Python addresses buffers, not tensors: `set_device_ptr(buffer, ptr, bytes)`
-//! before each execution.
 //!
-//! The runtime also runs on a borrowed `CUstream` and takes its
-//! intermediate-scratch arena from the caller per execution
-//! (`use_borrowed_stream`, `arena_bytes`/`execute`).
+//! THE CODE OBJECT IS BUILT AFTER SEARCH. [`CompiledGraph::code`] lowers the
+//! selected plan to the steps a device runs, compiles every kernel, and
+//! writes the boundary tables beside them. The searched plan, the
+//! translation and this crate stay behind.
 
 use std::collections::HashMap;
 
@@ -34,6 +35,8 @@ use luminal_cuda_lite::bindings::{BoundaryLayout, CudaBindings};
 use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer, harness_search_options};
 use luminal_pytorch_utils::translate::parse_dim_expr;
 use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate};
+use luminal_torch_cuda_lite_runtime as runtime;
+use luminal_torch_slots::TorchDtype;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
@@ -49,20 +52,47 @@ fn kind_name(kind: &InputKind) -> &'static str {
     }
 }
 
+/// The torch dtype a tensor of this storage dtype crosses the boundary as.
+fn torch_dtype(dtype: DType) -> Result<TorchDtype> {
+    Ok(match dtype {
+        DType::F32 => TorchDtype::Float32,
+        DType::F64 => TorchDtype::Float64,
+        DType::F16 => TorchDtype::Float16,
+        DType::Bf16 => TorchDtype::Bfloat16,
+        DType::Int => TorchDtype::Int32,
+        DType::I64 => TorchDtype::Int64,
+        DType::I8 => TorchDtype::Int8,
+        DType::U8 => TorchDtype::Uint8,
+        DType::I16 => TorchDtype::Int16,
+        DType::Bool => TorchDtype::Bool,
+        other => bail!("the CUDA backend has no torch dtype for {other:?} at its boundary"),
+    })
+}
+
 fn torch_code(dtype: DType) -> Result<u32> {
     Ok(TorchDType::try_from(dtype)
         .map_err(|d| anyhow!("no torch dtype for {d:?}"))?
         .code())
 }
 
-/// Host transfer storage owned by the Python application wrapper.
-#[pyclass(unsendable)]
-pub struct ExecutionStaging {
-    #[cfg(feature = "device")]
-    inner: luminal_cuda_lite::device::CudaStaging,
-}
+/// What the frontend states as the maximum of a dimension torch gave no
+/// upper bound.
+const NO_UPPER_BOUND: usize = (i64::MAX - 1) as usize;
 
-/// A compiled CUDA-lite graph with its boundary tables.
+/// One tensor constant the program holds, as the frontend states it: its
+/// graph name, shape, element strides, and the bytes its strides reach from
+/// its first element.
+type ConstantRow = (String, Vec<i64>, Vec<i64>, Vec<u8>);
+
+/// One compilation in progress: the translated program and the search
+/// engine working on it. This is the compiler's working state, not a
+/// compiled graph a caller holds: the product is the bytes [`Self::code`]
+/// returns, and nothing here is in them.
+///
+/// `unsendable`, because `CudaRuntime` is the search engine itself: its op
+/// registry is shared through `Rc`, and it holds the device executable it
+/// profiles candidates on, with a captured CUDA graph's handles. Python
+/// creates one of these for one compile, on the thread that compiles.
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
     translation: Translation,
@@ -81,6 +111,9 @@ pub struct CompiledGraph {
     /// hints and updated from real input shapes as they are bound.
     dims: DynMap,
     bounds: SymbolBounds,
+    /// The layout each translation output was bound at, by output index,
+    /// parsed.
+    output_declared: Vec<BoundaryLayout>,
 }
 
 /// Resolve a symbolic recorder shape to concrete extents. Literals and
@@ -228,26 +261,6 @@ impl CompiledGraph {
         self.output_layouts.clone()
     }
 
-    /// The buffer id the installed plan writes this output's bytes into.
-    fn output_backing_buffer(&self, name: &str) -> PyResult<i64> {
-        let slot = self.output_position(name)?;
-        self.runtime.output_slot_backing_buffer(slot).map_err(to_py)
-    }
-
-    /// The bytes that backing buffer spans at the dims bound now.
-    fn output_span_bytes(&self, name: &str) -> PyResult<usize> {
-        let slot = self.output_position(name)?;
-        self.runtime.output_slot_span_bytes(slot).map_err(to_py)
-    }
-
-    /// The element strides the installed plan elected for this output.
-    fn output_elected_strides(&self, name: &str) -> PyResult<Vec<i64>> {
-        let slot = self.output_position(name)?;
-        self.runtime
-            .output_slot_elected_strides(slot)
-            .map_err(to_py)
-    }
-
     /// Record the concrete shapes of one call's inputs by graph name.
     /// Their axes bind the graph's symbolic dims, so a symbolic input runs
     /// at a new extent without re-exporting. Dims only: no payload crosses
@@ -297,16 +310,6 @@ impl CompiledGraph {
             .collect()
     }
 
-    /// Evaluate the program's runtime checks at the symbol values the
-    /// current call bound, and raise the first one it breaks with torch's
-    /// own message. Binding does not depend on this having run.
-    fn check_assertions(&self) -> PyResult<()> {
-        match self.translation.boundary.failed_check(&self.dims) {
-            Some(check) => Err(PyRuntimeError::new_err(check.message.clone())),
-            None => Ok(()),
-        }
-    }
-
     /// The program's output leaves, in order: `(kind, source, index)`.
     /// `source` is `"program"` (index: the output row), `"input"` (index:
     /// the argument slot), `"expression"` or `"literal"`.
@@ -315,50 +318,25 @@ impl CompiledGraph {
         self.translation.boundary.output_rows()
     }
 
-    /// Address one EXTERNAL buffer for the next execution: the caller's
-    /// allocation at `ptr` IS the storage every binding on that buffer names.
-    /// One pointer per buffer — a writeback and the input it mutates share the
-    /// buffer and the pointer.
+    /// The code object of the searched program, as bytes: everything a call
+    /// needs and nothing this compiler needed.
     ///
-    /// The caller owns `ptr` and must keep the allocation live, at the
-    /// buffer's bound layout, until `execute` returns.
-    fn set_device_ptr(&mut self, buffer: i64, ptr: u64, bytes: usize) -> PyResult<()> {
-        // SAFETY: upheld by the Python layer, which binds the pointer of a
-        // tensor it holds for the duration of the call.
-        unsafe { self.runtime.set_device_ptr(buffer, ptr, bytes) }.map_err(to_py)
-    }
-
-    /// Forget a buffer's address. The next `execute` refuses by name until one
-    /// is supplied again.
-    fn clear_device_ptr(&mut self, buffer: i64) {
-        self.runtime.clear_device_ptr(buffer);
-    }
-
-    /// Bytes of intermediate-scratch arena the selected plan set needs for one
-    /// execution. The Python layer allocates exactly this from PyTorch's
-    /// caching allocator, passes it to [`Self::execute`], and frees it after.
-    #[cfg(feature = "device")]
-    fn arena_bytes(&self) -> PyResult<usize> {
-        self.runtime.arena_bytes().map_err(to_py)
-    }
-
-    /// Allocate a host staging object owned by the Python wrapper.
-    #[cfg(feature = "device")]
-    fn allocate_staging(&mut self) -> PyResult<ExecutionStaging> {
-        Ok(ExecutionStaging {
-            inner: self.runtime.allocate_staging().map_err(to_py)?,
-        })
-    }
-
-    /// Run on PyTorch's current stream (`torch.cuda.current_stream().cuda_stream`).
-    #[cfg(feature = "device")]
-    fn use_borrowed_stream(&mut self, raw_stream: u64) {
-        self.runtime.use_borrowed_stream(raw_stream);
-    }
-
-    #[cfg(feature = "device")]
-    fn use_owned_stream(&mut self) {
-        self.runtime.use_owned_stream();
+    /// `leaves` is the frontend's output leaf rows (JSON text). `constants`
+    /// states each tensor constant the program holds: `(graph name, shape,
+    /// element strides, the bytes its strides reach from its first
+    /// element)`. `aliases` states each output that is a view of an earlier
+    /// boundary tensor: `(output, owner, element offset past the owner's
+    /// first element)`.
+    #[pyo3(signature = (leaves, constants = Vec::new(), aliases = Vec::new()))]
+    fn code(
+        &self,
+        leaves: &str,
+        constants: Vec<ConstantRow>,
+        aliases: Vec<(String, String, i64)>,
+    ) -> PyResult<Vec<u8>> {
+        self.build_code(leaves, &constants, &aliases)
+            .and_then(|code| code.to_bytes())
+            .map_err(to_py)
     }
 
     /// Override a dynamic dimension's value before `search`, by PT2 symbol
@@ -415,76 +393,154 @@ impl CompiledGraph {
         )
         .map_err(to_py)
     }
-
-    #[cfg_attr(not(feature = "device"), allow(unused_variables, unused_mut))]
-    fn execute(
-        &mut self,
-        arena_ptr: u64,
-        arena_bytes: usize,
-        mut staging: PyRefMut<'_, ExecutionStaging>,
-    ) -> PyResult<()> {
-        if !self.searched {
-            return Err(PyRuntimeError::new_err(
-                "search() must run before execute()",
-            ));
-        }
-        #[cfg(feature = "device")]
-        {
-            // SAFETY: the Python wrapper holds this PyTorch allocation through completion.
-            let arena = unsafe { luminal_cuda_lite::CudaArena::from_raw(arena_ptr, arena_bytes) };
-            self.runtime
-                .execute(arena, &mut staging.inner)
-                .map_err(to_py)
-        }
-        #[cfg(not(feature = "device"))]
-        {
-            // Another workspace crate may enable the runtime's device feature
-            // without enabling this wrapper's feature or staging storage.
-            Err(PyRuntimeError::new_err(
-                "CUDA execution requires the Python wrapper's `device` feature",
-            ))
-        }
-    }
-
-    /// The runtime's cumulative counters, or None before it touched a device.
-    fn graph_stats(&self) -> Option<HashMap<String, u64>> {
-        #[cfg(feature = "device")]
-        {
-            self.runtime.graph_stats().map(|stats| {
-                HashMap::from([
-                    ("launches".to_string(), stats.launches),
-                    ("instantiations".to_string(), stats.instantiations),
-                    ("graph_cache_hits".to_string(), stats.graph_cache_hits),
-                    ("host_captures".to_string(), stats.host_captures),
-                    ("host_cache_hits".to_string(), stats.host_cache_hits),
-                    ("node_updates".to_string(), stats.node_updates),
-                    ("address_rebinds".to_string(), stats.address_rebinds),
-                    ("kernel_compilations".to_string(), stats.kernel_compilations),
-                    ("arena_generation".to_string(), stats.arena_generation),
-                    ("arena_base".to_string(), stats.arena_base),
-                    ("arena_bytes".to_string(), stats.arena_bytes as u64),
-                    ("staging_bytes".to_string(), stats.staging_bytes as u64),
-                ])
-            })
-        }
-        #[cfg(not(feature = "device"))]
-        {
-            None
-        }
-    }
 }
 
 impl CompiledGraph {
-    /// The graph value one output name names.
-    /// A translation output's position, which is its slot in the bound
-    /// program: outputs are bound in translation order, one slot each, so a
-    /// value returned under two names has two slots and each name finds its own.
-    fn output_position(&self, name: &str) -> PyResult<usize> {
-        self.translation
+    /// The code object of the searched program.
+    fn build_code(
+        &self,
+        leaves: &str,
+        constants: &[ConstantRow],
+        aliases: &[(String, String, i64)],
+    ) -> Result<runtime::Code> {
+        ensure!(
+            self.searched,
+            "search() must run before a code object is built"
+        );
+        let translation = &self.translation;
+        let boundary = &translation.boundary;
+        // The argument slot a graph name occupies.
+        let slot_of = |name: &str| {
+            boundary
+                .argument(name)
+                .map(|(slot, _)| slot)
+                .ok_or_else(|| anyhow!("{name:?} is not an argument of the program"))
+        };
+        let input_of = |name: &str| {
+            translation
+                .inputs
+                .iter()
+                .position(|input| input.graph_name == name)
+        };
+
+        let written: std::collections::HashSet<&str> = translation
             .outputs
             .iter()
-            .position(|output| output.graph_name == name)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("{name:?} is not a graph output")))
+            .filter_map(|output| output.mutation_target.as_deref())
+            .collect();
+        let inputs = translation
+            .inputs
+            .iter()
+            .zip(&self.input_buffers)
+            .map(|(input, buffer)| {
+                let constant = match &input.kind {
+                    InputKind::UserInput { .. } => None,
+                    InputKind::Buffer { .. } => {
+                        let (_, shape, strides, bytes) = constants
+                            .iter()
+                            .find(|(name, ..)| name == &input.graph_name)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "the program holds the constant {:?}, which was not given \
+                                     to the code object",
+                                    input.graph_name
+                                )
+                            })?;
+                        Some(runtime::Constant {
+                            dtype: torch_dtype(input.dtype)
+                                .with_context(|| format!("constant {:?}", input.graph_name))?,
+                            shape: shape.clone(),
+                            strides: strides.clone(),
+                            bytes: bytes.clone(),
+                        })
+                    }
+                };
+                Ok(runtime::Input {
+                    name: input.graph_name.clone(),
+                    buffer: *buffer,
+                    shape: input.shape.clone(),
+                    written: written.contains(input.graph_name.as_str()),
+                    constant,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let rows = translation
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                let name = &output.graph_name;
+                let alias = aliases.iter().find(|(aliased, ..)| aliased == name);
+                let storage = match (&output.mutation_target, alias) {
+                    // A writeback's value is the caller's own argument.
+                    (Some(target), _) => runtime::Storage::WritesBack {
+                        slot: slot_of(target).with_context(|| {
+                            format!("output {name:?} writes back into {target:?}")
+                        })?,
+                    },
+                    (None, Some((_, owner, offset))) => runtime::Storage::View {
+                        of: match input_of(owner) {
+                            Some(input) => match &translation.inputs[input].kind {
+                                InputKind::UserInput { .. } => runtime::Owner::Argument {
+                                    slot: slot_of(owner)?,
+                                },
+                                InputKind::Buffer { .. } => runtime::Owner::Constant { input },
+                            },
+                            None => runtime::Owner::Row {
+                                row: translation.outputs[..index]
+                                    .iter()
+                                    .position(|earlier| &earlier.graph_name == owner)
+                                    .ok_or_else(|| {
+                                        anyhow!(
+                                            "output {name:?} is a view of {owner:?}, which is \
+                                             neither a graph input nor an earlier graph output"
+                                        )
+                                    })?,
+                            },
+                        },
+                        offset: *offset,
+                    },
+                    (None, None) => runtime::Storage::Fresh,
+                };
+                Ok(runtime::Row {
+                    name: name.clone(),
+                    dtype: torch_dtype(output.dtype).with_context(|| format!("output {name:?}"))?,
+                    shape: output.shape.clone(),
+                    strides: match &self.output_declared[index] {
+                        BoundaryLayout::RowMajor => runtime::Strides::RowMajor,
+                        BoundaryLayout::ColumnMajor => runtime::Strides::ColumnMajor,
+                        BoundaryLayout::Strided { strides } => {
+                            runtime::Strides::Elements(strides.clone())
+                        }
+                    },
+                    buffer: self.output_buffers[index],
+                    storage,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // What the device runs: the selected plan lowered to launches,
+        // copies and library calls, with every kernel compiled, so nothing
+        // is compiled when the program is loaded.
+        #[cfg_attr(not(feature = "device"), allow(unused_mut))]
+        let mut program = self.runtime.lower().context("lowering the searched plan")?;
+        #[cfg(feature = "device")]
+        program
+            .compile_kernels()
+            .context("compiling the program's kernels")?;
+
+        let dims = self.dims.iter().map(|(symbol, value)| (*symbol, *value));
+        let code = runtime::Code {
+            format: runtime::FORMAT,
+            boundary: luminal_pytorch_utils::boundary::code_boundary(translation, leaves, dims)?,
+            inputs,
+            rows,
+            program: Some(program),
+        };
+        code.validate()
+            .context("the code object's tables disagree")?;
+        Ok(code)
     }
 
     /// Saturate and search. What this states is what Python reads: the
@@ -496,6 +552,7 @@ impl CompiledGraph {
         device_budget_bytes: Option<usize>,
         max_intermediate_bytes: Option<usize>,
     ) -> Result<()> {
+        self.refuse_unbounded_sizes()?;
         // Profiling allocates synthetic boundary storage. Actual executions use
         // the caller's device allocations and PyTorch-provided scratch arena.
         let data: FxHashMap<NodeIndex, HostBuffer> = FxHashMap::default();
@@ -509,6 +566,65 @@ impl CompiledGraph {
         self.runtime
             .search(&self.bounds, &self.dims, &data, &options)?;
         self.searched = true;
+        Ok(())
+    }
+
+    /// Refuse a program in which a dimension torch gave no upper bound sizes
+    /// a tensor the program reads or writes.
+    ///
+    /// The device runs a program in memory planned for the largest sizes it
+    /// was compiled for: the byte count of every buffer is taken at the
+    /// dimensions' maxima when the program is planned. A dimension with no
+    /// maximum has no largest size, and those byte counts overflow. Said
+    /// here, by name and before the search, rather than surfacing from the
+    /// search as an output no plan writes.
+    ///
+    /// An unbounded integer that is only a value (`t * n`) sizes nothing
+    /// and is left alone.
+    fn refuse_unbounded_sizes(&self) -> Result<()> {
+        let translation = &self.translation;
+        let sizes: std::collections::HashSet<Symbol> = translation
+            .inputs
+            .iter()
+            .flat_map(|input| input.shape.iter())
+            .chain(
+                translation
+                    .outputs
+                    .iter()
+                    .flat_map(|output| output.shape.iter()),
+            )
+            .flat_map(|extent| extent.to_symbols())
+            .collect();
+        let mut unbounded: Vec<&str> = translation
+            .symbols
+            .iter()
+            .filter(|(_, symbol)| {
+                sizes.contains(symbol)
+                    && self
+                        .bounds
+                        .get(symbol)
+                        .is_some_and(|range| range.max() >= NO_UPPER_BOUND)
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        unbounded.sort_unstable();
+        ensure!(
+            unbounded.is_empty(),
+            "dimension{} {} {} no upper bound and size{} a tensor the program reads or writes. \
+             The CUDA backend plans a program's memory for the largest sizes it is compiled \
+             for, so each such dimension needs a declared maximum: for example \
+             `ShapeVar(max=...)` in `torch.compile(..., dynamic_shapes=ShapesSpec(...))`, or \
+             `torch._dynamo.mark_dynamic(tensor, axis, max=...)`. `dynamic=True` alone \
+             declares none.",
+            if unbounded.len() == 1 { "" } else { "s" },
+            unbounded
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if unbounded.len() == 1 { "has" } else { "have" },
+            if unbounded.len() == 1 { "s" } else { "" },
+        );
         Ok(())
     }
 
@@ -703,6 +819,8 @@ struct Boundary {
     input_buffers: Vec<i64>,
     output_buffers: Vec<i64>,
     output_layouts: Vec<(String, Vec<String>)>,
+    /// The layout each translation output was bound at, by output index.
+    output_declared: Vec<BoundaryLayout>,
 }
 
 /// The CUDA-lite boundary for a translated program: every input is the
@@ -762,6 +880,7 @@ fn bind(
     }
     let mut output_buffers = Vec::with_capacity(translation.outputs.len());
     let mut spellings = Vec::with_capacity(translation.outputs.len());
+    let mut output_declared = Vec::with_capacity(translation.outputs.len());
     for output in &translation.outputs {
         let (buffer, layout) = match &output.mutation_target {
             Some(target) => {
@@ -835,6 +954,7 @@ fn bind(
             }
         };
         output_buffers.push(buffer);
+        output_declared.push(layout.layout.clone());
         spellings.push(layout.spelling());
     }
     luminal_pytorch_utils::declare(
@@ -847,6 +967,7 @@ fn bind(
         input_buffers,
         output_buffers,
         output_layouts: spellings,
+        output_declared,
     })
 }
 
@@ -921,15 +1042,37 @@ fn load(
         searched: false,
         dims,
         bounds,
+        output_declared: boundary.output_declared,
     })
+}
+
+/// The code object of a graph that computes nothing: it forwards arguments,
+/// sizes and constants. There is no program and no slot is bound.
+#[pyfunction]
+fn forwarding_code(program: &[u8], leaves: &str) -> PyResult<Vec<u8>> {
+    let parsed = luminal_pytorch_utils::parse_program(program).map_err(to_py)?;
+    let plan = luminal_pytorch_utils::boundary::plan(&parsed).map_err(to_py)?;
+    runtime::Code {
+        format: runtime::FORMAT,
+        boundary: luminal_pytorch_utils::boundary::forwarding_boundary(&plan, leaves)
+            .map_err(to_py)?,
+        inputs: Vec::new(),
+        rows: Vec::new(),
+        program: None,
+    }
+    .to_bytes()
+    .map_err(to_py)
 }
 
 #[pymodule]
 fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledGraph>()?;
-    m.add_class::<ExecutionStaging>()?;
     m.add_function(wrap_pyfunction!(compile_graph, m)?)?;
     m.add_function(wrap_pyfunction!(boundary_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(forwarding_code, m)?)?;
+    // Test hooks for the shared slot readers and writers; no call path
+    // goes through them.
+    luminal_torch_slots::debug::add_to(m)?;
     Ok(())
 }
 
@@ -1113,6 +1256,7 @@ mod tests {
             searched: false,
             bounds: SymbolBounds::exact(&dims).unwrap(),
             dims,
+            output_declared: boundary.output_declared,
         }
     }
 

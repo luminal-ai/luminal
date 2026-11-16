@@ -25,7 +25,9 @@ def _compile_cat(model, inputs, *, dynamic_shapes=None):
     what the translator does with them."""
     import importlib
 
-    compiler = importlib.import_module(f"luminal_{selected_backend()}").Compiler()
+    compiler = importlib.import_module(
+        f"luminal_torch_{selected_backend()}_compiler"
+    ).Compiler()
     shapes = (
         {"dynamic_shapes": _shapes_spec(model, inputs, dynamic_shapes)}
         if dynamic_shapes

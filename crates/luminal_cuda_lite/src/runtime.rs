@@ -804,6 +804,22 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// The selected program lowered to what a device runs: its steps, its
+    /// buffers, and where it leaves each output. The result stands alone.
+    /// Nothing in it refers back to this runtime, its plan or its search.
+    pub fn lower(&self) -> Result<crate::lowered::LoweredProgram> {
+        let program = self.install_program()?;
+        self.ensure_external_output_slots_are_literal(&program)?;
+        let storage = crate::storage::plan_storage(&program.0, &program.1, &self.externals)?;
+        let bytes = storage.slab_bytes;
+        anyhow::ensure!(
+            self.device_budget_bytes.is_none_or(|limit| bytes <= limit),
+            "CUDA arena needs {bytes} bytes, exceeding budget {:?}",
+            self.device_budget_bytes
+        );
+        crate::lowered::lower(&program.0, &storage, &program.1)
+    }
+
     fn install_program(&self) -> Result<(crate::layouts::CudaPlan, crate::symbolic::Bounds)> {
         let plan = self
             .plan
@@ -903,13 +919,8 @@ impl CudaRuntime {
                 }
             }
             if !self.device.as_ref().unwrap().is_installed() {
-                let program = self.install_program()?;
-                self.ensure_external_output_slots_are_literal(&program)?;
-                self.device.as_mut().unwrap().install_with_bindings(
-                    program,
-                    self.externals.clone(),
-                    self.device_budget_bytes,
-                )?;
+                let lowered = self.lower()?;
+                self.device.as_mut().unwrap().install_lowered(lowered)?;
             }
             let device = self.device.as_mut().unwrap();
 
@@ -1035,7 +1046,7 @@ impl CudaRuntime {
     pub fn output_elected_strides(&self, tensor: NodeIndex) -> Result<Vec<i64>> {
         let (_, slot) = self.installed_output_slot(tensor)?;
         let layout = crate::symbolic::resolve_layout(&slot.layout, &self.dims)?;
-        elected_strides(&layout).ok_or_else(|| {
+        elected_strides(&layout, &self.dims).ok_or_else(|| {
             anyhow!(
                 "output v{}'s elected layout {:?} has no strides",
                 tensor.index(),
@@ -1063,7 +1074,7 @@ impl CudaRuntime {
     pub fn output_slot_elected_strides(&self, slot: usize) -> Result<Vec<i64>> {
         let (_, binding) = self.installed_output_slot_at(slot)?;
         let layout = crate::symbolic::resolve_layout(&binding.layout, &self.dims)?;
-        elected_strides(&layout).ok_or_else(|| {
+        elected_strides(&layout, &self.dims).ok_or_else(|| {
             anyhow!(
                 "output slot {slot}'s elected layout {:?} has no strides",
                 layout.present()
@@ -1113,65 +1124,12 @@ impl CudaRuntime {
     }
 }
 
-/// One element stride per axis of a RESOLVED layout, taken from the
-/// constructor's own meaning: the contiguous forms state theirs by shape
-/// order, a strided chain by its three canonical residues (`coord * stride`,
-/// the bare coordinate, the dead axis's zero). `None` for a layout that
-/// states an offset function instead of strides, and for a chain summand
-/// outside those residues — a stride is never recovered by evaluation.
-fn elected_strides(layout: &DecodedLayout) -> Option<Vec<i64>> {
-    use luminal::layouts::{
-        IntExprTerm as T, LeftMajorContiguousElementLayout as LM,
-        RightMajorContiguousElementLayout as RM, StridedElementLayout as ST,
-    };
-    let extents: Vec<i64> = layout
-        .literal_extents()?
-        .into_iter()
-        .map(|e| i64::try_from(e).ok())
-        .collect::<Option<_>>()?;
-    let rank = extents.len();
-    if layout.has::<RM>() {
-        let mut strides = vec![1i64; rank];
-        for axis in (0..rank.saturating_sub(1)).rev() {
-            strides[axis] = strides[axis + 1].checked_mul(extents[axis + 1])?;
-        }
-        return Some(strides);
-    }
-    if layout.has::<LM>() {
-        let mut strides = vec![1i64; rank];
-        for axis in 1..rank {
-            strides[axis] = strides[axis - 1].checked_mul(extents[axis - 1])?;
-        }
-        return Some(strides);
-    }
-    let chain = &layout.first::<ST>()?.chain;
-    if chain.len() != rank {
-        return None;
-    }
-    // A summand names its own axis FROM THE END; only the dead axis's bare
-    // zero has none, and it sits at that axis's position in the chain.
-    let axis_of = |axis_from_end: &i64| -> Option<usize> {
-        let axis = usize::try_from(*axis_from_end).ok()?;
-        (axis < rank).then_some(rank - 1 - axis)
-    };
-    let mut strides: Vec<Option<i64>> = vec![None; rank];
-    for (position, summand) in chain.iter().enumerate() {
-        let (axis, stride) = match summand {
-            T::Lit(0) => (position, 0),
-            T::Coord { axis_from_end } => (axis_of(axis_from_end)?, 1),
-            T::Mul(a, b) => match (a.as_ref(), b.as_ref()) {
-                (T::Coord { axis_from_end }, k) | (k, T::Coord { axis_from_end }) => {
-                    (axis_of(axis_from_end)?, k.eval_literal()?)
-                }
-                _ => return None,
-            },
-            _ => return None,
-        };
-        if strides[axis].replace(stride).is_some() {
-            return None;
-        }
-    }
-    strides.into_iter().collect()
+/// The element strides a layout elects, at a call's dimensions.
+fn elected_strides(layout: &DecodedLayout, dims: &shape::DynMap) -> Option<Vec<i64>> {
+    crate::lowered::elected_strides(layout)?
+        .iter()
+        .map(|stride| crate::symbolic::eval(&stride.0, dims).ok())
+        .collect()
 }
 
 #[cfg(all(test, feature = "device"))]

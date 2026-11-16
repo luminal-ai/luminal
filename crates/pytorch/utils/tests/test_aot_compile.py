@@ -7,39 +7,22 @@ artifact: a compiled module takes the model as its first argument, so one
 loaded function serves any model of the same structure.
 
 torch saves an ``aot_autograd`` backend through the ``OutputCode`` each of
-its compilers returns. The reference backend's saved form is the graph the
-translator reads and the plan search selected, so a loaded function runs
-without searching. The CUDA runtime has no serialized form of a plan yet;
-it refuses ``aot_compile`` by name, which is reported here as an expected
-failure. Any other failure, at any stage, fails the test.
+its compilers returns. Every backend returns its runtime's code object,
+whose saved form is its own bytes: the boundary tables a call reads and the
+program the runtime runs. A loaded function runs without parsing,
+translating, searching or compiling anything.
 """
 
-import pytest
 import torch
-from backend_test_utils import luminal_backend, selected_backend
+from backend_test_utils import luminal_backend
 
 _CALLS = 3
 _TOLERANCE = {"atol": 1e-4, "rtol": 1e-4}
 
 
 def _aot_compile(compiled, example_args):
-    """``compiled.aot_compile`` on positional example inputs.
-
-    torch prepares the saved form of every graph while ``aot_compile``
-    runs, so a backend that cannot save says so here, not at the save.
-    """
-    try:
-        return compiled.aot_compile((example_args, {}))
-    except NotImplementedError as error:
-        if "cannot save a compiled graph yet" not in str(error):
-            raise
-        assert selected_backend() == "cuda_lite", (
-            f"only the CUDA backend refuses to save; {selected_backend()} said: {error}"
-        )
-        pytest.xfail(
-            "LUM-806, LUM-864: the CUDA runtime has no serialized form of a "
-            "searched plan, so a graph it computes cannot be saved"
-        )
+    """``compiled.aot_compile`` on positional example inputs."""
+    return compiled.aot_compile((example_args, {}))
 
 
 def _save_and_load(aot, path):

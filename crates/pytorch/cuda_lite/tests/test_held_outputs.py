@@ -1,17 +1,18 @@
-"""Outputs the caller keeps: every call's output is its own live storage.
+"""The memory of a CUDA call: its scratch memory, and the layout its outputs
+are written at.
 
-An output is allocated at the byte span the installed plan discloses for
-it and written in place, so a caller may hold every call's result at once
-and read it later. These need the maturin-built extension and a CUDA
-device; without either they skip cleanly.
+That every call's output is its own live storage, held or released, is a
+fact of every backend and is in ``utils/tests/test_held_outputs.py``. These
+need the maturin-built extension and a CUDA device; without either they
+skip cleanly.
 """
 
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("luminal_cuda_lite")
+pytest.importorskip("luminal_torch_cuda_lite_compiler")
 
-import luminal_cuda_lite  # noqa: E402
+import luminal_torch_cuda_lite_compiler  # noqa: E402
 
 # Full float32 on both sides (see conftest), over a three-matmul stack.
 
@@ -44,97 +45,66 @@ def _linear_stack():
     )
 
 
-def _elementwise():
-    """A small pointwise chain: one elected kernel writing the output."""
-
-    class Chain(torch.nn.Module):
-        def forward(self, x):
-            return (x * 2 + 1) * x - 0.5
-
-    return Chain().cuda().eval()
-
-
-MODELS = {"linear_stack": _linear_stack, "elementwise": _elementwise}
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.parametrize("build", list(MODELS.values()), ids=list(MODELS))
-def test_outputs_held_across_calls_stay_correct(build):
-    """Twelve calls, every output kept: each holds its own call's numbers,
-    so no call wrote into storage an earlier one still owns."""
+def test_a_call_holds_no_scratch_memory_after_it_returns():
+    """The scratch memory a program uses is a block from torch's allocator
+    that the call takes and gives back before it returns. torch accounts for
+    it while a call runs, none of it is allocated once the calls are over
+    however many there were, and torch can hand its cached block back to the
+    device, which it could not do if the executable still held it.
+
+    Held outputs move the addresses the program writes to on every call,
+    and that changes nothing."""
+    from luminal_torch_cuda_lite_runtime import describe
+
     torch.manual_seed(0)
-    model = build()
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
-    calls = []
-    with torch.no_grad():
-        for _ in range(12):
-            x = torch.randn(8, 64, device="cuda")
-            calls.append((x, compiled(x)))
-        pointers = [got.data_ptr() for _, got in calls]
-        assert len(set(pointers)) == len(pointers), "two held outputs share an address"
-        for x, got in calls:
-            torch.testing.assert_close(got, model(x), atol=ATOL, rtol=RTOL)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.parametrize("build", list(MODELS.values()), ids=list(MODELS))
-def test_rebinding_loop_matches_eager(build):
-    """The other half: each call's output is released before the next, so
-    the allocator hands the block straight back. Reuse must be as correct
-    as holding."""
-    torch.manual_seed(0)
-    model = build()
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
-    with torch.no_grad():
-        for _ in range(12):
-            x = torch.randn(8, 64, device="cuda")
-            y = compiled(x)
-            torch.testing.assert_close(y, model(x), atol=ATOL, rtol=RTOL)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_matmul_output_is_written_in_place():
-    """One matmul, one call: the returned tensor IS what the plan wrote,
-    at eager's layout."""
-    torch.manual_seed(0)
-    model = torch.nn.Linear(64, 64).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
-    x = torch.randn(8, 64, device="cuda")
-    with torch.no_grad():
-        expected = model(x)
-        got = compiled(x)
-    assert got.stride() == expected.stride()
-    torch.testing.assert_close(got, expected, atol=ATOL, rtol=RTOL)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_no_reinstantiation_when_only_pointers_move():
-    """A held output moves the address the plan writes to, and nothing
-    else: the captured graph is updated, never rebuilt."""
-    torch.manual_seed(0)
-    compiler = luminal_cuda_lite.Compiler()
+    compiler = luminal_torch_cuda_lite_compiler.Compiler()
     model = _linear_stack()
     compiled = torch.compile(model, backend=compiler)
     with torch.no_grad():
         for _ in range(3):
             compiled(torch.randn(8, 64, device="cuda"))
         assert compiler.graphs, "the backend compiled no graph"
-        graph = compiler.graphs[-1].program._graph
-        warm = graph.graph_stats()
-        if warm is None:
-            pytest.skip("no device counters (the runtime has not run on a device)")
+        program = compiler.graphs[-1].program
+        arena = describe(program)["program"]["arena_bytes"]
+        assert arena >= 1 << 20, "the program needs too little scratch to measure"
+
+        x = torch.randn(8, 64, device="cuda")
+        expected = model(x)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        allocated_before = torch.cuda.memory_allocated()
+        compiled_graphs = len(compiler.graphs)
         # Held, so every call writes an address the one before did not.
-        held = []
-        for _ in range(8):
-            held.append(compiled(torch.randn(8, 64, device="cuda")))
-        after = graph.graph_stats()
+        held = [compiled(x) for _ in range(8)]
         assert len({tensor.data_ptr() for tensor in held}) == len(held)
-    assert after["instantiations"] == warm["instantiations"], (
-        f"the plan was re-instantiated: {warm['instantiations']} -> "
-        f"{after['instantiations']}"
+        outputs = sum(tensor.untyped_storage().nbytes() for tensor in held)
+        torch.cuda.synchronize()
+        allocated_after = torch.cuda.memory_allocated()
+        peak = torch.cuda.max_memory_allocated()
+        reserved_cached = torch.cuda.memory_reserved()
+        torch.cuda.empty_cache()
+        reserved_released = torch.cuda.memory_reserved()
+
+    assert len(compiler.graphs) == compiled_graphs, "a call compiled a new graph"
+    for tensor in held:
+        torch.testing.assert_close(tensor, expected, atol=ATOL, rtol=RTOL)
+    # While a call ran, torch counted its scratch memory.
+    assert peak - allocated_before >= arena, (
+        f"torch saw at most {peak - allocated_before} bytes allocated during a call "
+        f"whose scratch arena is {arena} bytes"
     )
-    assert after["address_rebinds"] > warm["address_rebinds"], (
-        "no captured node was re-addressed across eight calls"
+    # What is allocated now that was not before is the held outputs, in
+    # whatever blocks torch gave them. A retained arena would add `arena`.
+    grown = allocated_after - allocated_before
+    assert outputs <= grown < arena, (
+        f"{grown} more bytes are allocated after 8 calls that hold {outputs} bytes "
+        f"of output; the program's scratch arena is {arena} bytes and must not be kept"
+    )
+    # The block sat in torch's cache, free: emptying the cache released it.
+    assert reserved_cached - reserved_released >= arena, (
+        f"emptying torch's cache released {reserved_cached - reserved_released} "
+        f"bytes; the scratch arena is {arena} bytes and something still holds it"
     )
 
 
@@ -154,7 +124,9 @@ def test_elected_layout_mismatch_is_refused_by_name():
     b = torch.randn(64, 32, device="cuda")
     expected = fn(a, b)
     try:
-        got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(a, b)
+        got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(
+            a, b
+        )
     except RuntimeError as refusal:
         message = str(refusal)
         assert (

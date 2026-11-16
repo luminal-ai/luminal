@@ -6,10 +6,12 @@
 //! the runtime underneath.
 
 pub mod boundary;
+pub mod data_dependent;
 pub mod declaration;
 pub mod declared_dtype;
 pub mod dim_range;
 pub mod dtype;
+pub mod leaves;
 pub mod pt2_parser;
 pub mod pt2_schema;
 pub mod torch_device;

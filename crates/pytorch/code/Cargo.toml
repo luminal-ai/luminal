@@ -1,0 +1,35 @@
+[package]
+name = "luminal_torch_code"
+version = "0.1.0"
+edition.workspace = true
+
+# What every PyTorch backend's code object states the same way: the boundary
+# tables (argument slots, output leaves, runtime checks, dimension values),
+# how a code object is read from its bytes, and, with the `python` feature,
+# the steps of a call that read nothing but those tables.
+#
+# What is a backend's own stays in that backend's runtime crate: the tensors
+# it reads and writes and how, and the program it runs.
+#
+# This crate depends on no compiler: not on the parser, the translator or
+# search. A backend's runtime depends on it; so does the shared translator,
+# which states output leaves in these tables.
+
+[features]
+default = []
+# The Python half: reading a call's arguments and building its outputs.
+# Without it the crate is plain data, so the translator can state these
+# tables without linking Python.
+python = ["dep:pyo3", "luminal_torch_slots/python"]
+
+[dependencies]
+luminal = { path = "../../.." }
+luminal_torch_slots = { path = "../slots" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dependencies.pyo3]
+version = "0.28.0"
+features = ["abi3-py38"]
+optional = true

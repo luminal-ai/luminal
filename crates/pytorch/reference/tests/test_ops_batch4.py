@@ -1,6 +1,6 @@
 """Translator batch 4/5: pooling, conv, norms, index/scatter, movement, special."""
 
-import luminal_reference
+import luminal_torch_reference_compiler
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +9,7 @@ import torch.nn.functional as F
 def _check(model: nn.Module, *inputs: torch.Tensor, atol: float = 1e-4) -> None:
     torch.manual_seed(0)
     eager = model(*inputs)
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
     out = compiled(*inputs)
     assert out.shape == eager.shape, f"{out.shape} != {eager.shape}"
     assert torch.allclose(out.to(torch.float32), eager.to(torch.float32), atol=atol), (
@@ -179,7 +179,9 @@ def test_adaptive_avg_pool() -> None:
 def test_max_pool_values() -> None:
     torch.manual_seed(0)
     x = torch.randn(2, 3, 8, 8)
-    compiled = torch.compile(MaxPool(), backend=luminal_reference.Compiler())
+    compiled = torch.compile(
+        MaxPool(), backend=luminal_torch_reference_compiler.Compiler()
+    )
     out = compiled(x)
     eager = F.max_pool2d(x, 2, 2)
     assert out.shape == eager.shape and torch.allclose(out, eager, atol=1e-5)
@@ -204,7 +206,7 @@ def test_max_pool_training_step_gradients() -> None:
     expected_model.load_state_dict(model.state_dict())
     x = torch.randn(2, 2, 7, 7, requires_grad=True)
     expected_x = x.detach().clone().requires_grad_()
-    backend = luminal_reference.Compiler()
+    backend = luminal_torch_reference_compiler.Compiler()
     loss = torch.compile(model, backend=backend)(x)
     expected_loss = expected_model(expected_x)
     loss.backward()
@@ -231,7 +233,7 @@ def test_batch_norm_eval() -> None:
     model = BatchNorm().eval()
     x = torch.randn(2, 3, 4, 4)
     eager = model(x)
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
     out = compiled(x)
     assert out.shape == eager.shape
     assert torch.allclose(out, eager, atol=1e-4)

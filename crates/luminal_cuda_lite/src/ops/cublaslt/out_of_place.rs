@@ -2,8 +2,8 @@
 //! decodes the elected configuration and evaluates its descriptor expressions.
 use super::CublasLtForm;
 use super::exec::{
-    LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation, LtDesc, LtOrder,
-    LtReductionSchemeMask, LtScalars,
+    LtActivation, LtBiasTemplate, LtCall, LtCallTemplate, LtComputation, LtDesc, LtMatrixTemplate,
+    LtOrder, LtReductionSchemeMask, LtScalars,
 };
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
@@ -20,9 +20,9 @@ pub const RULES: &str = include_str!("egg/approved_rules.egg");
 pub const WHITELIST: &str = include_str!("egg/approved_whitelist.egg");
 
 #[derive(Debug)]
-pub struct ApprovedCublasLtMatcher;
+pub struct CublasLtOutOfPlaceMatcher;
 
-impl OpMatcher for ApprovedCublasLtMatcher {
+impl OpMatcher for CublasLtOutOfPlaceMatcher {
     fn egglog_constructor(&self) -> &'static str {
         CONSTRUCTOR
     }
@@ -96,7 +96,7 @@ impl OpMatcher for ApprovedCublasLtMatcher {
             |class: &ClassId, name: &str| site.nodes_in_class_value(class, name).next().is_some();
         let frame = member(site, &site.child_class(7), "CublasLtExpressionFrameOf");
         let semantic = |n| site.class_of_child(&frame, n).unwrap();
-        Box::new(ApprovedCublasLt {
+        Box::new(CublasLtOutOfPlace {
             configuration: site.child_class(0),
             computation,
             reduction_scheme_mask: reduction_scheme_mask(site, &child(14)),
@@ -385,20 +385,27 @@ pub(super) fn matrix(site: &ExtractionSite<'_>, class: &ClassId) -> Matrix {
 }
 
 impl Matrix {
-    pub fn resolve(&self, dims: &luminal::shape::DynMap) -> LtDesc {
-        LtDesc {
-            rows: self.rows.eval_with_dims(&[], dims),
-            cols: self.cols.eval_with_dims(&[], dims),
-            ld: self.ld.eval_with_dims(&[], dims),
+    /// The matrix as plain data: its sizes, without the tensor it was
+    /// elected for.
+    pub fn template(&self) -> LtMatrixTemplate {
+        LtMatrixTemplate {
+            dtype: self.dtype,
             order: self.order,
-            batch_count: self.batch_count.eval_with_dims(&[], dims),
-            batch_stride_in_elements: self.batch_stride_in_elements.eval_with_dims(&[], dims),
+            rows: self.rows.clone(),
+            cols: self.cols.clone(),
+            ld: self.ld.clone(),
+            batch_count: self.batch_count.clone(),
+            batch_stride_in_elements: self.batch_stride_in_elements.clone(),
         }
+    }
+
+    pub fn resolve(&self, dims: &luminal::shape::DynMap) -> LtDesc {
+        self.template().resolve(dims)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct ApprovedCublasLt {
+pub struct CublasLtOutOfPlace {
     pub configuration: ClassId,
     pub computation: LtComputation,
     pub reduction_scheme_mask: LtReductionSchemeMask,
@@ -419,7 +426,7 @@ pub struct ApprovedCublasLt {
     dps: bool,
 }
 
-impl ApprovedCublasLt {
+impl CublasLtOutOfPlace {
     pub fn prototype() -> Self {
         let matrix = Matrix {
             tensor: ClassId::from("prototype"),
@@ -458,57 +465,55 @@ impl ApprovedCublasLt {
             + usize::from(self.bias.is_some())
     }
 
-    /// Evaluate already-approved descriptor expressions. No layout inference,
-    /// transpose flip, legality filter, destination rebinding, or dtype fallback.
-    pub fn resolve(&self, dims: &luminal::shape::DynMap) -> LtCall {
-        let a = self.a.resolve(dims);
-        let b = self.b.resolve(dims);
-        let d = self.d.resolve(dims);
-        LtCall {
-            computation: self.computation,
-            reduction_scheme_mask: self.reduction_scheme_mask,
+    /// The call this operation is, as plain data: what a lowered program
+    /// holds in its place. The destination is its own buffer.
+    pub fn template(&self) -> LtCallTemplate {
+        let scalars = self.scalars.resolve();
+        LtCallTemplate {
             form: match (self.c.is_some(), self.bias.is_some()) {
                 (false, false) => CublasLtForm::Base,
                 (false, true) => CublasLtForm::Bias,
                 (true, false) => CublasLtForm::Accumulate,
                 (true, true) => CublasLtForm::AccumulateBias,
             },
-            m: d.rows,
-            n: d.cols,
-            k: if self.trans_a { a.rows } else { a.cols },
+            computation: self.computation,
+            reduction_scheme_mask: self.reduction_scheme_mask,
             trans_a: self.trans_a,
             trans_b: self.trans_b,
-            a_dtype: self.a.dtype,
-            b_dtype: self.b.dtype,
-            d_dtype: self.d.dtype,
-            a,
-            b,
-            c: self.c.as_ref().map(|c| LtCMatrixInput {
-                descriptor: c.resolve(dims),
-                data_type: c.dtype,
-                operand: 2
-                    + self.scalars.resolve().input_count()
-                    + usize::from(self.bias.is_some()),
+            a: self.a.template(),
+            b: self.b.template(),
+            c: self.c.as_ref().map(|c| {
+                (
+                    c.template(),
+                    2 + scalars.input_count() + usize::from(self.bias.is_some()),
+                )
             }),
-            d,
+            d: self.d.template(),
             scale_dtype: self.scale,
-            scalars: self.scalars.resolve(),
+            scalars,
             activation: self.activation,
-            bias: self.bias.as_ref().map(|bias| LtBiasInput {
-                operand: 2 + self.scalars.resolve().input_count(),
+            bias: self.bias.as_ref().map(|bias| LtBiasTemplate {
+                operand: 2 + scalars.input_count(),
                 data_type: bias.dtype,
-                batch_stride_in_elements: bias.batch_stride_in_elements.eval_with_dims(&[], dims),
+                batch_stride_in_elements: bias.batch_stride_in_elements.clone(),
             }),
+            in_place: None,
         }
+    }
+
+    /// Evaluate already-approved descriptor expressions. No layout inference,
+    /// transpose flip, legality filter, destination rebinding, or dtype fallback.
+    pub fn resolve(&self, dims: &luminal::shape::DynMap) -> LtCall {
+        self.template().resolve(dims)
     }
 }
 
-impl OpSlotNames for ApprovedCublasLt {
+impl OpSlotNames for CublasLtOutOfPlace {
     fn operand_name(&self, operand: usize) -> String {
         format!("slot{operand}")
     }
 }
-impl BufferTensorIrOp for ApprovedCublasLt {
+impl BufferTensorIrOp for CublasLtOutOfPlace {
     fn label(&self) -> &str {
         "CublasLtCall"
     }
@@ -519,7 +524,7 @@ impl BufferTensorIrOp for ApprovedCublasLt {
         !self.dps || operand < self.input_count()
     }
 }
-impl Bufferizable for ApprovedCublasLt {
+impl Bufferizable for CublasLtOutOfPlace {
     fn alias_info(&self) -> Vec<AliasInfo> {
         if !self.dps {
             return vec![];
@@ -531,7 +536,7 @@ impl Bufferizable for ApprovedCublasLt {
         }]
     }
 }
-impl ToDps for ApprovedCublasLt {
+impl ToDps for CublasLtOutOfPlace {
     fn to_dps(&self) -> Option<Box<dyn LayoutIrOp>> {
         if self.dps {
             None
@@ -542,9 +547,9 @@ impl ToDps for ApprovedCublasLt {
         }
     }
 }
-impl LayoutIrOp for ApprovedCublasLt {}
+impl LayoutIrOp for CublasLtOutOfPlace {}
 
-impl crate::HostOp for ApprovedCublasLt {
+impl crate::HostOp for CublasLtOutOfPlace {
     fn capture_dims(&self) -> Option<Vec<luminal::shape::Symbol>> {
         Some(capture_dimensions(
             [&self.a, &self.b, &self.d].into_iter().chain(self.c.iter()),
@@ -561,8 +566,8 @@ impl crate::HostOp for ApprovedCublasLt {
         &self,
         ctx: &crate::host::HostOpContext<'_>,
     ) -> anyhow::Result<Box<dyn crate::host::PreparedHostOp>> {
-        let call = self.resolve(ctx.dims);
-        crate::ops::cublaslt::device_call::prepare(&call, ctx.inputs, ctx.dest, ctx.workspace)
+        self.template()
+            .prepare(ctx.dims, ctx.inputs, ctx.dest, ctx.workspace)
             .map(|prepared| Box::new(prepared) as Box<dyn crate::host::PreparedHostOp>)
     }
 }

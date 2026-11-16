@@ -1,4 +1,4 @@
-"""YOLO v11n end-to-end tests using the luminal_cuda_lite backend.
+"""YOLO v11n end-to-end tests using the luminal_torch_cuda_lite_compiler backend.
 
 This module exercises the YOLO v11n building blocks (Conv + BN, C3k2, the
 SPPF/C2PSA backbone, the Detect head) and finally the full model through
@@ -19,7 +19,7 @@ from typing import Callable
 import pytest
 import torch
 import torch._dynamo
-from luminal_cuda_lite import Compiler
+from luminal_torch_cuda_lite_compiler import Compiler
 
 luminal_backend = Compiler()
 

@@ -15,12 +15,16 @@ default = []
 # the runtime refuse loudly; `maturin develop --features device` builds the
 # real GPU backend (see pyproject.toml, which turns the feature on for the
 # wheel).
-device = ["luminal_cuda_lite/device"]
+device = ["luminal_cuda_lite/device", "luminal_torch_cuda_lite_runtime/device"]
 
 [dependencies]
 luminal = { path = "../../.." }
 luminal_cuda_lite = { path = "../../luminal_cuda_lite" }
 luminal_pytorch_utils = { path = "../utils" }
+luminal_torch_slots = { path = "../slots", features = ["python"] }
+# The code object this compiler builds. The dependency points one way: the
+# runtime never depends on the compiler.
+luminal_torch_cuda_lite_runtime = { path = "../cuda_lite_runtime" }
 anyhow = "1"
 rustc-hash = "2.1.1"
 

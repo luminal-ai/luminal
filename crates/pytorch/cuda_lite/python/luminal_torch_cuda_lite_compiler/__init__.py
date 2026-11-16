@@ -1,6 +1,6 @@
 """Cuda Lite compiler for ``torch.compile``.
 
-from luminal_cuda_lite import Compiler
+from luminal_torch_cuda_lite_compiler import Compiler
 compiled = torch.compile(model, backend=Compiler())
 """
 

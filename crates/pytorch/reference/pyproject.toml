@@ -1,11 +1,18 @@
 [project]
-name = "luminal_reference"
+name = "luminal_torch_reference_compiler"
 version = "0.1.0"
 description = "Luminal reference (CPU) torch.compile backend"
 requires-python = ">=3.10"
 # luminal_torch_common: the torch.compile frontend every backend shares.
+# luminal_torch_reference_runtime: what runs a compiled program. This
+#   package is the compiler and depends on it; never the reverse.
 # numpy: `_tensor_bytes` stages a tensor through `.numpy().tobytes()`.
-dependencies = ["torch>=2.14.0", "numpy>=2.0.2", "luminal_torch_common"]
+dependencies = [
+  "torch>=2.14.0",
+  "numpy>=2.0.2",
+  "luminal_torch_common",
+  "luminal_torch_reference_runtime",
+]
 
 # PyTorch 2.14 wheels require the CUDA 13.0 index; cu128 stops before 2.14.
 [[tool.uv.index]]
@@ -18,6 +25,7 @@ torch = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 luminal_torch_common = { path = "../utils", editable = true }
+luminal_torch_reference_runtime = { path = "../reference_runtime", editable = true }
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
@@ -26,7 +34,7 @@ build-backend = "maturin"
 [tool.maturin]
 python-source = "python"
 manifest-path = "Cargo.toml"
-module-name = "luminal_reference._luminal"
+module-name = "luminal_torch_reference_compiler._luminal"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

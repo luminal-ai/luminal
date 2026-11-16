@@ -9,7 +9,9 @@ CUDA-free CI job should not go red over a missing device.
 import pytest
 
 torch = pytest.importorskip("torch")
-luminal_cuda_lite = pytest.importorskip("luminal_cuda_lite")
+luminal_torch_cuda_lite_compiler = pytest.importorskip(
+    "luminal_torch_cuda_lite_compiler"
+)
 
 from torch.fx.experimental.dynamic_spec import (  # noqa: E402
     ShapesSpec,
@@ -21,23 +23,24 @@ from torch.fx.experimental.dynamic_spec import (  # noqa: E402
 def _bounded_compile(model, shape, parameter="x"):
     return torch.compile(
         model,
-        backend=luminal_cuda_lite.Compiler(),
+        backend=luminal_torch_cuda_lite_compiler.Compiler(),
         dynamic_shapes=ShapesSpec(params={parameter: TensorSpec(shape)}),
         isolate_recompiles=True,
     )
 
 
 def test_compiler_available():
-    assert callable(luminal_cuda_lite.Compiler())
+    assert callable(luminal_torch_cuda_lite_compiler.Compiler())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_linear_roundtrip_repeated_calls():
-    """Fresh inputs each call: the per-execution arena is alloc/free'd each time
-    and outputs are separate tensors, so every call must still be exact."""
+    """Fresh inputs each call: the scratch arena is allocated and freed
+    each time and outputs are separate tensors, so every call must still be
+    exact."""
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_cuda_lite_compiler.Compiler())
     with torch.no_grad():
         for _ in range(5):
             x = torch.randn(4, 16, device="cuda")
@@ -111,7 +114,7 @@ def test_repeated_calls_reuse_input_tensors():
     result."""
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_cuda_lite_compiler.Compiler())
     x = torch.randn(4, 16, device="cuda")
     with torch.no_grad():
         for _ in range(5):
@@ -132,7 +135,7 @@ def test_writeback_after_read():
     x = torch.randn(4, 8, device="cuda")
     expected_y = x * 2
     expected_x = x + 1
-    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+    got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(x)
     torch.testing.assert_close(got, expected_y)
     torch.testing.assert_close(x, expected_x)
 
@@ -153,7 +156,7 @@ def test_returned_clone_of_a_mutated_value_is_fresh_storage():
     torch.manual_seed(0)
     x = torch.randn(4, 8, device="cuda")
     expected = x + 1
-    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+    got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(x)
     torch.testing.assert_close(got, expected)
     torch.testing.assert_close(x, expected)
     assert got.data_ptr() != x.data_ptr()
@@ -174,7 +177,7 @@ def test_writeback_consumed_downstream():
     x = torch.randn(4, 8, device="cuda")
     expected_x = x + 1
     expected = expected_x * 2
-    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+    got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(x)
     torch.testing.assert_close(got, expected)
     torch.testing.assert_close(x, expected_x)
 
@@ -199,7 +202,7 @@ def test_transposed_input_binds_zero_copy():
     x = torch.randn(8, 4, device="cuda").t()
     assert not x.is_contiguous()
     expected = fn(x)
-    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+    got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(x)
     torch.testing.assert_close(got, expected)
 
 
@@ -216,7 +219,7 @@ def test_output_is_returned_at_eagers_strides():
     x = torch.randn(4, 8, device="cuda")
     y = torch.randn(4, 8, device="cuda")
     expected = fn(x, y)
-    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, y)
+    got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(x, y)
     assert got.stride() == expected.stride()
     torch.testing.assert_close(got, expected)
 
@@ -254,7 +257,7 @@ def test_transposed_output_keeps_eagers_strides():
     a = torch.randn(8, 4, device="cuda")
     b = torch.randn(8, 4, device="cuda")
     expected = fn(a, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(a, b)
+    got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(a, b)
     assert got.stride() == expected.stride()
     torch.testing.assert_close(got, expected)
 
@@ -276,7 +279,7 @@ def test_writeback_into_transposed_input_finds_no_plan_naming_the_output():
     with pytest.raises(
         Exception, match=r"no plan writes the bound outputs: v\d+ at Strided"
     ):
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+        torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(x)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -292,7 +295,8 @@ def test_read_only_aliasing_binds_two_buffers_on_one_address():
     torch.manual_seed(0)
     x = torch.randn(4, 8, device="cuda")
     torch.testing.assert_close(
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, x[:]), x * x
+        torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(x, x[:]),
+        x * x,
     )
 
 
@@ -312,7 +316,9 @@ def test_aliased_inputs_with_a_writeback_match_eager():
     x = torch.randn(4, 8, device="cuda")
     expected_x = x + 1
     expected = expected_x * expected_x
-    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, x[:])
+    got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(
+        x, x[:]
+    )
     torch.testing.assert_close(got, expected)
     torch.testing.assert_close(x, expected_x)
 
@@ -329,7 +335,9 @@ def test_int32_and_bool_inputs_bind_external():
     values = torch.arange(32, device="cuda", dtype=torch.int32).reshape(4, 8)
     mask = (torch.arange(32, device="cuda") % 2 == 0).reshape(4, 8)
     expected = fn(values, mask)
-    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(values, mask)
+    got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(
+        values, mask
+    )
     assert got.dtype == torch.int32
     torch.testing.assert_close(got, expected)
 
@@ -397,7 +405,9 @@ def test_stride_only_symbol_is_refused_by_name():
         return x * 2 + 1
 
     torch.manual_seed(0)
-    compiled = torch.compile(fn, backend=luminal_cuda_lite.Compiler(), dynamic=True)
+    compiled = torch.compile(
+        fn, backend=luminal_torch_cuda_lite_compiler.Compiler(), dynamic=True
+    )
     x = torch.randn(16, 6, device="cuda").t()[:, ::2]
     with pytest.raises(Exception, match=r"stride on axis 1.*does not declare"):
         compiled(x)
@@ -418,7 +428,7 @@ def test_offset_input_is_refused_by_name():
     x = base[1:]
     assert x.storage_offset() == 8
     with pytest.raises(Exception, match="storage offset 8"):
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+        torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(x)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -434,7 +444,8 @@ def test_expanded_input_is_a_broadcast_read_map():
     assert x.stride() == (0, 1)
     y = torch.randn(4, 8, device="cuda")
     torch.testing.assert_close(
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, y), fn(x, y)
+        torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(x, y),
+        fn(x, y),
     )
 
 
@@ -444,7 +455,7 @@ def test_stride_zero_mutation_target_is_refused_as_eager_refuses_it():
     program outright (a write through a non-injective view), and so does
     functionalization while AOTAutograd traces it, before any boundary is
     declared: the refusal the caller sees is torch's own, by name."""
-    from luminal_cuda_lite.boundary import Strided, boundary_layout
+    from luminal_torch_cuda_lite_compiler.boundary import Strided, boundary_layout
 
     def fn(t):
         t.add_(1)
@@ -460,7 +471,7 @@ def test_stride_zero_mutation_target_is_refused_as_eager_refuses_it():
     with pytest.raises(
         Exception, match="more than one element of the written-to tensor"
     ):
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+        torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(x)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -471,7 +482,7 @@ def test_a_parameter_whose_storage_moved_is_read_at_its_new_address():
     module's."""
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_cuda_lite_compiler.Compiler())
     x = torch.randn(4, 16, device="cuda")
     with torch.no_grad():
         torch.testing.assert_close(compiled(x), model(x))
@@ -505,7 +516,7 @@ def test_training_round_trip_through_saved_activation_views():
     torch.manual_seed(0)
     eager = SplitGate().cuda()
     model = copy.deepcopy(eager)
-    compiler = luminal_cuda_lite.Compiler()
+    compiler = luminal_torch_cuda_lite_compiler.Compiler()
     compiled = torch.compile(model, backend=compiler)
     for _ in range(2):
         x = torch.randn(2, 64, 16, device="cuda")
@@ -521,3 +532,33 @@ def test_training_round_trip_through_saved_activation_views():
                 actual.grad, expected.grad, atol=1e-3, rtol=1e-3, msg=f"grad of {name}"
             )
     assert [record.phase for record in compiler.graphs] == ["forward", "backward"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_a_dimension_with_no_upper_bound_is_refused_by_name():
+    """``dynamic=True`` makes a dimension dynamic without declaring a maximum
+    for it. The device runs a program in memory planned for the largest sizes
+    it was compiled for, so the compile is refused before the search, naming
+    the dimensions and how to bound them. The same function with a declared
+    maximum compiles and matches eager at several sizes."""
+
+    def scaled(x):
+        return x * 2 + 1
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        scaled, backend=luminal_torch_cuda_lite_compiler.Compiler(), dynamic=True
+    )
+    with pytest.raises(torch._dynamo.exc.BackendCompilerFailed) as refusal:
+        compiled(torch.randn(4, 8, device="cuda"))
+    message = str(refusal.value)
+    assert "no upper bound" in message, message
+    assert "ShapeVar(max=" in message, message
+
+    torch._dynamo.reset()
+    rows = ShapeVar("rows", min=2, max=16, optimization_hint=4)
+    bounded = _bounded_compile(scaled, [rows, 8])
+    for size in (4, 9, 2, 16):
+        x = torch.randn(size, 8, device="cuda")
+        torch.testing.assert_close(bounded(x), scaled(x))
+    torch._dynamo.reset()

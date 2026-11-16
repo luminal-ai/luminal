@@ -1,0 +1,29 @@
+[package]
+name = "luminal_torch_slots"
+version = "0.1.0"
+edition.workspace = true
+
+# What every PyTorch backend shares at its boundary with torch: the kind of
+# value each argument slot holds and, with the `python` feature, Rust functions
+# that read a value out of a slot and create tensors torch owns.
+#
+# This crate depends on no compiler: not on `luminal`, the parser or the
+# translator. A backend's runtime can depend on it alone.
+
+[features]
+default = []
+# The Python half. Without it the crate is plain data (`SlotKind`), so the
+# translator can name slot kinds without linking Python.
+python = ["dep:pyo3", "dep:libloading"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+libloading = { version = "0.9", optional = true }
+
+[dependencies.pyo3]
+version = "0.28.0"
+features = ["abi3-py38"]
+optional = true
+
+[dev-dependencies]
+serde_json = "1"

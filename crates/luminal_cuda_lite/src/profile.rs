@@ -1,9 +1,7 @@
 //! Search profiling uses the serving graph path. Preparation/instantiation is
 //! outside the timed trials. Trials measure device execution and synchronization.
 //! The profiling caller owns candidate storage and restores staged inputs per trial.
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
-use std::sync::Arc;
+use anyhow::Result;
 
 use std::time::{Duration, Instant};
 
@@ -11,7 +9,7 @@ use luminal::bufferize::BufferIrGraph;
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::FxHashMap;
 
-use crate::device::CudaExecutable;
+use crate::device::{CudaExecutable, CudaMemory};
 use crate::host_buffer::HostBuffer;
 use crate::search::early_stop_exceeded;
 
@@ -83,7 +81,7 @@ pub fn profile_candidate_at(
     // 1. PREPARE: compile + stage + one untimed run (warmup + validity).
     let staged = prepare_candidate(device, plan, staged, shapes, arena_budget)
         .map_err(ProfileFailure::Prepare)?;
-    let mut arena = ProfilingMemory::new(device.stream().clone(), device.slab_bytes())
+    let mut arena = CudaMemory::new(device.stream().clone(), device.slab_bytes())
         .map_err(ProfileFailure::Prepare)?;
     let mut staging = device
         .allocate_staging(device.stats().staging_bytes)
@@ -202,12 +200,12 @@ fn prepare_candidate<'a>(
 fn initialize_inputs(
     device: &CudaExecutable,
     plan: &BufferIrGraph<DecodedLayout>,
-    arena: &mut ProfilingMemory,
+    arena: &mut CudaMemory,
     inputs: &FxHashMap<i64, std::borrow::Cow<'_, HostBuffer>>,
     dims: &luminal::shape::DynMap,
 ) -> anyhow::Result<()> {
     for buffer in plan.buffers.values().filter(|b| b.lit.is_some()) {
-        let Some(home) = device.memory_plan()?.slices.get(&buffer.id) else {
+        let Some(home) = device.program()?.slice(&buffer.id) else {
             continue;
         };
         let bytes = crate::symbolic::bytes(&buffer.layout, dims)?;
@@ -234,43 +232,8 @@ pub(crate) fn warmup_candidate(
     arena_budget: Option<usize>,
 ) -> anyhow::Result<()> {
     let inputs = prepare_candidate(device, plan, inputs, shapes, arena_budget)?;
-    let mut arena = ProfilingMemory::new(device.stream().clone(), device.slab_bytes())?;
+    let mut arena = CudaMemory::new(device.stream().clone(), device.slab_bytes())?;
     initialize_inputs(device, plan, &mut arena, &inputs, &shapes.values)?;
     let mut staging = device.allocate_staging(device.stats().staging_bytes)?;
     device.execute(arena.arena(), &mut staging, &shapes.values)
-}
-
-use crate::CudaArena;
-struct ProfilingMemory {
-    buffer: CudaSlice<u8>,
-    stream: Arc<CudaStream>,
-}
-impl ProfilingMemory {
-    fn new(stream: Arc<CudaStream>, bytes: usize) -> Result<Self> {
-        // SAFETY: the caller initializes inputs; program operations initialize destinations.
-        let buffer = unsafe { stream.alloc(bytes.max(1))? };
-        Ok(Self { buffer, stream })
-    }
-
-    fn arena(&mut self) -> CudaArena<'_> {
-        // SAFETY: this exclusive borrow keeps the allocation alive through execution.
-        unsafe { CudaArena::from_raw(self.ptr(), self.bytes()) }
-    }
-    fn ptr(&self) -> u64 {
-        self.buffer.device_ptr(&self.stream).0
-    }
-    fn bytes(&self) -> usize {
-        self.buffer.len()
-    }
-
-    fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
-        let end = offset
-            .checked_add(data.len())
-            .ok_or_else(|| anyhow!("upload range overflow"))?;
-        ensure!(end <= self.bytes(), "upload exceeds allocation");
-        self.stream
-            .memcpy_htod(data, &mut self.buffer.slice_mut(offset..end))?;
-        self.stream.synchronize()?;
-        Ok(())
-    }
 }

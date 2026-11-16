@@ -4,10 +4,10 @@ use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
     CONSTRUCTOR as IN_PLACE, CublasLtAccumulateInPlace, CublasLtAccumulateInPlaceMatcher,
 };
-use luminal_cuda_lite::ops::cublaslt::approved::{
-    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST,
-};
 use luminal_cuda_lite::ops::cublaslt::exec::LtComputation;
+use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+    CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher, WHITELIST,
+};
 
 #[cfg(feature = "device")]
 mod support;
@@ -50,7 +50,7 @@ fn saturate(model: &Graph, table: &str) -> EGraph {
     graph.serialize(Default::default()).egraph
 }
 
-fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
+fn calls(graph: &EGraph) -> (Vec<CublasLtOutOfPlace>, Vec<CublasLtAccumulateInPlace>) {
     let index = SerializedIndex::new(graph);
     let mut separate = Vec::new();
     let mut in_place = Vec::new();
@@ -66,10 +66,10 @@ fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlac
         };
         match node.op.as_str() {
             CONSTRUCTOR => separate.push(
-                ApprovedCublasLtMatcher
+                CublasLtOutOfPlaceMatcher
                     .extract(&site)
                     .as_any()
-                    .downcast_ref::<ApprovedCublasLt>()
+                    .downcast_ref::<CublasLtOutOfPlace>()
                     .unwrap()
                     .clone(),
             ),
@@ -292,7 +292,7 @@ mod execution {
         let mut found = false;
         for node in runtime.plan().unwrap().dag.node_weights() {
             if let BufferNode::Compute { op, .. } = node {
-                if let Some(op) = op.as_any().downcast_ref::<ApprovedCublasLt>() {
+                if let Some(op) = op.as_any().downcast_ref::<CublasLtOutOfPlace>() {
                     assert!(!in_place);
                     assert_eq!(op.computation, mode(dtype));
                     found = true;
@@ -452,7 +452,7 @@ mod execution {
                     registry(dtype, false),
                 );
                 // The authored final cast is intentionally outside the F32 call.
-                assert!(runtime.plan().unwrap().dag.node_weights().any(|node|matches!(node,BufferNode::Compute{op,..} if op.as_any().downcast_ref::<ApprovedCublasLt>().is_some_and(|op|op.computation==mode(dtype)&&op.bias.is_some()))));
+                assert!(runtime.plan().unwrap().dag.node_weights().any(|node|matches!(node,BufferNode::Compute{op,..} if op.as_any().downcast_ref::<CublasLtOutOfPlace>().is_some_and(|op|op.computation==mode(dtype)&&op.bias.is_some()))));
                 let rounded = |value| {
                     if dtype == DType::F16 {
                         half::f16::from_f32(value).to_f32()

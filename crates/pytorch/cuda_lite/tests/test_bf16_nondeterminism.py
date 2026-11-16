@@ -11,7 +11,7 @@ the unsound F32-output cuBLASLt candidate. This test fails if ANY compile breaks
 import pytest
 import torch
 import torch._dynamo
-from luminal_cuda_lite import Compiler
+from luminal_torch_cuda_lite_compiler import Compiler
 
 luminal_backend = Compiler()
 

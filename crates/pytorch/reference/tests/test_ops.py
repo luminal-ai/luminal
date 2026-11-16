@@ -1,6 +1,6 @@
 """Operator matrix: elementwise, unary, matmul, movement, reductions."""
 
-import luminal_reference
+import luminal_torch_reference_compiler
 import torch
 import torch.nn as nn
 
@@ -8,7 +8,7 @@ import torch.nn as nn
 def _check(model: nn.Module, *inputs: torch.Tensor, atol: float = 1e-5) -> None:
     torch.manual_seed(0)
     eager = model(*inputs)
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
     out = compiled(*inputs)
     assert out.shape == eager.shape, f"{out.shape} != {eager.shape}"
     assert torch.allclose(out, eager, atol=atol), f"{out} != {eager}"
@@ -226,7 +226,7 @@ def test_cat() -> None:
 
 def _check_input(model: nn.Module, x: torch.Tensor) -> None:
     eager = model(x)
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
     out = compiled(x.clone())
     assert out.shape == eager.shape, f"{out.shape} != {eager.shape}"
     assert torch.equal(out.to(torch.float32), eager.to(torch.float32)), (

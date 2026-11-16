@@ -1,10 +1,21 @@
-"""Facts about what the boundary declares and refuses, asked without a device.
+"""Facts about what the boundary declares and refuses at COMPILE time, asked
+without a device.
+
+What a CALL's tensors must satisfy is checked by the runtime when it reads
+the arguments; those facts are the unit tests of ``call.rs`` in the
+extension, and ``test_backend.py`` exercises them through compiled calls.
 
 ``boundary.py`` never touches device memory — it reads a tensor's class,
 layout, dtype, storage offset, shape and strides, and a declaration — so
-these run on a CPU host and without the built extension: the module is
-loaded straight from its source path rather than through the package,
-whose ``__init__`` imports the Rust extension.
+these run on a CPU host and without the compiler's extension: the module
+is loaded straight from its source path rather than through the package,
+whose ``__init__`` imports the compiler's Rust extension. It does import
+the runtime package, for the refusal class the two share.
+
+A real tensor built here names its device. The shared suite's fixtures set
+torch's default device to the backend's for every test of a session they
+are loaded into, and that includes these tests whenever both directories
+run together; a tensor that must be a CPU one says so.
 """
 
 import importlib.util
@@ -19,7 +30,7 @@ sympy = pytest.importorskip("sympy")
 _SOURCE = (
     pathlib.Path(__file__).resolve().parents[1]
     / "python"
-    / "luminal_cuda_lite"
+    / "luminal_torch_cuda_lite_compiler"
     / "boundary.py"
 )
 _SPEC = importlib.util.spec_from_file_location("luminal_cuda_lite_boundary", _SOURCE)
@@ -30,85 +41,9 @@ sys.modules[_SPEC.name] = boundary
 _SPEC.loader.exec_module(boundary)
 
 
-def _binding(name, shape, layout):
-    return boundary.Binding(
-        name=name, buffer=0, dtype=torch.float32, shape=shape, layout=layout
-    )
-
-
 def _chain(strides):
     """A declared layout at literal element strides, in the wire spelling."""
     return boundary.Strided(tuple(f"Integer({stride})" for stride in strides))
-
-
-def test_check_binding_refuses_a_stride_no_dimension_of_the_call_pins():
-    """A declared stride naming a dimension no boundary of this call gives
-    an extent cannot be compared with the tensor's own. This is the last
-    place a stride is looked at, so it is refused by name rather than left
-    to a runtime that only ever sees an address and a byte count."""
-    binding = _binding(
-        "x", (sympy.Symbol("s0"), 4), boundary.Strided(("Integer(1)", "Symbol('s1')"))
-    )
-    with pytest.raises(boundary.UnsupportedBoundary, match="s1"):
-        boundary.check_binding(binding, torch.empty(3, 4))
-
-
-def test_check_binding_reads_strides_against_the_whole_calls_dimensions():
-    """A dimension ANOTHER boundary of the same call spells bare is what
-    pins this one's declared stride, so the map handed to the check is the
-    call's and not the tensor's."""
-    x = _binding("x", (sympy.Symbol("s0"), 4), _chain((4, 1)))
-    w = _binding("w", (2, 4), boundary.Strided(("Integer(1)", "Symbol('s0')")))
-    x_value = torch.empty(3, 4)
-    # Shape (2, 4) at element strides (1, 3): two rows of a transposed
-    # (4, 3) buffer, so the second axis is strided by x's dimension.
-    w_value = torch.empty(4, 3).t()[:2]
-    assert w_value.stride() == (1, 3)
-
-    dims = boundary.call_dim_values([(x, x_value), (w, w_value)])
-    assert dims == {"s0": 3}
-    boundary.check_binding(w, w_value, dims)
-    # Without the call's map w states a dimension of its own that nothing
-    # pins, and the stride would go unchecked.
-    with pytest.raises(boundary.UnsupportedBoundary, match="s0"):
-        boundary.check_binding(w, w_value)
-
-
-def test_check_binding_dimensions_refuse_one_symbol_with_two_extents():
-    """One dimension, two extents: the strides of the whole call are read
-    against one map, so a call whose boundaries disagree about a dimension
-    is refused naming the dimension and both extents."""
-    a = _binding("a", (sympy.Symbol("s0"), 4), _chain((4, 1)))
-    b = _binding("b", (sympy.Symbol("s0"), 4), _chain((4, 1)))
-    with pytest.raises(boundary.UnsupportedBoundary) as refusal:
-        boundary.call_dim_values([(a, torch.empty(3, 4)), (b, torch.empty(5, 4))])
-    message = str(refusal.value)
-    assert "s0" in message, message
-    assert "3" in message and "5" in message, message
-    assert "'a'" in message and "'b'" in message, message
-
-
-def test_check_binding_checks_a_compound_extent_against_the_calls_dimensions():
-    """A declared extent over the program's dimensions is checked here, not
-    only its strides: a call that brings FEWER rows than the declaration
-    makes still fits inside the bytes it hands over, so nothing downstream
-    would catch it."""
-    binding = _binding("x", (2 * sympy.Symbol("s0"), 4), _chain((4, 1)))
-    boundary.check_binding(binding, torch.empty(6, 4), {"s0": 3})
-    with pytest.raises(boundary.UnsupportedBoundary) as refusal:
-        boundary.check_binding(binding, torch.empty(4, 4), {"s0": 3})
-    message = str(refusal.value)
-    assert "axis 0" in message, message
-    assert "s0" in message, message
-    assert "6" in message and "4" in message, message
-
-
-def test_check_binding_refuses_an_extent_no_dimension_of_the_call_pins():
-    """The same declaration with nothing stating its dimension: refused by
-    name rather than left unchecked."""
-    binding = _binding("x", (2 * sympy.Symbol("s0"), 4), _chain((4, 1)))
-    with pytest.raises(boundary.UnsupportedBoundary, match="s0"):
-        boundary.check_binding(binding, torch.empty(6, 4), {})
 
 
 class _Boundary:
@@ -201,16 +136,6 @@ def test_a_storage_offset_is_refused_by_name():
     assert boundary.boundary_layout("x", _Boundary((4, 4), (1, 8))) == _chain((1, 8))
 
 
-def test_a_storage_offset_is_refused_at_call_time_too():
-    """Dynamo guards shapes, not storage offsets, so a program compiled on
-    a tensor at its storage's base can be called with one that is not:
-    checked again per call."""
-    binding = _binding("x", (4, 4), _chain((4, 1)))
-    boundary.check_binding(binding, _Boundary((4, 4), (4, 1)))
-    with pytest.raises(boundary.UnsupportedBoundary, match="storage offset 8"):
-        boundary.check_binding(binding, _Boundary((4, 4), (4, 1), offset=8))
-
-
 def test_a_tensor_subclass_is_refused_by_name():
     """A subclass carries semantics of its own — a distributed tensor's
     sizes are the global ones, a masked tensor's elements are not all
@@ -222,13 +147,17 @@ def test_a_tensor_subclass_is_refused_by_name():
         pass
 
     with pytest.raises(boundary.UnsupportedBoundary) as refusal:
-        boundary.boundary_layout("x", torch.empty(4, 4).as_subclass(_Exotic))
+        boundary.boundary_layout(
+            "x", torch.empty(4, 4, device="cpu").as_subclass(_Exotic)
+        )
     message = str(refusal.value)
     assert "x:" in message, message
     assert "_Exotic" in message, message
 
     with pytest.raises(boundary.UnsupportedBoundary, match="expected a CUDA tensor"):
-        boundary.boundary_layout("w", torch.nn.Parameter(torch.empty(4, 4)))
+        boundary.boundary_layout(
+            "w", torch.nn.Parameter(torch.empty(4, 4, device="cpu"))
+        )
 
 
 def test_a_parameter_of_a_custom_tensor_type_is_refused_by_name():
@@ -241,7 +170,7 @@ def test_a_parameter_of_a_custom_tensor_type_is_refused_by_name():
     class _Exotic(torch.Tensor):
         pass
 
-    exotic = torch.empty(4, 4).as_subclass(_Exotic)
+    exotic = torch.empty(4, 4, device="cpu").as_subclass(_Exotic)
     exotic._is_param = True
     assert isinstance(exotic, torch.nn.Parameter)
 
@@ -263,31 +192,3 @@ def test_a_zero_extent_states_torchs_own_strides(shape, strides):
     it. Nothing here synthesizes a chain that could disagree."""
     assert strides == _torch_contiguous_strides(shape)
     assert boundary.boundary_layout("out", _Boundary(shape, strides)) == _chain(strides)
-
-
-@pytest.mark.parametrize(
-    ("shape", "row_chain", "column_chain"),
-    [((4, 0), (1, 1), (1, 4)), ((0, 4), (4, 1), (1, 1))],
-)
-def test_a_zero_extent_allocation_is_not_refused(shape, row_chain, column_chain):
-    """What the wrapper allocates for an empty output — ``empty_strided``
-    at the declared strides — is what the binding check must accept,
-    whichever chain the output was declared at."""
-    for chain in (row_chain, column_chain):
-        binding = _binding("out", shape, _chain(chain))
-        allocated = boundary.declared_strides(binding, shape, {})
-        assert allocated == chain
-        boundary.check_binding(binding, _Boundary(shape, allocated))
-
-
-def test_a_zero_extent_makes_every_stride_insignificant():
-    """One empty axis and the tensor addresses no element at all, so no
-    stride carries information — the contract inductor states in
-    ``significant_strides_equal``. The strides here are nothing torch would
-    produce and are accepted all the same."""
-    binding = _binding("out", (4, 0, 3), _chain((3, 3, 1)))
-    boundary.check_binding(binding, _Boundary((4, 0, 3), (99, 7, 5)))
-    # An extent that is not zero is still held to the declared stride.
-    full = _binding("out", (4, 2, 3), _chain((6, 3, 1)))
-    with pytest.raises(boundary.UnsupportedBoundary, match="axis 0"):
-        boundary.check_binding(full, _Boundary((4, 2, 3), (99, 3, 1)))

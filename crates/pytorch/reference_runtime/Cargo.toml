@@ -1,0 +1,29 @@
+[package]
+name = "luminal_torch_reference_runtime"
+version = "0.1.0"
+edition.workspace = true
+
+# The reference backend's torch runtime: the code object a compiled graph is,
+# and the call path that runs one. It is everything a saved program needs at
+# load. It depends on no compiler: not on the parser, the translator or
+# search. The reference compiler depends on this crate to build code objects;
+# never the reverse.
+
+[lib]
+name = "luminal_torch_reference_runtime"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+half = { version = "2.7.1", features = ["num-traits", "bytemuck"] }
+float8 = { version = "0.7", features = ["bytemuck", "num-traits"] }
+luminal = { path = "../../.." }
+luminal_reference = { path = "../../luminal_reference" }
+luminal_torch_slots = { path = "../slots", features = ["python"] }
+luminal_torch_code = { path = "../code", features = ["python"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dependencies.pyo3]
+version = "0.28.0"
+features = ["abi3-py38"]

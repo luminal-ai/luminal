@@ -22,7 +22,7 @@ def _backend(inputs):
             raise ValueError(
                 f"{name} test received a {value.device.type} input; expected {expected}"
             )
-    return importlib.import_module(f"luminal_{name}")
+    return importlib.import_module(f"luminal_torch_{name}_compiler")
 
 
 def luminal_backend(gm, example_inputs, options=None):
@@ -98,7 +98,7 @@ def _fully_decomposed_backend(**options):
     applied, instead of the table that leaves the composites the translator
     lowers itself. The translator then sees only primitive ops."""
     name = selected_backend()
-    aot = importlib.import_module(f"luminal_{name}.aot")
+    aot = importlib.import_module(f"luminal_torch_{name}_compiler.aot")
     base = aot.ReferenceAOTBackend if name == "reference" else aot.CudaAOTBackend
 
     def every_core_decomposition():

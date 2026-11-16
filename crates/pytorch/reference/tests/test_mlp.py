@@ -1,6 +1,6 @@
-"""End-to-end MLP via `torch.compile(backend=luminal_reference.Compiler())`."""
+"""End-to-end MLP via `torch.compile(backend=luminal_torch_reference_compiler.Compiler())`."""
 
-import luminal_reference
+import luminal_torch_reference_compiler
 import torch
 import torch.nn as nn
 
@@ -21,7 +21,7 @@ def test_mlp_matches_eager_compiler() -> None:
     x = torch.randn(3, 4)
     eager = model(x)
 
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
     out = compiled(x)
 
     assert out.shape == eager.shape
@@ -31,7 +31,7 @@ def test_mlp_matches_eager_compiler() -> None:
 def test_mlp_rebinds_new_inputs_without_recompile() -> None:
     torch.manual_seed(0)
     model = MLP()
-    compiled = torch.compile(model, backend=luminal_reference.Compiler())
+    compiled = torch.compile(model, backend=luminal_torch_reference_compiler.Compiler())
 
     for _ in range(3):
         x = torch.randn(3, 4)

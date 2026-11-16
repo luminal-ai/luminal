@@ -246,7 +246,7 @@ fn plan_with_form(fixture: &Fixture, in_place: bool) -> CudaPlan {
             if in_place {
                 CONSTRUCTOR
             } else {
-                luminal_cuda_lite::ops::cublaslt::approved::CONSTRUCTOR
+                luminal_cuda_lite::ops::cublaslt::out_of_place::CONSTRUCTOR
             },
             "LayoutTensorOpIndexMapApplyViewGeneric",
         ],
@@ -490,7 +490,7 @@ fn execute_fixture_with_form(fixture: Fixture, keep_c: bool, in_place: bool) {
         .unwrap();
     let mut arena = Allocation::new(
         device.stream().clone(),
-        executable.memory_plan().unwrap().slab_bytes,
+        executable.program().unwrap().arena_bytes,
     )
     .unwrap();
     for binding in fixture.bindings.inputs() {
@@ -499,7 +499,7 @@ fn execute_fixture_with_form(fixture: Fixture, keep_c: bool, in_place: bool) {
             .values()
             .find(|buffer| buffer.lit == Some(binding.buffer))
             .unwrap();
-        let range = executable.memory_plan().unwrap().slices[&buffer.id];
+        let range = executable.program().unwrap().slice(&buffer.id).unwrap();
         let values = &fixture
             .inputs
             .iter()

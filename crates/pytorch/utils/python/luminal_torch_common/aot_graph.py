@@ -45,11 +45,14 @@ from .graph_prep import (
 
 @dataclass
 class GraphRecord:
-    """Inspection evidence for one compiled AOT graph.
+    """Inspection evidence for one compiled AOT graph: plain facts about it.
 
-    ``program`` is the native compiled program behind the graph (``None``
-    when the graph only forwards inputs and sizes); it owns the runtime and
-    the program's constants, and nothing else here retains a tensor.
+    ``slots`` are the graph's argument slots, ``(kind, name, read,
+    symbol)``, and ``checks`` the messages of the size conditions torch
+    asserted in it. ``program`` is the compiled program torch calls
+    (``None`` when the graph only forwards inputs and sizes). The compiler's
+    own state (the translation, the searched graph) is not kept here: it is
+    dropped once the program exists.
     """
 
     phase: str
@@ -58,6 +61,8 @@ class GraphRecord:
     targets: tuple[str, ...] = ()
     executions: int = 0
     bounds: dict = field(default_factory=dict)
+    slots: tuple = ()
+    checks: tuple = ()
     program: Any = None
 
 
@@ -268,6 +273,62 @@ class LocalGraph:
             scalar_leaves=self.scalar_leaves,
             device=self.device,
         )
+
+    def leaf_rows(self) -> list:
+        """The output leaves as plain rows, one per leaf in order: what a
+        backend puts in its compiled program so a call can build the output
+        without this object.
+
+        * ``{"source": "row", "row": i, "scalar": flag}``: the tensor the
+          program wrote in row ``i``; ``scalar`` when the graph returned a
+          Python scalar that was boxed into a rank-zero tensor.
+        * ``{"source": "argument", "slot": i}``: the caller's own argument.
+        * ``{"source": "expression", "kind": kind, "expr": srepr,
+          "sources": [[symbol, slot, axis], ...]}``: a symbolic scalar, with
+          where a call states each dimension it names (``axis`` is ``None``
+          for an integer argument that is the dimension).
+        * ``{"source": "literal", "value": value}``: a value written in the
+          program.
+        """
+        import sympy
+
+        rows = []
+        for position, slot in enumerate(self.output_slots):
+            if slot.source == PROGRAM:
+                rows.append(
+                    {
+                        "source": "row",
+                        "row": slot.index,
+                        "scalar": position in self.scalar_leaves,
+                    }
+                )
+            elif slot.source == INPUT:
+                rows.append({"source": "argument", "slot": slot.index})
+            elif slot.source == LITERAL:
+                if slot.value is not None and not isinstance(
+                    slot.value, (bool, int, float, str)
+                ):
+                    raise TypeError(
+                        f"output leaf {position} is the constant {slot.value!r}, a "
+                        f"{type(slot.value).__name__}; a compiled program states "
+                        "None, a bool, an int, a float or a str"
+                    )
+                rows.append({"source": "literal", "value": slot.value})
+            else:
+                expression = slot.value
+                rows.append(
+                    {
+                        "source": "expression",
+                        "kind": slot.kind,
+                        "expr": sympy.srepr(expression),
+                        "sources": [
+                            [symbol.name, *self.sources[symbol]]
+                            for symbol in sorted(expression.free_symbols, key=str)
+                            if symbol in self.sources
+                        ],
+                    }
+                )
+        return rows
 
     def bind(self, args) -> list:
         """One AOT call's arguments, one per slot."""

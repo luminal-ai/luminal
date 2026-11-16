@@ -69,7 +69,9 @@ def test_unknown_symbolic_expression_does_not_freeze_hint(device, monkeypatch):
     assert changed, "the program states no dynamic extent"
     altered = json.dumps(payload).encode()
 
-    native = importlib.import_module(f"luminal_{selected_backend()}._luminal")
+    native = importlib.import_module(
+        f"luminal_torch_{selected_backend()}_compiler._luminal"
+    )
     # The CUDA entry also takes the boundary layouts, which translation
     # never reaches here.
     layouts = ([], [], []) if selected_backend() == "cuda_lite" else ()

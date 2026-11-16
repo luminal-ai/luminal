@@ -431,7 +431,7 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
         )
         .expect("bias search");
     assert!(fused.plan().unwrap().dag.node_weights().any(|node| matches!(node,
-        BufferNode::Compute{op,..} if op.as_any().downcast_ref::<luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt>().is_some_and(|call|call.bias.is_some()))));
+        BufferNode::Compute{op,..} if op.as_any().downcast_ref::<luminal_cuda_lite::ops::cublaslt::out_of_place::CublasLtOutOfPlace>().is_some_and(|call|call.bias.is_some()))));
     let mut arena = support::allocate_arena(&fused).unwrap();
     fused.upload(&mut arena, x, weights(STATE, 1)).unwrap();
     fused

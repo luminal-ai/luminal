@@ -84,7 +84,11 @@ members = [
     "crates/luminal_tracing",
     "tests/scalar_refs",
     "tests/test_runtime",
+    "crates/pytorch/slots",
+    "crates/pytorch/code",
     "crates/pytorch/utils",
+    "crates/pytorch/reference_runtime",
+    "crates/pytorch/cuda_lite_runtime",
     "crates/pytorch/reference",
     "crates/pytorch/cuda_lite",
 ]

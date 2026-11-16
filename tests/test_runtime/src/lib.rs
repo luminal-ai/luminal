@@ -75,7 +75,7 @@ pub fn matchers() -> Vec<Box<dyn OpMatcher>> {
     matchers.push(Box::new(AddMulFusedMatcher));
     matchers.extend(ops::mutating::mutating_matchers());
     matchers.push(Box::new(
-        luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLtMatcher,
+        luminal_cuda_lite::ops::cublaslt::out_of_place::CublasLtOutOfPlaceMatcher,
     ));
     matchers.push(Box::new(
         luminal_cuda_lite::ops::cublaslt::accumulate_in_place::CublasLtAccumulateInPlaceMatcher,

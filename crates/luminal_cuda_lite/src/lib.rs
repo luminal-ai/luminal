@@ -66,6 +66,7 @@ pub mod host;
 pub mod host_buffer;
 pub mod kernels;
 pub mod layouts;
+pub mod lowered;
 pub mod op;
 pub mod ops;
 pub mod runtime;
@@ -79,6 +80,8 @@ pub mod device;
 /// evaluator. Device builds only — it measures, so it needs a device.
 #[cfg(feature = "device")]
 pub mod profile;
+#[cfg(feature = "device")]
+pub mod stream;
 
 pub use bindings::CudaBindings;
 pub use host::HostOp;

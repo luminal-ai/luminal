@@ -3,10 +3,10 @@ use luminal::dtype::PlanDtype;
 use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
 use luminal::prelude::egraph_serialize::EGraph;
 use luminal::prelude::*;
-use luminal_cuda_lite::ops::cublaslt::approved::{
-    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST,
-};
 use luminal_cuda_lite::ops::cublaslt::exec::{LtActivation, LtReductionSchemeMask};
+use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+    CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher, WHITELIST,
+};
 
 fn saturate(model: &Graph, whitelist: &str) -> EGraph {
     let matchers: Vec<_> = luminal_cuda_lite::cuda_registry()
@@ -33,7 +33,7 @@ fn saturate(model: &Graph, whitelist: &str) -> EGraph {
     graph.serialize(Default::default()).egraph
 }
 
-fn calls(graph: &EGraph) -> Vec<ApprovedCublasLt> {
+fn calls(graph: &EGraph) -> Vec<CublasLtOutOfPlace> {
     let index = SerializedIndex::new(graph);
     graph
         .nodes
@@ -42,7 +42,7 @@ fn calls(graph: &EGraph) -> Vec<ApprovedCublasLt> {
             if node.subsumed || node.op != CONSTRUCTOR {
                 return None;
             }
-            let op = ApprovedCublasLtMatcher.extract(&ExtractionSite {
+            let op = CublasLtOutOfPlaceMatcher.extract(&ExtractionSite {
                 egraph: graph,
                 node_id: id,
                 node,
@@ -50,7 +50,7 @@ fn calls(graph: &EGraph) -> Vec<ApprovedCublasLt> {
             });
             Some(
                 op.as_any()
-                    .downcast_ref::<ApprovedCublasLt>()
+                    .downcast_ref::<CublasLtOutOfPlace>()
                     .unwrap()
                     .clone(),
             )
@@ -84,13 +84,13 @@ fn empty_whitelist_cannot_emit_any_call_or_decorated_variant() {
 #[test]
 fn removing_one_configuration_disables_exactly_that_configuration() {
     let model = fixture();
-    let configuration = whitelist::key(&ApprovedCublasLt::prototype());
+    let configuration = whitelist::key(&CublasLtOutOfPlace::prototype());
     let expected = format!("(cublaslt-approved-configuration {configuration})");
     let entry = WHITELIST
         .split("\n\n")
         .find(|entry| entry.split_whitespace().collect::<Vec<_>>().join(" ") == expected)
         .expect("the exact float32 configuration is whitelisted");
-    let key = |call: &ApprovedCublasLt| {
+    let key = |call: &CublasLtOutOfPlace| {
         let resolved = call.resolve(&Default::default());
         call.a.dtype == PlanDtype::F32
             && call.b.dtype == PlanDtype::F32
@@ -116,9 +116,9 @@ fn removing_an_accumulation_configuration_disables_both_executable_forms() {
         CONSTRUCTOR as IN_PLACE_CONSTRUCTOR, CublasLtAccumulateInPlace,
         CublasLtAccumulateInPlaceMatcher,
     };
-    let mut prototype = ApprovedCublasLt::prototype();
+    let mut prototype = CublasLtOutOfPlace::prototype();
     prototype.c = Some(prototype.d.clone());
-    prototype.scalars = luminal_cuda_lite::ops::cublaslt::approved::Scalars::host(1.0, 1.0);
+    prototype.scalars = luminal_cuda_lite::ops::cublaslt::out_of_place::Scalars::host(1.0, 1.0);
     let configuration = whitelist::key(&prototype);
     let expected = format!("(cublaslt-approved-configuration {configuration})");
     let entry = WHITELIST
@@ -267,13 +267,13 @@ fn whitelist_mask_reaches_both_executable_forms_for_matrices_and_batches() {
             let a = model.tensor(shape(3, 8), DType::F32);
             let b = model.tensor(shape(8, 4), DType::F32);
             let product = a.matmul(b);
-            let mut prototype = ApprovedCublasLt::prototype();
+            let mut prototype = CublasLtOutOfPlace::prototype();
             if with_c {
                 let c = model.tensor(shape(3, 4), DType::F32);
                 let _out = product + c;
                 prototype.c = Some(prototype.d.clone());
                 prototype.scalars =
-                    luminal_cuda_lite::ops::cublaslt::approved::Scalars::host(1.0, 1.0);
+                    luminal_cuda_lite::ops::cublaslt::out_of_place::Scalars::host(1.0, 1.0);
             }
             for mask in [
                 LtReductionSchemeMask::All,
@@ -369,7 +369,7 @@ fn symbolic_bias_and_relu_have_a_complete_production_extraction() {
     let mut fused_relu = false;
     for node in extracted.dag.node_weights() {
         if let luminal::layout_ir::ExtractedNode::LayoutOp(node) = node {
-            if let Some(op) = node.op.as_any().downcast_ref::<ApprovedCublasLt>() {
+            if let Some(op) = node.op.as_any().downcast_ref::<CublasLtOutOfPlace>() {
                 assert!(op.bias.is_some());
                 fused_relu |= op.activation == LtActivation::RectifiedLinear;
                 library += 1;

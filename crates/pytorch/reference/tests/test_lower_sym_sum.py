@@ -11,7 +11,7 @@ node, the contract is the same: the graph handed to the translator has no
 
 import torch
 from backend_test_utils import record_lowered_graphs
-from luminal_reference import Compiler
+from luminal_torch_reference_compiler import Compiler
 from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
 
 

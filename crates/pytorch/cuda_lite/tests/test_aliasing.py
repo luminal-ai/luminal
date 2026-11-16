@@ -11,9 +11,9 @@ skip cleanly.
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("luminal_cuda_lite")
+pytest.importorskip("luminal_torch_cuda_lite_compiler")
 
-import luminal_cuda_lite  # noqa: E402
+import luminal_torch_cuda_lite_compiler  # noqa: E402
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 
@@ -36,7 +36,9 @@ def _same_as_eager(fn, *make_inputs):
     eager_inputs = [make() for make in make_inputs]
     compiled_inputs = [make() for make in make_inputs]
     eager = fn(*eager_inputs)
-    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(*compiled_inputs)
+    got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(
+        *compiled_inputs
+    )
     eager_list = list(eager) if isinstance(eager, (tuple, list)) else [eager]
     got_list = list(got) if isinstance(got, (tuple, list)) else [got]
     assert len(got_list) == len(eager_list)
@@ -184,7 +186,9 @@ def test_module_buffer_slice_write():
 
     eager_model, model = Cache(), Cache()
     eager = eager_model(_x())
-    got = torch.compile(model, backend=luminal_cuda_lite.Compiler())(_x())
+    got = torch.compile(model, backend=luminal_torch_cuda_lite_compiler.Compiler())(
+        _x()
+    )
     torch.testing.assert_close(got, eager)
     torch.testing.assert_close(
         model.kv, eager_model.kv, msg="the buffer's rows 1:3 hold x"
@@ -204,7 +208,9 @@ def test_writes_through_storage_sharing_inputs_match_eager():
 
     eager_x, x = _x(), _x()
     want = fn(eager_x, eager_x[0])
-    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, x[0])
+    got = torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(
+        x, x[0]
+    )
     torch.testing.assert_close(got, want)
     torch.testing.assert_close(x, eager_x)
     assert got.data_ptr() == x.data_ptr(), (
@@ -221,4 +227,4 @@ def test_returned_view_at_a_storage_offset_is_refused_by_name():
         return x[1]
 
     with pytest.raises(Exception, match="storage offset"):
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(_x())
+        torch.compile(fn, backend=luminal_torch_cuda_lite_compiler.Compiler())(_x())

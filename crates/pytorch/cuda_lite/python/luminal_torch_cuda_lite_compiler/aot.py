@@ -15,77 +15,38 @@ Collective operations are refused by name. A program that communicates must be
 split by the application so that each compiled graph is collective-free.
 """
 
-import dataclasses
+import json
 from functools import partial
-from typing import Any
 
 import torch
 from luminal_torch_common.aot_graph import (
     GraphRecord,
-    LocalGraph,
     prepare_local_graph,
     refuse_collectives,
 )
 from luminal_torch_common.graph_prep import _aot_decomposition_table, private_graph_copy
+from luminal_torch_cuda_lite_runtime import Code
 from torch._dynamo.backends.common import aot_autograd
-from torch._inductor.output_code import OutputCode
 
 from . import _luminal
 from .backend import _compile_local_graph
+from .boundary import layout_from_spec
 
-__all__ = ["CudaAOTBackend", "CudaOutputCode", "GraphRecord"]
+__all__ = ["Code", "CudaAOTBackend", "GraphRecord"]
 
 
-@dataclasses.dataclass
-class CudaOutputCode(OutputCode):
-    """One AOTAutograd graph compiled for the CUDA-lite runtime, as the
-    object torch's AOT machinery holds and calls.
+class _Recorded(Code):
+    """A code object that also counts its calls on the compiler's inspection
+    record. It saves as a plain ``Code``: the record is the compiler's, and
+    a saved program names the runtime alone."""
 
-    ``local`` is the graph's boundary, ``compiled`` the compiled program
-    (``None`` for a graph that only forwards inputs and sizes), and
-    ``record`` the inspection record of the compile.
+    def __init__(self, code: bytes, record: GraphRecord) -> None:
+        super().__init__(code)
+        self.record = record
 
-    torch prepares the saved form of every graph while ``aot_compile``
-    runs. The CUDA runtime has no serialized form of a searched plan yet,
-    so a graph it computes cannot be saved, and ``aot_compile`` is refused
-    here, by name.
-    """
-
-    local: LocalGraph | None = None
-    compiled: Any = None
-    record: GraphRecord | None = None
-
-    def __post_init__(self) -> None:
-        # torch calls a compiled graph with its arguments in one list. It
-        # reads this flag off a wrapper that copies the instance's own
-        # attributes, so it is set on the instance.
-        self._boxed_call = True
-
-    def __call__(self, inputs) -> Any:
-        args = self.local.bind(inputs)
-        rows = self.compiled.rows(*args) if self.compiled is not None else ()
-        if self.record is not None:
-            self.record.executions += 1
-        return self.local.assemble(args, rows)
-
-    def prepare_for_serialization(self) -> None:
-        """Turn this object into its saved form, on the shallow copy torch
-        makes while ``aot_compile`` runs. Only a graph with no compiled
-        program has one: its boundary, as plain data."""
-        if self.compiled is not None:
-            raise NotImplementedError(
-                "luminal_cuda_lite cannot save a compiled graph yet: the CUDA runtime "
-                "has no serialized form of a searched plan (LUM-806, LUM-864)"
-            )
-        self.local = self.local.portable()
-        self.record = None
-
-    def post_compile(self, example_inputs, constants, graph_kwargs) -> None:
-        """torch calls this once on a loaded object. A saved graph has no
-        compiled program, so there is nothing to rebuild."""
-
-    def set_triton_bundle(self, triton_bundle: Any) -> None:
-        """Part of the ``OutputCode`` interface; there is nothing to bundle."""
+    def __call__(self, inputs: list):
+        self.record.executions += 1
+        return super().__call__(inputs)
 
 
 def _saved_activation_outputs(local, phase):
@@ -123,7 +84,7 @@ def _saved_activation_outputs(local, phase):
     return frozenset(dense)
 
 
-def _report_output_strides(local, compiled):
+def _report_output_strides(local, graph):
     """Tell AOTAutograd the strides every forward output is returned at:
     one entry per output of the AOT graph, read from the layout the output
     was bound at (eager's, row-major, or a view's), ``None`` for a
@@ -134,11 +95,14 @@ def _report_output_strides(local, compiled):
     context = TracingContext.try_get()
     if context is None or context.output_strides is None:
         return
+    names = graph.output_names
+    layouts = graph.output_layouts
     strides = [None] * len(local.output_slots)
     for i in local.positions:
         # The row the leaf's value is written in is the plan's to say.
-        binding = compiled._output_bindings[local.output_slots[i].index]
-        spelled = [sympy.sympify(stride) for stride in binding.layout.strides]
+        row = local.output_slots[i].index
+        layout = layout_from_spec(names[row], *layouts[row])
+        spelled = [sympy.sympify(stride) for stride in layout.strides]
         if all(stride.is_Integer for stride in spelled):
             strides[i] = tuple(int(stride) for stride in spelled)
     context.output_strides.extend(strides)
@@ -195,7 +159,9 @@ def _compile_graph(
         gm, inputs, device_type="cuda", boundary_plan=_luminal.boundary_plan
     )
 
-    compiled = None
+    # The output leaves as plain rows: what the code object builds a call's
+    # output from.
+    leaves = local.leaf_rows()
     if local.computes:
         dense = _saved_activation_outputs(local, phase)
         record.input_shapes = tuple(
@@ -213,20 +179,33 @@ def _compile_graph(
         from torch._subclasses.fake_tensor import unset_fake_temporarily
 
         with unset_fake_temporarily(), tracing(None):
-            compiled = _compile_local_graph(
+            code, graph = _compile_local_graph(
                 local.program,
                 local.example_inputs,
+                leaves,
                 search_iterations=search_iterations,
                 search_log=search_log,
                 device_budget_bytes=device_budget_bytes,
                 max_intermediate_bytes=max_intermediate_bytes,
                 dense_outputs=dense,
             )
-        _report_output_strides(local, compiled)
-        record.bounds = compiled._graph.dim_bounds
-        record.program = compiled
+        _report_output_strides(local, graph)
+        record.bounds = graph.dim_bounds
+        record.slots = tuple(graph.input_slots)
+        record.checks = tuple(graph.runtime_assertions)
+    else:
+        # Nothing is computed: the graph forwards arguments, sizes and
+        # constants, and its code object has no program.
+        code = bytes(
+            _luminal.forwarding_code(local.program.program_json(), json.dumps(leaves))
+        )
 
-    return CudaOutputCode(local=local, compiled=compiled, record=record)
+    # From here on a call needs only the code object. The lowered graph, the
+    # translation and the search state are the compiler's.
+    compiled = _Recorded(code, record)
+    if local.computes:
+        record.program = compiled
+    return compiled
 
 
 class CudaAOTBackend:
@@ -271,7 +250,7 @@ class CudaAOTBackend:
         return self._backend(gm, example_inputs)
 
     def _compile(self, gm, example_inputs, *, phase):
-        refuse_collectives(gm, phase, "luminal_cuda_lite")
+        refuse_collectives(gm, phase, "luminal_torch_cuda_lite_compiler")
         record = GraphRecord(phase, gm.code)
         self.graphs.append(record)
         return _compile_graph(

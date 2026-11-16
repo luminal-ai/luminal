@@ -137,8 +137,8 @@ fn assert_product_values(
     transposed: bool,
 ) {
     use luminal::bufferize::BufferNode;
-    use luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt;
     use luminal_cuda_lite::ops::cublaslt::exec::{LtDesc, LtOrder};
+    use luminal_cuda_lite::ops::cublaslt::out_of_place::CublasLtOutOfPlace;
 
     let x: Vec<f32> = (0..32).map(|i| (i as f32 - 13.0) / 8.0).collect();
     let w: Vec<f32> = (0..24).map(|i| ((i * 7 % 19) as f32 - 9.0) / 4.0).collect();
@@ -150,7 +150,7 @@ fn assert_product_values(
                 op, reads, writes, ..
             } => op
                 .as_any()
-                .downcast_ref::<ApprovedCublasLt>()
+                .downcast_ref::<CublasLtOutOfPlace>()
                 .map(|op| (op.resolve(&Default::default()), reads, writes)),
             _ => None,
         })

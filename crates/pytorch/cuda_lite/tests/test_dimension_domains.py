@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from luminal_cuda_lite import Compiler
+from luminal_torch_cuda_lite_compiler import Compiler
 from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")

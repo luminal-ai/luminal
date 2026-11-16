@@ -8,7 +8,7 @@ use std::fmt;
 
 pub type Bounds = BTreeMap<Symbol, (usize, usize)>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Expr(pub T);
 impl From<usize> for Expr {
     fn from(v: usize) -> Self {

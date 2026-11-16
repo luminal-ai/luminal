@@ -335,7 +335,7 @@ mod execution {
         let mut selected = Vec::new();
         for node in runtime.plan().unwrap().dag.node_weights() {
             if let BufferNode::Compute { op, .. } = node {
-                if let Some(op) = op.as_any().downcast_ref::<ApprovedCublasLt>() {
+                if let Some(op) = op.as_any().downcast_ref::<CublasLtOutOfPlace>() {
                     assert!(!alias);
                     selected.push(op.resolve(&dims(2)));
                 } else if let Some(op) = op.as_any().downcast_ref::<CublasLtAccumulateInPlace>() {

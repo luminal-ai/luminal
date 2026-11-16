@@ -11,85 +11,38 @@ Collective operations are refused by name. A program that communicates must be
 split by the application so that each compiled graph is collective-free.
 """
 
-import dataclasses
+import json
 from functools import partial
-from typing import Any
 
 import torch
 from luminal_torch_common.aot_graph import (
     GraphRecord,
-    LocalGraph,
     prepare_local_graph,
     refuse_collectives,
 )
 from luminal_torch_common.dimensions import profile_value
 from luminal_torch_common.graph_prep import _aot_decomposition_table
+from luminal_torch_reference_runtime import Code
 from torch._dynamo.backends.common import aot_autograd
-from torch._inductor.output_code import OutputCode
 
 from . import _luminal
-from .backend import _compile_local_graph, load_compiled, save_compiled
+from .backend import _compile_local_graph
 
-__all__ = ["GraphRecord", "ReferenceAOTBackend", "ReferenceOutputCode"]
+__all__ = ["Code", "GraphRecord", "ReferenceAOTBackend"]
 
 
-@dataclasses.dataclass
-class ReferenceOutputCode(OutputCode):
-    """One AOTAutograd graph compiled for the reference runtime, as the
-    object torch's AOT machinery holds, calls, saves and loads.
+class _Recorded(Code):
+    """A code object that also counts its calls on the compiler's inspection
+    record. It saves as a plain ``Code``: the record is the compiler's, and
+    a saved program names the runtime alone."""
 
-    Returning an ``OutputCode`` is what lets
-    ``torch.compile(...).aot_compile()`` save a compiled function and
-    ``torch.compiler.load_compiled_function`` load it. torch pickles each
-    graph's ``OutputCode`` after ``prepare_for_serialization`` and calls
-    ``post_compile`` on the unpickled object before its first call.
+    def __init__(self, code: bytes, record: GraphRecord) -> None:
+        super().__init__(code)
+        self.record = record
 
-    ``local`` is the graph's boundary, ``compiled`` the compiled program
-    (``None`` for a graph that only forwards inputs and sizes), and
-    ``record`` the inspection record of the compile. The saved form is the
-    boundary as plain data, the graph the translator reads, the plan search
-    selected, and the constants: a loaded function translates and installs
-    the plan without searching.
-    """
-
-    local: LocalGraph | None = None
-    compiled: Any = None
-    record: GraphRecord | None = None
-    saved: dict | None = None
-
-    def __post_init__(self) -> None:
-        # torch calls a compiled graph with its arguments in one list. It
-        # reads this flag off a wrapper that copies the instance's own
-        # attributes, so it is set on the instance.
-        self._boxed_call = True
-
-    def __call__(self, inputs) -> Any:
-        args = self.local.bind(inputs)
-        rows = self.compiled.rows(*args) if self.compiled is not None else ()
-        if self.record is not None:
-            self.record.executions += 1
-        return self.local.assemble(args, rows)
-
-    def prepare_for_serialization(self) -> None:
-        """Turn this object into its saved form. torch calls this on a
-        shallow copy while ``aot_compile`` runs, and the original keeps
-        serving calls, so every attribute is rebound and nothing shared is
-        changed in place."""
-        if self.compiled is not None:
-            self.saved = save_compiled(self.compiled)
-        self.local = self.local.portable()
-        self.compiled = None
-        self.record = None
-
-    def post_compile(self, example_inputs, constants, graph_kwargs) -> None:
-        """Rebuild the compiled program from the saved form. torch calls
-        this once on a loaded object, before its first call, with no
-        example inputs and no shape environment."""
-        if self.compiled is None and self.saved is not None:
-            self.compiled = load_compiled(self.saved)
-
-    def set_triton_bundle(self, triton_bundle: Any) -> None:
-        """Part of the ``OutputCode`` interface; there is nothing to bundle."""
+    def __call__(self, inputs: list):
+        self.record.executions += 1
+        return super().__call__(inputs)
 
 
 def _stand_in(value: torch.Tensor) -> torch.Tensor:
@@ -127,7 +80,9 @@ def _compile_graph(
         gm, inputs, device_type="cpu", boundary_plan=_luminal.boundary_plan
     )
 
-    compiled = None
+    # The output leaves as plain rows: what the code object builds a call's
+    # output from.
+    leaves = local.leaf_rows()
     if local.computes:
         record.input_shapes = tuple(
             tuple(v.shape) for v in local.inputs if isinstance(v, torch.Tensor)
@@ -153,18 +108,31 @@ def _compile_graph(
                 else None
                 for slot, v in zip(local.input_slots, local.example_inputs)
             ]
-            compiled = _compile_local_graph(
+            code, graph = _compile_local_graph(
                 local.program,
                 examples,
+                leaves,
                 search_iterations=search_iterations,
                 search_log=search_log,
                 max_intermediate_bytes=max_intermediate_bytes,
                 memory_budget_bytes=memory_budget_bytes,
             )
-            record.bounds = compiled._graph.dim_bounds
-        record.program = compiled
+            record.bounds = graph.dim_bounds
+            record.slots = tuple(graph.input_slots)
+            record.checks = tuple(graph.runtime_assertions)
+    else:
+        # Nothing is computed: the graph forwards arguments, sizes and
+        # constants, and its code object has no plan.
+        code = bytes(
+            _luminal.forwarding_code(local.program.program_json(), json.dumps(leaves))
+        )
 
-    return ReferenceOutputCode(local=local, compiled=compiled, record=record)
+    # From here on a call needs only the code object. The lowered graph, the
+    # translation and the search state are the compiler's.
+    compiled = _Recorded(code, record)
+    if local.computes:
+        record.program = compiled
+    return compiled
 
 
 class ReferenceAOTBackend:
@@ -222,7 +190,7 @@ class ReferenceAOTBackend:
         return self._backend(gm, example_inputs)
 
     def _compile(self, gm, example_inputs, *, phase):
-        refuse_collectives(gm, phase, "luminal_reference")
+        refuse_collectives(gm, phase, "luminal_torch_reference_compiler")
         record = GraphRecord(phase, gm.code)
         self.graphs.append(record)
         return _compile_graph(gm, example_inputs, record, **self.compile_options)

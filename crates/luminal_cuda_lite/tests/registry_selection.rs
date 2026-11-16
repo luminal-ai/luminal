@@ -12,8 +12,8 @@
 
 use luminal::dtype::DType;
 use luminal::prelude::FxHashMap;
-use luminal_cuda_lite::ops::cublaslt::approved::{
-    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR,
+use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+    CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher,
 };
 
 use luminal_cuda_lite::{
@@ -162,8 +162,8 @@ fn a_row_registered_from_outside_joins_the_claim_set() {
     let (cx, _, _) = add_graph();
     let mut registry = cuda_registry_without_cublaslt();
     registry.push(RegisteredOp::new(
-        Box::new(ApprovedCublasLtMatcher),
-        Box::new(ApprovedCublasLt::prototype()),
+        Box::new(CublasLtOutOfPlaceMatcher),
+        Box::new(CublasLtOutOfPlace::prototype()),
     ));
     let rt = CudaRuntime::load_with_registry(&cx, registry).unwrap();
     assert!(rt.active_allow_list().contains(&CONSTRUCTOR));
@@ -233,7 +233,7 @@ fn retired_cublaslt_rows_cannot_bypass_the_complete_call_whitelist() {
         let mut registry = cuda_registry_without_cublaslt();
         registry.push(RegisteredOp::new(
             Box::new(Retired(name)),
-            Box::new(ApprovedCublasLt::prototype()),
+            Box::new(CublasLtOutOfPlace::prototype()),
         ));
         let err = CudaRuntime::load_with_registry(&cx, registry)
             .err()

@@ -1,6 +1,6 @@
 """Reference compiler for ``torch.compile``.
 
-from luminal_reference import Compiler
+from luminal_torch_reference_compiler import Compiler
 compiled = torch.compile(model, backend=Compiler())
 """
 

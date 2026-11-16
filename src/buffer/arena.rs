@@ -183,7 +183,7 @@ fn align_up(bytes: usize) -> usize {
 /// One buffer's home in the slab. `bytes` is the buffer's TRUE size
 /// (what a memcpy of it moves); the range RESERVED is `align_up(bytes)`,
 /// which is what disjointness is checked over.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArenaSlice {
     pub offset: usize,
     pub bytes: usize,

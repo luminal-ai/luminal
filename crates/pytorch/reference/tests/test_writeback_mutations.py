@@ -8,7 +8,7 @@ matching eager semantics and torch.compile's calling contract.
 """
 
 import torch
-from luminal_reference import Compiler
+from luminal_torch_reference_compiler import Compiler
 
 luminal_backend = Compiler()
 
@@ -92,8 +92,11 @@ def test_writeback_metadata_exposed(device):
         static_cache_forward(compiled_model, cache, input_ids)
 
     (record,) = compiler.graphs
-    # Each output row names the input it writes back to, or nothing.
-    writebacks = [target for target in record.program._graph.output_mutations if target]
+    # Each output row names the argument slot it writes back into, or nothing.
+    from luminal_torch_reference_runtime import describe
+
+    rows = describe(record.program)["rows"]
+    writebacks = [row["writes_back"] for row in rows if row["writes_back"] is not None]
     # 2 layers x (keys, values) index_put mutations + 2 cumulative_length
     # counters = 6 write-back outputs, each bound to a distinct input.
     assert len(writebacks) == 2 * config.num_hidden_layers + config.num_hidden_layers

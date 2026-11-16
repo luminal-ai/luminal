@@ -5,10 +5,10 @@ use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
 use luminal::prelude::*;
 use luminal_cuda_lite::CudaRuntime;
-use luminal_cuda_lite::ops::cublaslt::approved::{
-    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR,
-};
 use luminal_cuda_lite::ops::cublaslt::exec::LtComputation;
+use luminal_cuda_lite::ops::cublaslt::out_of_place::{
+    CONSTRUCTOR, CublasLtOutOfPlace, CublasLtOutOfPlaceMatcher,
+};
 
 fn logical_of(graph: &EGraph, layout_tensor: &ClassId) -> ClassId {
     let node = graph
@@ -30,7 +30,7 @@ fn has_cast(graph: &EGraph, value: &ClassId, source: &ClassId, target: &str) -> 
     })
 }
 
-fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
+fn candidates(graph: &Graph) -> Vec<CublasLtOutOfPlace> {
     let runtime = CudaRuntime::load(graph).unwrap();
     let egraph = runtime.saturated_egraph(&Default::default()).unwrap();
     let index = SerializedIndex::new(&egraph);
@@ -45,8 +45,8 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
             node,
             index: &index,
         };
-        let op = ApprovedCublasLtMatcher.extract(&site);
-        let call = op.as_any().downcast_ref::<ApprovedCublasLt>().unwrap();
+        let op = CublasLtOutOfPlaceMatcher.extract(&site);
+        let call = op.as_any().downcast_ref::<CublasLtOutOfPlace>().unwrap();
         if call.computation == LtComputation::Float16 {
             assert_eq!(site.logical_dtype(&call.logical_a), Some(PlanDtype::F16));
             assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::F16));
