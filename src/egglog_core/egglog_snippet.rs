@@ -340,6 +340,46 @@ mod tests {
             .unwrap();
     }
 
+    /// A view's reshape and clamp entries are free of a coordinate they do
+    /// not read: the quotient, remainder, minimum and maximum of operands
+    /// free of an axis are free of it, and an entry that reads the axis is
+    /// not.
+    #[test]
+    fn axis_freedom_descends_into_quotients_remainders_minima_and_maxima() {
+        let mut graph = new_egraph();
+        graph
+            .parse_and_run_program(None, &assembled_program_for(&[]))
+            .unwrap();
+        graph
+            .parse_and_run_program(
+                None,
+                r#"
+(let shape (ShapeLit (IntExprCons (IntLit 4) (IntExprCons (IntLit 6) (IntExprNil)))))
+(let inner (CoordVar shape 0))
+(let outer (CoordVar shape 1))
+(let quotient (IntTruncDiv inner (IntLit 2)))
+(let remainder (IntTruncRem inner (IntLit 2)))
+(let ceiling (IntCeilDiv inner (IntLit 4)))
+(let clamp (IntMax (IntAdd (IntMin inner (IntLit 3)) (IntLit -1)) (IntLit 0)))
+(let reads (IntTruncDiv (IntAdd inner outer) (IntLit 2)))
+(axis-free-demand quotient 1)
+(axis-free-demand remainder 1)
+(axis-free-demand ceiling 1)
+(axis-free-demand clamp 1)
+(axis-free-demand reads 1)
+(axis-free-demand quotient 0)
+(run-schedule (saturate (run main_ruleset) (run prop)))
+(check (axis-free quotient 1))
+(check (axis-free remainder 1))
+(check (axis-free ceiling 1))
+(check (axis-free clamp 1))
+(fail (check (axis-free reads 1)))
+(fail (check (axis-free quotient 0)))
+"#,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn exact_div_is_partial_outside_exact_division() {
         let mut eg = new_egraph();

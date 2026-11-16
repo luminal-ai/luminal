@@ -2290,6 +2290,83 @@
   ((axis-free ?expr ?axis))
   :ruleset main_ruleset :name "core: axis-free of IntMul when both factors are axis-free"
 )
+; The quotient, remainder, minimum and maximum of operands free of an axis
+; are free of it (a view's reshape and clamp entries).
+(rule
+  ((axis-free-demand ?expr ?axis) (= ?expr (IntTruncDiv ?lhs ?rhs)))
+  ((axis-free-demand ?lhs ?axis) (axis-free-demand ?rhs ?axis))
+  :ruleset main_ruleset :name "core: axis-free-demand descends into IntTruncDiv operands"
+)
+(rule
+  (
+    (axis-free-demand ?expr ?axis)
+    (= ?expr (IntTruncDiv ?lhs ?rhs))
+    (axis-free ?lhs ?axis)
+    (axis-free ?rhs ?axis)
+  )
+  ((axis-free ?expr ?axis))
+  :ruleset main_ruleset :name "core: axis-free of a truncated quotient when both operands are axis-free"
+)
+(rule
+  ((axis-free-demand ?expr ?axis) (= ?expr (IntTruncRem ?lhs ?rhs)))
+  ((axis-free-demand ?lhs ?axis) (axis-free-demand ?rhs ?axis))
+  :ruleset main_ruleset :name "core: axis-free-demand descends into IntTruncRem operands"
+)
+(rule
+  (
+    (axis-free-demand ?expr ?axis)
+    (= ?expr (IntTruncRem ?lhs ?rhs))
+    (axis-free ?lhs ?axis)
+    (axis-free ?rhs ?axis)
+  )
+  ((axis-free ?expr ?axis))
+  :ruleset main_ruleset :name "core: axis-free of a truncated remainder when both operands are axis-free"
+)
+(rule
+  ((axis-free-demand ?expr ?axis) (= ?expr (IntCeilDiv ?lhs ?rhs)))
+  ((axis-free-demand ?lhs ?axis) (axis-free-demand ?rhs ?axis))
+  :ruleset main_ruleset :name "core: axis-free-demand descends into IntCeilDiv operands"
+)
+(rule
+  (
+    (axis-free-demand ?expr ?axis)
+    (= ?expr (IntCeilDiv ?lhs ?rhs))
+    (axis-free ?lhs ?axis)
+    (axis-free ?rhs ?axis)
+  )
+  ((axis-free ?expr ?axis))
+  :ruleset main_ruleset :name "core: axis-free of a ceiling quotient when both operands are axis-free"
+)
+(rule
+  ((axis-free-demand ?expr ?axis) (= ?expr (IntMin ?lhs ?rhs)))
+  ((axis-free-demand ?lhs ?axis) (axis-free-demand ?rhs ?axis))
+  :ruleset main_ruleset :name "core: axis-free-demand descends into IntMin operands"
+)
+(rule
+  (
+    (axis-free-demand ?expr ?axis)
+    (= ?expr (IntMin ?lhs ?rhs))
+    (axis-free ?lhs ?axis)
+    (axis-free ?rhs ?axis)
+  )
+  ((axis-free ?expr ?axis))
+  :ruleset main_ruleset :name "core: axis-free of a minimum when both operands are axis-free"
+)
+(rule
+  ((axis-free-demand ?expr ?axis) (= ?expr (IntMax ?lhs ?rhs)))
+  ((axis-free-demand ?lhs ?axis) (axis-free-demand ?rhs ?axis))
+  :ruleset main_ruleset :name "core: axis-free-demand descends into IntMax operands"
+)
+(rule
+  (
+    (axis-free-demand ?expr ?axis)
+    (= ?expr (IntMax ?lhs ?rhs))
+    (axis-free ?lhs ?axis)
+    (axis-free ?rhs ?axis)
+  )
+  ((axis-free ?expr ?axis))
+  :ruleset main_ruleset :name "core: axis-free of a maximum when both operands are axis-free"
+)
 
 ; --- certificate tripwires (LOUD, never silence them) ---
 ; A certified class holding the zero literal means a certificate route
