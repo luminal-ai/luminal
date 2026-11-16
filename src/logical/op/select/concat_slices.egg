@@ -3,7 +3,8 @@
 ; `Select(c, View(a, ma, S), View(b, mb, S))` (frontend/movement.rs::
 ; concat_along): c is the truth test of `IntCastFromBool(coord_k < A)`, ma
 ; clamps the axis to A - 1, mb shifts it by -A and clamps at 0. The rules
-; here work on that spelling; there is no concatenation node.
+; here and in concat_rowwise.egg / concat_sink.egg work on that spelling;
+; there is no concatenation node.
 ;
 ; Axes are FROM-END indices throughout, as CoordVar and the reductions
 ; count them. A row slice of a shape S is the view reading `ext` rows from
@@ -23,9 +24,19 @@
 ; A CERTIFIED concatenation `X = Select(c, View(a, ma, S), View(b, mb, S))`
 ; = cat(a, b) along k at A (the certificate below). It is a fact about c,
 ; ma and mb alone, so the same select over ANY parts of a's and b's shapes
-; is their concatenation.
+; is their concatenation: the row-wise rules mint
+; `Select(c, View(p, ma, S), View(q, mb, S))` as `cat(p, q)`.
 (relation concat-template (LogicalTensor i64 i64 LogicalTensor IndexMap IndexMap Shape))
 (relation concat-parts (LogicalTensor i64 i64 LogicalTensor LogicalTensor))
+; Row carriers and sinking demands (concat_sink.egg).
+(relation row-carrier (LogicalTensor i64 i64))
+(relation row-carry (LogicalTensor LogicalTensor IntExprList Shape i64 i64))
+(relation row-free-demand (IntExprList i64 i64))
+(relation row-free (IntExprList i64 i64))
+(relation row-sink-demand (LogicalTensor i64 i64 i64 i64))
+(relation row-reducible (LogicalTensor i64 i64))
+(relation row-constant (LogicalTensor))
+(relation row-sinkable (LogicalTensor i64 i64))
 
 ; The row slice of S along k: the sliced dims (axis k's extent the literal
 ; `ext`), then the entries over the sliced shape.

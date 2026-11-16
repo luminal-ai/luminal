@@ -1,9 +1,13 @@
-//! Tests for the concatenation rules (concat_slices.egg): one per rule on
-//! small graphs, and a saturation regression on a transformer-shaped graph,
-//! a chain of blocks that each concatenate two streams on entry and slice
-//! them apart on exit. The regression saturates the model alone and records
-//! the e-graph's size against a budget, then adds the expected spelling and
-//! checks it lands in the model's classes.
+//! Tests for the concatenation rules (concat_slices.egg, concat_rowwise.egg,
+//! concat_sink.egg): one per rule on small graphs, and saturation
+//! regressions on transformer-shaped graphs: a joint attention block whose
+//! query, key and value streams are concatenated along the sequence before
+//! a row-indexed rotary table, a per-head norm and one attention, then
+//! split back into two linears; and a chain of blocks that each concatenate
+//! two streams on entry and slice them apart on exit. Each regression
+//! saturates the model alone and records the e-graph's size against a
+//! budget, then adds the expected per-stream (or joined) spelling and checks
+//! it lands in the model's classes.
 
 use crate::egglog_snippet::{assembled_program_for, new_egraph};
 use crate::prelude::*;
@@ -145,6 +149,80 @@ fn check(
     );
 }
 
+/// FLUX's double block as upstream vllm-omni traces it: the text and image
+/// query, key and value streams concatenated along the sequence (text
+/// first), the rotary embedding over ONE joint table, the per-head norm,
+/// one attention over all queries, the result split back into the streams
+/// and each projected. Saturated, each stream's output is one attention of
+/// its own queries (its rows of the table, its own norm) over the keys
+/// spelled as the concatenation of the two streams' keys, which is the
+/// spelling a backend's joint attention over two key sets reads.
+#[test]
+fn joint_attention_block_splits_into_per_stream_attention() {
+    let mut cx = Graph::new();
+    let stream = |cx: &mut Graph, name: &str, rows: usize| {
+        cx.named_tensor(name, vec![1, rows, H, D], DType::F32)
+    };
+    let (qa, ka, va) = (
+        stream(&mut cx, "qa", A),
+        stream(&mut cx, "ka", A),
+        stream(&mut cx, "va", A),
+    );
+    let (qb, kb, vb) = (
+        stream(&mut cx, "qb", B),
+        stream(&mut cx, "kb", B),
+        stream(&mut cx, "vb", B),
+    );
+    let cos = cx.named_tensor("cos", vec![S, D / 2], DType::F32);
+    let sin = cx.named_tensor("sin", vec![S, D / 2], DType::F32);
+    let w_txt = cx.named_tensor("w_txt", vec![HD, HD], DType::F32);
+    let w_img = cx.named_tensor("w_img", vec![HD, HD], DType::F32);
+
+    let q = rms(rope(qa.concat_along(qb, 1), cos, sin));
+    let k = rms(rope(ka.concat_along(kb, 1), cos, sin));
+    let v = va.concat_along(vb, 1);
+    let o = sdpa(q, k, v);
+    let txt = linear(o.slice_along(..A, 1), w_txt);
+    let img = linear(o.slice_along(A.., 1), w_img);
+
+    let lo = |t: GraphTensor| t.slice_along(..A, 0);
+    let hi = |t: GraphTensor| t.slice_along(A.., 0);
+    let (ka_exp, kb_exp) = (
+        rms(rope(ka, lo(cos), lo(sin))),
+        rms(rope(kb, hi(cos), hi(sin))),
+    );
+    let k_exp = ka_exp.concat_along(kb_exp, 1);
+    let qa_exp = rms(rope(qa, lo(cos), lo(sin)));
+    let qb_exp = rms(rope(qb, hi(cos), hi(sin)));
+    let txt_exp = linear(sdpa(qa_exp, k_exp, v), w_txt);
+    let img_exp = linear(sdpa(qb_exp, k_exp, v), w_img);
+    let name = |t: GraphTensor| cx.logical.let_name(t.id);
+    // The keys hold a certified concatenation whose parts are the
+    // per-stream keys: a select over clamped views of exactly those parts.
+    let keys = format!(
+        "(concat-parts {} 2 {A} {} {})",
+        name(k),
+        name(ka_exp),
+        name(kb_exp)
+    );
+    check(
+        &cx,
+        &[txt.id, img.id],
+        &[
+            (q.slice_along(..A, 1), qa_exp),
+            (q.slice_along(A.., 1), qb_exp),
+            (k, k_exp),
+            (txt, txt_exp),
+            (img, img_exp),
+        ],
+        &[keys],
+        // 11367 rows without the concatenation rules, 53445 with them: two
+        // query streams' attentions beside the joint one.
+        60_000,
+        "joint attention block",
+    );
+}
+
 /// FLUX's single blocks as upstream vllm-omni traces them: each block
 /// concatenates the two streams on entry and slices them apart on exit.
 /// Saturated, each block's entry concatenation is the previous block's
@@ -213,8 +291,8 @@ fn concatenating_blocks_chain_without_their_slices() {
             (i, last.slice_along(A.., 1)),
         ],
         &[],
-        // 14115 rows without the concatenation rules, 15545 with them.
-        17_000,
+        // 14115 rows without the concatenation rules, 22230 with them.
+        25_000,
         "three concatenating blocks",
     );
 }
@@ -295,4 +373,82 @@ fn the_concatenation_of_a_tensors_row_slices_is_the_tensor() {
             apart(&cx, mixed, y),
         ],
     );
+}
+
+/// select/concat_rowwise.egg: an elementwise op of a concatenation and a
+/// row-indexed table is the concatenation of the op over the parts and the
+/// table's rows, on either side, and the result is again a concatenation
+/// the next op pushes through.
+#[test]
+fn an_elementwise_op_of_a_concatenation_is_the_concatenation_over_its_parts() {
+    let mut cx = Graph::new();
+    let a = cx.named_tensor("a", vec![2, A, 3], DType::F32);
+    let b = cx.named_tensor("b", vec![2, B, 3], DType::F32);
+    let t = cx.named_tensor("t", vec![2, S, 3], DType::F32);
+    let x = a.concat_along(b, 1);
+    let (t_lo, t_hi) = (t.slice_along(..A, 1), t.slice_along(A.., 1));
+    let product = x * t;
+    let flipped = t + x;
+    let chained = (x * t).exp();
+    let product_exp = (a * t_lo).concat_along(b * t_hi, 1);
+    let flipped_exp = (t_lo + a).concat_along(t_hi + b, 1);
+    let chained_exp = (a * t_lo).exp().concat_along((b * t_hi).exp(), 1);
+    holds(
+        &cx,
+        &[
+            same(&cx, product, product_exp),
+            same(&cx, flipped, flipped_exp),
+            same(&cx, chained, chained_exp),
+        ],
+    );
+}
+
+/// select/concat_sink.egg: a norm over the feature axis of a concatenation
+/// is the concatenation of the parts' norms (the statistics' row slices
+/// sink through their reduction), and a projection of a concatenation read
+/// by its rows is the projection of the part; a projection of a projection
+/// is left as the slice of the joint result.
+#[test]
+fn row_slices_sink_through_norms_and_a_projection_of_a_concatenation() {
+    let mut cx = Graph::new();
+    let a = cx.named_tensor("a", vec![1, A, 4], DType::F32);
+    let b = cx.named_tensor("b", vec![1, B, 4], DType::F32);
+    let w = cx.named_tensor("w", vec![4, 5], DType::F32);
+    let w2 = cx.named_tensor("w2", vec![5, 6], DType::F32);
+    let w3 = cx.named_tensor("w3", vec![5, 5], DType::F32);
+    let x = a.concat_along(b, 1);
+    let normed = x.std_norm(vec![2], 1e-6_f32);
+    let projected = x.matmul(w);
+    let twice = projected.matmul(w3);
+    let _readers = (
+        projected.slice_along(..A, 1).matmul(w2),
+        twice.slice_along(..A, 1).matmul(w2),
+    );
+    let normed_exp = a
+        .std_norm(vec![2], 1e-6_f32)
+        .concat_along(b.std_norm(vec![2], 1e-6_f32), 1);
+    holds(
+        &cx,
+        &[
+            same(&cx, normed, normed_exp),
+            same(&cx, projected.slice_along(..A, 1), a.matmul(w)),
+            apart(&cx, twice.slice_along(..A, 1), a.matmul(w).matmul(w3)),
+        ],
+    );
+}
+
+/// select/concat_sink.egg: a row slice sinks through a reduction over an
+/// earlier axis (the row axis keeps its index from the end) and through a
+/// permute that moves the rows.
+#[test]
+fn row_slices_sink_through_reductions_over_earlier_axes_and_permutes() {
+    let mut cx = Graph::new();
+    let a = cx.named_tensor("a", vec![2, 3, A], DType::F32);
+    let b = cx.named_tensor("b", vec![2, 3, B], DType::F32);
+    let w = cx.named_tensor("w", vec![3, 4], DType::F32);
+    let x = a.concat_along(b, 2);
+    let summed = x.exp().sum(vec![0]).permute(vec![1, 0]);
+    let _reader = summed.slice_along(..A, 0).matmul(w);
+    let summed_exp = a.exp().sum(vec![0]).permute(vec![1, 0]);
+    holds(&cx, &[same(&cx, summed.slice_along(..A, 0), summed_exp)]);
 }

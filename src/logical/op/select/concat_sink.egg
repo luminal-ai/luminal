@@ -1,0 +1,3665 @@
+; Rewrite : a row slice of a row-wise computation is the computation over
+; the row slices of its operands. A ROW CARRIER is a tensor one of whose
+; axes is, row for row, the axis of a certified concatenation (k, A)
+; (concat_slices.egg): the concatenation itself, then through elementwise
+; ops and selects (any operand carrying), reductions over another axis, and
+; views that read the carried axis at one of their own coordinates of the
+; same extent and no other entry of theirs at that coordinate (a permute, a
+; reshape of other axes, a broadcast, a matmul's operand view keep the rows;
+; a slice of the axis does not).
+;
+; A row slice of a carrier SINKS when it is demanded: the slice is the op
+; over the same slice of each operand, and an operand that carries the same
+; rows, or is computed from literals alone, is demanded in turn, down to
+; the concatenation, whose slices are its parts (select/rewrite.egg decides
+; the select over the slice). Any other operand (a weight, the other side
+; of a product, a table) is read through the slice's view, which composes
+; with whatever view it already is. Demands come from
+;   - a slice the model reads row for row through a view of another shape
+;     (a split feeding a projection): an attention whose result is split by
+;     query rows becomes one attention per query stream over the same keys;
+;   - the row-wise rule (concat_rowwise.egg), for an operand that carries
+;     the rows: a norm's statistics or the rotated half of a rotary
+;     embedding become per-part.
+; Slices read only to be concatenated again are not demanded: their
+; concatenation is the tensor itself (concat_slices.egg).
+;
+; A slice sinks through a reduction only where the reduced operand mixes
+; nothing but carried rows: a product of two carriers (the scores and the
+; values of an attention, a norm's square), a carrier and a broadcast
+; literal, a unary op or select of a carrier, or a projection of a
+; concatenation itself. A projection of anything else by a weight keeps its
+; slice as the slice of the joint projection. This is a cost bound, not a
+; soundness condition: without it a demand reaching the residual stream of
+; a chain of joined blocks (each block's entry concatenation IS the
+; previous block's output) would sink through every block's projections and
+; attention, and the three-block regression grows from 22k to 74k rows.
+;
+; Same values, same rounding: each element of a slice is computed by the
+; same op on the same operand elements, and a reduction over another axis
+; accumulates the same elements in the same order.
+
+(rule
+  ((row-free-demand ?list ?skip ?coord) (= ?list (IntExprNil)))
+  ((row-free ?list ?skip ?coord))
+  :ruleset main_ruleset
+  :name "select/concat_sink: no entries are free of any coordinate"
+)
+(rule
+  ((row-free-demand ?list ?skip ?coord) (= ?list (IntExprCons ?entry ?tail)))
+  ((row-free-demand ?tail ?skip ?coord))
+  :ruleset main_ruleset
+  :name "select/concat_sink: freedom of the entries demands the tail's"
+)
+(rule
+  (
+    (row-free-demand ?list ?skip ?coord)
+    (= ?list (IntExprCons ?entry ?tail))
+    (= ?index (expr-list-length-of ?tail))
+    (!= ?index ?skip)
+  )
+  ((axis-free-demand ?entry ?coord))
+  :ruleset main_ruleset
+  :name "select/concat_sink: freedom of the entries demands each other entry's"
+)
+(rule
+  (
+    (row-free-demand ?list ?skip ?coord)
+    (= ?list (IntExprCons ?entry ?tail))
+    (= ?skip (expr-list-length-of ?tail))
+    (row-free ?tail ?skip ?coord)
+  )
+  ((row-free ?list ?skip ?coord))
+  :ruleset main_ruleset
+  :name "select/concat_sink: the carried axis's own entry is skipped"
+)
+(rule
+  (
+    (row-free-demand ?list ?skip ?coord)
+    (= ?list (IntExprCons ?entry ?tail))
+    (= ?index (expr-list-length-of ?tail))
+    (!= ?index ?skip)
+    (axis-free ?entry ?coord)
+    (row-free ?tail ?skip ?coord)
+  )
+  ((row-free ?list ?skip ?coord))
+  :ruleset main_ruleset
+  :name "select/concat_sink: an entry free of the coordinate keeps the list free"
+)
+
+; A row slice of a carrier the model reads row for row through a view of
+; another shape (the slice's axis read at one of the view's own coordinates,
+; over the slice's extent: a projection's operand view) is demanded. A
+; concatenation reads its parts through clamps over the whole extent, which
+; is not such a reader, nor is anything composed from one. The slice is
+; recognised by its carried entry and extent; the demand then builds the
+; exact row-slice map, and a view that is not exactly that slice merges
+; with nothing.
+(rule
+  (
+    (row-carrier ?y ?axis ?split)
+    (= ?slice (LogicalIndexMapApply ?y ?map ?sliced))
+    (= ?map (IndexMapLit ?entries ?shape))
+    (= ?entry (expr-list-nth-from-end ?entries ?axis))
+    (= ?entry (CoordVar ?sliced ?axis))
+    (= ?sliced (ShapeLit ?sliced_dims))
+    (= ?slice_extent (expr-list-nth-from-end ?sliced_dims ?axis))
+    (= ?slice_extent (IntLit ?split))
+    (= ?reader (LogicalIndexMapApply ?slice ?reader_map ?reader_shape))
+    (= ?reader_map (IndexMapLit ?reader_entries ?sliced))
+    (= ?reader_entry (expr-list-nth-from-end ?reader_entries ?axis))
+    (= ?reader_entry (CoordVar ?reader_shape ?reader_axis))
+    (= ?reader_shape (ShapeLit ?reader_dims))
+    (= ?reader_extent (expr-list-nth-from-end ?reader_dims ?reader_axis))
+    (= ?reader_extent (IntLit ?split))
+    (!= ?reader_shape ?sliced)
+  )
+  ((row-sink-demand ?y ?axis ?split 0 ?split))
+  :ruleset main_ruleset
+  :name "select/concat_sink: a carrier's first slice read row for row through another shape is demanded"
+)
+(rule
+  (
+    (row-carrier ?y ?axis ?split)
+    (= ?slice (LogicalIndexMapApply ?y ?map ?sliced))
+    (= ?map (IndexMapLit ?entries ?shape))
+    (= ?entry (expr-list-nth-from-end ?entries ?axis))
+    (= ?entry (IntAdd (CoordVar ?sliced ?axis) (IntLit ?split)))
+    (= ?sliced (ShapeLit ?sliced_dims))
+    (= ?slice_extent (expr-list-nth-from-end ?sliced_dims ?axis))
+    (= ?slice_extent (IntLit ?extent))
+    (= ?reader (LogicalIndexMapApply ?slice ?reader_map ?reader_shape))
+    (= ?reader_map (IndexMapLit ?reader_entries ?sliced))
+    (= ?reader_entry (expr-list-nth-from-end ?reader_entries ?axis))
+    (= ?reader_entry (CoordVar ?reader_shape ?reader_axis))
+    (= ?reader_shape (ShapeLit ?reader_dims))
+    (= ?reader_extent (expr-list-nth-from-end ?reader_dims ?reader_axis))
+    (= ?reader_extent (IntLit ?extent))
+    (!= ?reader_shape ?sliced)
+  )
+  ((row-sink-demand ?y ?axis ?split ?split ?extent))
+  :ruleset main_ruleset
+  :name "select/concat_sink: a carrier's second slice read row for row through another shape is demanded"
+)
+; A demanded slice builds its map.
+(rule
+  ((row-sink-demand ?y ?axis ?split ?offset ?extent) (= ?shape (shape-of ?y)))
+  ((row-slice-demand ?shape ?axis ?offset ?extent))
+  :ruleset main_ruleset
+  :name "select/concat_sink: a demanded row slice builds its map"
+)
+
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalExp ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Exp of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalExp2 ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Exp2 of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalLog2 ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Log2 of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalSin ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Sin of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalSqrt ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Sqrt of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalRecip ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Recip of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTanh ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Tanh of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalNot ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Not of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalCeil ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Ceil of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalFloor ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Floor of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalRound ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Round of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTrunc ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Trunc of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalCast ?x ?dtype))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Cast of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalRoundingCast ?x ?dtype))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: RoundingCast of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncCast ?x ?dtype))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncCast of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalPolygamma ?x ?order))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Polygamma of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalRoundDecimals ?x ?decimals))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: RoundDecimals of a carrier mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalAdd ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Add of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalAdd ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Add of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAdd ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Add of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAdd (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Add of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAdd ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Add of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAdd (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Add of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalMul ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mul of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalMul ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mul of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMul ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mul of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMul (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mul of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMul ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mul of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMul (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mul of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalDiv ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Div of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalDiv ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Div of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalDiv ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Div of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalDiv (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Div of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalDiv ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Div of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalDiv (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Div of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalLessThan ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: LessThan of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalLessThan ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: LessThan of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalLessThan ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: LessThan of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalLessThan (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: LessThan of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalLessThan ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: LessThan of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalLessThan (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: LessThan of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalAnd ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: And of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalAnd ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: And of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAnd ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: And of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAnd (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: And of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAnd ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: And of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAnd (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: And of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalOr ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Or of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalOr ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Or of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalOr ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Or of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalOr (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Or of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalOr ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Or of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalOr (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Or of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalMod ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mod of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalMod ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mod of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMod ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mod of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMod (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mod of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMod ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mod of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMod (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mod of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalHypot ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Hypot of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalHypot ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Hypot of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalHypot ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Hypot of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalHypot (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Hypot of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalHypot ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Hypot of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalHypot (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Hypot of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalTruncDiv ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncDiv of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalTruncDiv ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncDiv of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncDiv ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncDiv of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncDiv (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncDiv of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncDiv ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncDiv of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncDiv (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncDiv of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalTruncRem ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncRem of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalTruncRem ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncRem of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncRem ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncRem of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncRem (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncRem of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncRem ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncRem of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncRem (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncRem of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalWrappingAdd ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingAdd of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalWrappingAdd ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingAdd of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingAdd ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingAdd of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingAdd (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingAdd of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingAdd ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingAdd of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingAdd (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingAdd of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalWrappingMul ?x ?t))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingMul of two carriers of one split mixes only carried rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (row-carrier ?t ?other_axis ?split)
+    (= ?y (LogicalWrappingMul ?t ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingMul of two carriers of one split mixes only carried rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingMul ?x (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingMul of a carrier and a broadcast Constant mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingMul (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingMul of a carrier and a broadcast Constant mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingMul ?x (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape)))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingMul of a carrier and a broadcast ConstantF64 mixes nothing across rows, left"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingMul (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape) ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingMul of a carrier and a broadcast ConstantF64 mixes nothing across rows, right"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalSelect ?x ?t ?f))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Select with a carrier as its condition mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalSelect ?t ?x ?f))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Select with a carrier as its first branch mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalSelect ?t ?f ?x))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Select with a carrier as its second branch mixes nothing across rows"
+)
+(rule
+  (
+    (row-carrier ?p ?axis ?split)
+    (= ?p (LogicalIndexMapApply ?x ?map ?view_shape))
+    (concat-template ?x ?x_axis ?split ?condition ?true_map ?false_map ?x_shape)
+    (= ?y (LogicalMul ?p ?q))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a product with a view of a concatenation on the left is reducible along its rows (a projection of the concatenation)"
+)
+(rule
+  (
+    (row-carrier ?p ?axis ?split)
+    (= ?p (LogicalIndexMapApply ?x ?map ?view_shape))
+    (concat-template ?x ?x_axis ?split ?condition ?true_map ?false_map ?x_shape)
+    (= ?y (LogicalMul ?q ?p))
+  )
+  (
+    (row-reducible ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a product with a view of a concatenation on the right is reducible along its rows (a projection of the concatenation)"
+)
+(rule
+  (
+    (= ?y (LogicalIndexMapApply (LogicalConstant ?value) ?map ?shape))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a broadcast Constant is computed from literals alone"
+)
+(rule
+  (
+    (= ?y (LogicalIndexMapApply (LogicalConstantF64 ?value) ?map ?shape))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a broadcast ConstantF64 is computed from literals alone"
+)
+(rule
+  (
+    (= ?y (LogicalIota ?expr ?shape))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: an iota is computed from literals alone"
+)
+(rule
+  (
+    (= ?y (LogicalIndexMapApply (LogicalIota ?expr ?iota_shape) ?map ?shape))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a view of an iota is computed from literals alone"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalExp ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Exp of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalExp2 ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Exp2 of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalLog2 ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Log2 of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalSin ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Sin of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalSqrt ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Sqrt of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalRecip ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Recip of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalTanh ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Tanh of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalNot ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Not of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalCeil ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Ceil of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalFloor ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Floor of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalRound ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Round of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalTrunc ?x))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Trunc of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalCast ?x ?dtype))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Cast of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalRoundingCast ?x ?dtype))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: RoundingCast of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalTruncCast ?x ?dtype))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncCast of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalPolygamma ?x ?order))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Polygamma of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x)
+    (= ?y (LogicalRoundDecimals ?x ?decimals))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: RoundDecimals of a literal computation is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalAdd ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Add of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalMul ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mul of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalDiv ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Div of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalLessThan ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: LessThan of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalAnd ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: And of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalOr ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Or of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalMod ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mod of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalHypot ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Hypot of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalTruncDiv ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncDiv of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalTruncRem ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncRem of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalWrappingAdd ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingAdd of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (= ?y (LogicalWrappingMul ?x1 ?x2))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingMul of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-constant ?x1)
+    (row-constant ?x2)
+    (row-constant ?x3)
+    (= ?y (LogicalSelect ?x1 ?x2 ?x3))
+  )
+  (
+    (row-constant ?y)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Select of literal computations is a literal computation"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a carrier sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalExp ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Exp sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalExp2 ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Exp2 sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalLog2 ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Log2 sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalSin ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Sin sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalSqrt ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Sqrt sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalRecip ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Recip sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalTanh ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Tanh sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalNot ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Not sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalCeil ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Ceil sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalFloor ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Floor sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalRound ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Round sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalTrunc ?x))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Trunc sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalCast ?x ?dtype))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Cast sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalRoundingCast ?x ?dtype))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking RoundingCast sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalTruncCast ?x ?dtype))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking TruncCast sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalPolygamma ?x ?order))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking Polygamma sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalRoundDecimals ?x ?decimals))
+    (row-constant ?x)
+  )
+  (
+    (row-sinkable ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: the literal operand of a sinking RoundDecimals sinks"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalAdd ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Add sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalAdd ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Add sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalMul ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Mul sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalMul ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Mul sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalDiv ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Div sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalDiv ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Div sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalLessThan ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking LessThan sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalLessThan ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking LessThan sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalAnd ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking And sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalAnd ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking And sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalOr ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Or sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalOr ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Or sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalMod ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Mod sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalMod ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Mod sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalHypot ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Hypot sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalHypot ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Hypot sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalTruncDiv ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking TruncDiv sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalTruncDiv ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking TruncDiv sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalTruncRem ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking TruncRem sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalTruncRem ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking TruncRem sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalWrappingAdd ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking WrappingAdd sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalWrappingAdd ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking WrappingAdd sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalWrappingMul ?x1 ?x2))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking WrappingMul sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalWrappingMul ?x1 ?x2))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking WrappingMul sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalSelect ?x1 ?x2 ?x3))
+    (row-constant ?x1)
+  )
+  (
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Select sinks (?x1)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalSelect ?x1 ?x2 ?x3))
+    (row-constant ?x2)
+  )
+  (
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Select sinks (?x2)"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?y (LogicalSelect ?x1 ?x2 ?x3))
+    (row-constant ?x3)
+  )
+  (
+    (row-sinkable ?x3 ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a literal operand of a sinking Select sinks (?x3)"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+  )
+  (
+    (row-carrier ?x ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a concatenation carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalExp ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Exp of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalExp2 ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Exp2 of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalLog2 ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Log2 of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalSin ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Sin of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalSqrt ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Sqrt of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalRecip ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Recip of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTanh ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Tanh of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalNot ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Not of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalCeil ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Ceil of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalFloor ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Floor of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalRound ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Round of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTrunc ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Trunc of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalCast ?x ?dtype))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Cast of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalRoundingCast ?x ?dtype))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: RoundingCast of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncCast ?x ?dtype))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncCast of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalPolygamma ?x ?order))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Polygamma of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalRoundDecimals ?x ?decimals))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: RoundDecimals of a carrier carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAdd ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Add of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAdd ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Add of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMul ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mul of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMul ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mul of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalDiv ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Div of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalDiv ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Div of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalLessThan ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: LessThan of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalLessThan ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: LessThan of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAnd ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: And of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalAnd ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: And of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalOr ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Or of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalOr ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Or of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMod ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mod of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalMod ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Mod of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalHypot ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Hypot of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalHypot ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Hypot of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncDiv ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncDiv of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncDiv ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncDiv of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncRem ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncRem of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalTruncRem ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: TruncRem of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingAdd ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingAdd of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingAdd ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingAdd of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingMul ?x ?t))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingMul of a carrier on the left carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingMul ?t ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingMul of a carrier on the right carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalSelect ?x ?t ?f))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Select with a carrier as its condition carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalSelect ?t ?x ?f))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Select with a carrier as its first branch carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalSelect ?t ?f ?x))
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: Select with a carrier as its second branch carries its rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalReduceSum ?x ?reduced))
+    (< ?axis ?reduced)
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: ReduceSum over a later axis carries the rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalReduceSum ?x ?reduced))
+    (> ?axis ?reduced)
+  )
+  (
+    (row-carrier ?y (- ?axis 1) ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: ReduceSum over an earlier axis carries the rows one axis lower"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalReduceMax ?x ?reduced))
+    (< ?axis ?reduced)
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: ReduceMax over a later axis carries the rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalReduceMax ?x ?reduced))
+    (> ?axis ?reduced)
+  )
+  (
+    (row-carrier ?y (- ?axis 1) ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: ReduceMax over an earlier axis carries the rows one axis lower"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingReduceSum ?x ?reduced))
+    (< ?axis ?reduced)
+  )
+  (
+    (row-carrier ?y ?axis ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingReduceSum over a later axis carries the rows"
+)
+(rule
+  (
+    (row-carrier ?x ?axis ?split)
+    (= ?y (LogicalWrappingReduceSum ?x ?reduced))
+    (> ?axis ?reduced)
+  )
+  (
+    (row-carrier ?y (- ?axis 1) ?split)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: WrappingReduceSum over an earlier axis carries the rows one axis lower"
+)
+(rule
+  (
+    (row-carrier ?x ?x_axis ?split)
+    (= ?y (LogicalIndexMapApply ?x ?map ?y_shape))
+    (= ?map (IndexMapLit ?entries ?x_shape))
+    (= ?entry (expr-list-nth-from-end ?entries ?x_axis))
+    (= ?entry (CoordVar ?y_shape ?y_axis))
+    (= ?y_shape (ShapeLit ?y_dims))
+    (= ?x_shape (ShapeLit ?x_dims))
+    (= ?extent (expr-list-nth-from-end ?y_dims ?y_axis))
+    (= ?extent (expr-list-nth-from-end ?x_dims ?x_axis))
+  )
+  (
+    (row-free-demand ?entries ?x_axis ?y_axis)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a view reading the carried axis at its own coordinate asks the other entries to be free of it"
+)
+(rule
+  (
+    (row-carrier ?x ?x_axis ?split)
+    (= ?y (LogicalIndexMapApply ?x ?map ?y_shape))
+    (= ?map (IndexMapLit ?entries ?x_shape))
+    (= ?entry (expr-list-nth-from-end ?entries ?x_axis))
+    (= ?entry (CoordVar ?y_shape ?y_axis))
+    (= ?y_shape (ShapeLit ?y_dims))
+    (= ?x_shape (ShapeLit ?x_dims))
+    (= ?extent (expr-list-nth-from-end ?y_dims ?y_axis))
+    (= ?extent (expr-list-nth-from-end ?x_dims ?x_axis))
+    (row-free ?entries ?x_axis ?y_axis)
+  )
+  (
+    (row-carrier ?y ?y_axis ?split)
+    (row-carry ?y ?x ?entries ?x_shape ?x_axis ?y_axis)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a view reading the carried axis at its own coordinate alone carries the rows"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalExp ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalExp (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Exp is Exp of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalExp2 ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalExp2 (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Exp2 is Exp2 of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalLog2 ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalLog2 (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Log2 is Log2 of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalSin ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalSin (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Sin is Sin of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalSqrt ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalSqrt (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Sqrt is Sqrt of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalRecip ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalRecip (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Recip is Recip of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalTanh ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalTanh (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Tanh is Tanh of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalNot ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalNot (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Not is Not of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalCeil ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalCeil (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Ceil is Ceil of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalFloor ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalFloor (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Floor is Floor of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalRound ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalRound (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Round is Round of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalTrunc ?x))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalTrunc (LogicalIndexMapApply ?x ?map ?sliced)))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Trunc is Trunc of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalCast ?x ?dtype))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalCast (LogicalIndexMapApply ?x ?map ?sliced) ?dtype))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Cast is Cast of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalRoundingCast ?x ?dtype))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalRoundingCast (LogicalIndexMapApply ?x ?map ?sliced) ?dtype))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of RoundingCast is RoundingCast of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalTruncCast ?x ?dtype))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalTruncCast (LogicalIndexMapApply ?x ?map ?sliced) ?dtype))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of TruncCast is TruncCast of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalPolygamma ?x ?order))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalPolygamma (LogicalIndexMapApply ?x ?map ?sliced) ?order))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Polygamma is Polygamma of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalRoundDecimals ?x ?decimals))
+    (row-sinkable ?x ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalRoundDecimals (LogicalIndexMapApply ?x ?map ?sliced) ?decimals))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of RoundDecimals is RoundDecimals of the slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalAdd ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalAdd (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Add is Add of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalAdd ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalAdd (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Add is Add of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalMul ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalMul (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Mul is Mul of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalMul ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalMul (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Mul is Mul of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalDiv ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalDiv (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Div is Div of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalDiv ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalDiv (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Div is Div of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalLessThan ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalLessThan (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of LessThan is LessThan of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalLessThan ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalLessThan (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of LessThan is LessThan of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalAnd ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalAnd (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of And is And of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalAnd ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalAnd (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of And is And of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalOr ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalOr (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Or is Or of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalOr ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalOr (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Or is Or of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalMod ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalMod (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Mod is Mod of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalMod ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalMod (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Mod is Mod of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalHypot ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalHypot (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Hypot is Hypot of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalHypot ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalHypot (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Hypot is Hypot of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalTruncDiv ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalTruncDiv (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of TruncDiv is TruncDiv of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalTruncDiv ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalTruncDiv (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of TruncDiv is TruncDiv of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalTruncRem ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalTruncRem (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of TruncRem is TruncRem of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalTruncRem ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalTruncRem (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of TruncRem is TruncRem of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalWrappingAdd ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalWrappingAdd (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of WrappingAdd is WrappingAdd of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalWrappingAdd ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalWrappingAdd (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of WrappingAdd is WrappingAdd of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalWrappingMul ?x1 ?x2))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalWrappingMul (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of WrappingMul is WrappingMul of the slices, the left operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalWrappingMul ?x1 ?x2))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalWrappingMul (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of WrappingMul is WrappingMul of the slices, the right operand carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalSelect ?x1 ?x2 ?x3))
+    (row-sinkable ?x1 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalSelect (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced) (LogicalIndexMapApply ?x3 ?map ?sliced)))
+    (row-sink-demand ?x1 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Select is Select of the slices, the condition carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalSelect ?x1 ?x2 ?x3))
+    (row-sinkable ?x2 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalSelect (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced) (LogicalIndexMapApply ?x3 ?map ?sliced)))
+    (row-sink-demand ?x2 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Select is Select of the slices, the first branch carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalSelect ?x1 ?x2 ?x3))
+    (row-sinkable ?x3 ?axis ?split)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalSelect (LogicalIndexMapApply ?x1 ?map ?sliced) (LogicalIndexMapApply ?x2 ?map ?sliced) (LogicalIndexMapApply ?x3 ?map ?sliced)))
+    (row-sink-demand ?x3 ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of Select is Select of the slices, the second branch carrying"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalReduceSum ?x ?reduced))
+    (< ?axis ?reduced)
+    (row-carrier ?x ?axis ?split)
+    (row-reducible ?x ?axis ?split)
+    (= ?x_shape (shape-of ?x))
+  )
+  (
+    (row-slice-demand ?x_shape ?axis ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of ReduceSum over a later axis demands the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalReduceSum ?x ?reduced))
+    (< ?axis ?reduced)
+    (row-carrier ?x ?axis ?split)
+    (row-reducible ?x ?axis ?split)
+    (= ?x_shape (shape-of ?x))
+    (row-slice ?x_shape ?axis ?offset ?extent ?x_map ?x_sliced)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalReduceSum (LogicalIndexMapApply ?x ?x_map ?x_sliced) ?reduced))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of ReduceSum over a later axis is ReduceSum of the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalReduceSum ?x ?reduced))
+    (>= ?axis ?reduced)
+    (row-carrier ?x (+ ?axis 1) ?split)
+    (row-reducible ?x (+ ?axis 1) ?split)
+    (= ?x_shape (shape-of ?x))
+  )
+  (
+    (row-slice-demand ?x_shape (+ ?axis 1) ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of ReduceSum over an earlier axis demands the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalReduceSum ?x ?reduced))
+    (>= ?axis ?reduced)
+    (row-carrier ?x (+ ?axis 1) ?split)
+    (row-reducible ?x (+ ?axis 1) ?split)
+    (= ?x_shape (shape-of ?x))
+    (row-slice ?x_shape (+ ?axis 1) ?offset ?extent ?x_map ?x_sliced)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalReduceSum (LogicalIndexMapApply ?x ?x_map ?x_sliced) ?reduced))
+    (row-sink-demand ?x (+ ?axis 1) ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of ReduceSum over an earlier axis is ReduceSum of the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalReduceMax ?x ?reduced))
+    (< ?axis ?reduced)
+    (row-carrier ?x ?axis ?split)
+    (row-reducible ?x ?axis ?split)
+    (= ?x_shape (shape-of ?x))
+  )
+  (
+    (row-slice-demand ?x_shape ?axis ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of ReduceMax over a later axis demands the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalReduceMax ?x ?reduced))
+    (< ?axis ?reduced)
+    (row-carrier ?x ?axis ?split)
+    (row-reducible ?x ?axis ?split)
+    (= ?x_shape (shape-of ?x))
+    (row-slice ?x_shape ?axis ?offset ?extent ?x_map ?x_sliced)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalReduceMax (LogicalIndexMapApply ?x ?x_map ?x_sliced) ?reduced))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of ReduceMax over a later axis is ReduceMax of the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalReduceMax ?x ?reduced))
+    (>= ?axis ?reduced)
+    (row-carrier ?x (+ ?axis 1) ?split)
+    (row-reducible ?x (+ ?axis 1) ?split)
+    (= ?x_shape (shape-of ?x))
+  )
+  (
+    (row-slice-demand ?x_shape (+ ?axis 1) ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of ReduceMax over an earlier axis demands the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalReduceMax ?x ?reduced))
+    (>= ?axis ?reduced)
+    (row-carrier ?x (+ ?axis 1) ?split)
+    (row-reducible ?x (+ ?axis 1) ?split)
+    (= ?x_shape (shape-of ?x))
+    (row-slice ?x_shape (+ ?axis 1) ?offset ?extent ?x_map ?x_sliced)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalReduceMax (LogicalIndexMapApply ?x ?x_map ?x_sliced) ?reduced))
+    (row-sink-demand ?x (+ ?axis 1) ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of ReduceMax over an earlier axis is ReduceMax of the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalWrappingReduceSum ?x ?reduced))
+    (< ?axis ?reduced)
+    (row-carrier ?x ?axis ?split)
+    (row-reducible ?x ?axis ?split)
+    (= ?x_shape (shape-of ?x))
+  )
+  (
+    (row-slice-demand ?x_shape ?axis ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of WrappingReduceSum over a later axis demands the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalWrappingReduceSum ?x ?reduced))
+    (< ?axis ?reduced)
+    (row-carrier ?x ?axis ?split)
+    (row-reducible ?x ?axis ?split)
+    (= ?x_shape (shape-of ?x))
+    (row-slice ?x_shape ?axis ?offset ?extent ?x_map ?x_sliced)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalWrappingReduceSum (LogicalIndexMapApply ?x ?x_map ?x_sliced) ?reduced))
+    (row-sink-demand ?x ?axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of WrappingReduceSum over a later axis is WrappingReduceSum of the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalWrappingReduceSum ?x ?reduced))
+    (>= ?axis ?reduced)
+    (row-carrier ?x (+ ?axis 1) ?split)
+    (row-reducible ?x (+ ?axis 1) ?split)
+    (= ?x_shape (shape-of ?x))
+  )
+  (
+    (row-slice-demand ?x_shape (+ ?axis 1) ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of WrappingReduceSum over an earlier axis demands the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (= ?y (LogicalWrappingReduceSum ?x ?reduced))
+    (>= ?axis ?reduced)
+    (row-carrier ?x (+ ?axis 1) ?split)
+    (row-reducible ?x (+ ?axis 1) ?split)
+    (= ?x_shape (shape-of ?x))
+    (row-slice ?x_shape (+ ?axis 1) ?offset ?extent ?x_map ?x_sliced)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced) (LogicalWrappingReduceSum (LogicalIndexMapApply ?x ?x_map ?x_sliced) ?reduced))
+    (row-sink-demand ?x (+ ?axis 1) ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of WrappingReduceSum over an earlier axis is WrappingReduceSum of the operand's slice"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (row-carry ?y ?x ?entries ?x_shape ?x_axis ?axis)
+    (row-carrier ?x ?x_axis ?split)
+    (= ?shape (shape-of ?y))
+  )
+  (
+    (row-slice-demand ?x_shape ?x_axis ?offset ?extent)
+    (row-slice-demand ?shape ?axis 0 ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of a carrying view demands the operand's slice and the rebasing"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (row-carry ?y ?x ?entries ?x_shape ?x_axis ?axis)
+    (row-carrier ?x ?x_axis ?split)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis 0 ?extent ?rebase ?sliced)
+  )
+  (
+    (composed-entries-demand ?entries ?rebase)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of a carrying view demands the rebased entries"
+)
+(rule
+  (
+    (row-sink-demand ?y ?axis ?split ?offset ?extent)
+    (row-carry ?y ?x ?entries ?x_shape ?x_axis ?axis)
+    (row-carrier ?x ?x_axis ?split)
+    (= ?shape (shape-of ?y))
+    (row-slice ?shape ?axis ?offset ?extent ?map ?sliced)
+    (row-slice ?shape ?axis 0 ?extent ?rebase ?sliced)
+    (composed-entries ?entries ?rebase ?rebased)
+    (row-slice ?x_shape ?x_axis ?offset ?extent ?x_map ?x_sliced)
+  )
+  (
+    (union (LogicalIndexMapApply ?y ?map ?sliced)
+      (LogicalIndexMapApply
+        (LogicalIndexMapApply ?x ?x_map ?x_sliced)
+        (IndexMapLit ?rebased ?x_sliced)
+        ?sliced))
+    (row-sink-demand ?x ?x_axis ?split ?offset ?extent)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_sink: a row slice of a carrying view is the rebased view of the operand's slice"
+)

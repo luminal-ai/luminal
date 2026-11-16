@@ -54,6 +54,14 @@ impl LogicalOp for LogicalSelect {
                 text: include_str!("concat_slices.egg"),
             },
             EgglogSnippet {
+                category: SpliceCategory::Rewrites,
+                text: include_str!("concat_rowwise.egg"),
+            },
+            EgglogSnippet {
+                category: SpliceCategory::Rewrites,
+                text: include_str!("concat_sink.egg"),
+            },
+            EgglogSnippet {
                 category: SpliceCategory::Shape,
                 text: include_str!("shape.egg"),
             },

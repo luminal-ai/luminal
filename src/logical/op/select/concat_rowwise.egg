@@ -1,0 +1,1207 @@
+; Rewrite : a row-wise op of a concatenation is the concatenation of the op
+; over its parts, `f(cat(a, b), t) = cat(f(a, t[:A]), f(b, t[A:]))`.
+; Elementwise ops act on each element alone, so over the rows a
+; concatenation takes from a they read a and the same rows of every other
+; operand (a row-indexed table like a rotary embedding's included), and
+; likewise for b. The result is spelled with the certified concatenation's
+; own condition and maps (concat_slices.egg), so it is itself a certified
+; concatenation and the next elementwise op pushes through it too; a view
+; or a reduction stops the push (their row slices sink instead,
+; concat_sink.egg). Where another operand itself carries the rows (a norm's
+; statistics, a rotary embedding's rotated half), its two row slices are
+; demanded, so they sink to computations over the parts. Same values, same
+; rounding: each element is computed by the same op on the same operands.
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalExp ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalExp ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalExp ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Exp of a concatenation is the concatenation of its parts' Exp"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalExp2 ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalExp2 ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalExp2 ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Exp2 of a concatenation is the concatenation of its parts' Exp2"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalLog2 ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalLog2 ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalLog2 ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Log2 of a concatenation is the concatenation of its parts' Log2"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSin ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalSin ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalSin ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Sin of a concatenation is the concatenation of its parts' Sin"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSqrt ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalSqrt ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalSqrt ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Sqrt of a concatenation is the concatenation of its parts' Sqrt"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalRecip ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalRecip ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalRecip ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Recip of a concatenation is the concatenation of its parts' Recip"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTanh ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalTanh ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalTanh ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Tanh of a concatenation is the concatenation of its parts' Tanh"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalNot ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalNot ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalNot ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Not of a concatenation is the concatenation of its parts' Not"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalCeil ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalCeil ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalCeil ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Ceil of a concatenation is the concatenation of its parts' Ceil"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalFloor ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalFloor ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalFloor ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Floor of a concatenation is the concatenation of its parts' Floor"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalRound ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalRound ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalRound ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Round of a concatenation is the concatenation of its parts' Round"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTrunc ?x))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalTrunc ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalTrunc ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Trunc of a concatenation is the concatenation of its parts' Trunc"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalCast ?x ?dtype))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalCast ?a ?dtype) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalCast ?b ?dtype) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Cast of a concatenation is the concatenation of its parts' Cast"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalRoundingCast ?x ?dtype))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalRoundingCast ?a ?dtype) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalRoundingCast ?b ?dtype) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: RoundingCast of a concatenation is the concatenation of its parts' RoundingCast"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTruncCast ?x ?dtype))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalTruncCast ?a ?dtype) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalTruncCast ?b ?dtype) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: TruncCast of a concatenation is the concatenation of its parts' TruncCast"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalPolygamma ?x ?order))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalPolygamma ?a ?order) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalPolygamma ?b ?order) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Polygamma of a concatenation is the concatenation of its parts' Polygamma"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalRoundDecimals ?x ?decimals))
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalRoundDecimals ?a ?decimals) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalRoundDecimals ?b ?decimals) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: RoundDecimals of a concatenation is the concatenation of its parts' RoundDecimals"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalAdd ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalAdd ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalAdd ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Add with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalAdd ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalAdd (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalAdd (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Add with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalAdd ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Add with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalAdd ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Add with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalMul ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalMul ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalMul ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Mul with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalMul ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalMul (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalMul (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Mul with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalMul ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Mul with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalMul ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Mul with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalDiv ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalDiv ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalDiv ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Div with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalDiv ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalDiv (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalDiv (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Div with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalDiv ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Div with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalDiv ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Div with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalLessThan ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalLessThan ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalLessThan ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: LessThan with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalLessThan ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalLessThan (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalLessThan (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: LessThan with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalLessThan ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: LessThan with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalLessThan ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: LessThan with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalAnd ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalAnd ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalAnd ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: And with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalAnd ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalAnd (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalAnd (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: And with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalAnd ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: And with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalAnd ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: And with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalOr ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalOr ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalOr ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Or with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalOr ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalOr (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalOr (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Or with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalOr ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Or with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalOr ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Or with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalMod ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalMod ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalMod ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Mod with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalMod ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalMod (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalMod (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Mod with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalMod ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Mod with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalMod ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Mod with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalHypot ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalHypot ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalHypot ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Hypot with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalHypot ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalHypot (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalHypot (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Hypot with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalHypot ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Hypot with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalHypot ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Hypot with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTruncDiv ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalTruncDiv ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalTruncDiv ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: TruncDiv with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTruncDiv ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalTruncDiv (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalTruncDiv (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: TruncDiv with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTruncDiv ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: TruncDiv with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTruncDiv ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: TruncDiv with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTruncRem ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalTruncRem ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalTruncRem ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: TruncRem with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTruncRem ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalTruncRem (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalTruncRem (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: TruncRem with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTruncRem ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: TruncRem with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalTruncRem ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: TruncRem with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalWrappingAdd ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalWrappingAdd ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalWrappingAdd ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: WrappingAdd with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalWrappingAdd ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalWrappingAdd (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalWrappingAdd (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: WrappingAdd with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalWrappingAdd ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: WrappingAdd with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalWrappingAdd ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: WrappingAdd with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalWrappingMul ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalWrappingMul ?a (LogicalIndexMapApply ?t ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalWrappingMul ?b (LogicalIndexMapApply ?t ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: WrappingMul with a concatenation on the left is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalWrappingMul ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalWrappingMul (LogicalIndexMapApply ?t ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalWrappingMul (LogicalIndexMapApply ?t ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: WrappingMul with a concatenation on the right is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalWrappingMul ?x ?t))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: WrappingMul with a concatenation on the left sinks the slices of a carrier on the right"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalWrappingMul ?t ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: WrappingMul with a concatenation on the right sinks the slices of a carrier on the left"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSelect ?x ?t ?f))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalSelect ?a (LogicalIndexMapApply ?t ?low ?low_shape) (LogicalIndexMapApply ?f ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalSelect ?b (LogicalIndexMapApply ?t ?high ?high_shape) (LogicalIndexMapApply ?f ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Select on a concatenated condition is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSelect ?t ?x ?f))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalSelect (LogicalIndexMapApply ?t ?low ?low_shape) ?a (LogicalIndexMapApply ?f ?low ?low_shape)) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalSelect (LogicalIndexMapApply ?t ?high ?high_shape) ?b (LogicalIndexMapApply ?f ?high ?high_shape)) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Select with a concatenated first branch is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSelect ?t ?f ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+  )
+  (
+    (union ?y
+      (LogicalSelect ?condition
+        (LogicalIndexMapApply (LogicalSelect (LogicalIndexMapApply ?t ?low ?low_shape) (LogicalIndexMapApply ?f ?low ?low_shape) ?a) ?true_map ?shape)
+        (LogicalIndexMapApply (LogicalSelect (LogicalIndexMapApply ?t ?high ?high_shape) (LogicalIndexMapApply ?f ?high ?high_shape) ?b) ?false_map ?shape)))
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Select with a concatenated second branch is the concatenation over the row slices"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSelect ?x ?t ?f))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Select with a concatenated condition sinks the slices of a carrier ?t"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSelect ?x ?t ?f))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?f ?axis ?split)
+  )
+  (
+    (row-sink-demand ?f ?axis ?split 0 ?split)
+    (row-sink-demand ?f ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Select with a concatenated condition sinks the slices of a carrier ?f"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSelect ?t ?x ?f))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Select with a concatenated first branch sinks the slices of a carrier ?t"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSelect ?t ?x ?f))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?f ?axis ?split)
+  )
+  (
+    (row-sink-demand ?f ?axis ?split 0 ?split)
+    (row-sink-demand ?f ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Select with a concatenated first branch sinks the slices of a carrier ?f"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSelect ?t ?f ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?t ?axis ?split)
+  )
+  (
+    (row-sink-demand ?t ?axis ?split 0 ?split)
+    (row-sink-demand ?t ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Select with a concatenated second branch sinks the slices of a carrier ?t"
+)
+(rule
+  (
+    (concat-template ?x ?axis ?split ?condition ?true_map ?false_map ?shape)
+    (concat-parts ?x ?axis ?split ?a ?b)
+    (= ?y (LogicalSelect ?t ?f ?x))
+    (row-slice ?shape ?axis 0 ?split ?low ?low_shape)
+    (row-slice ?shape ?axis ?split ?rest ?high ?high_shape)
+    (row-carrier ?f ?axis ?split)
+  )
+  (
+    (row-sink-demand ?f ?axis ?split 0 ?split)
+    (row-sink-demand ?f ?axis ?split ?split ?rest)
+  )
+  :ruleset main_ruleset
+  :name "select/concat_rowwise: Select with a concatenated second branch sinks the slices of a carrier ?f"
+)
