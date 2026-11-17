@@ -234,10 +234,9 @@ fn flatten_unflatten_substitution_reaches_a_fixpoint() {
     graph
         .parse_and_run_program(None, "(run-schedule (saturate (run prop)))")
         .unwrap();
-    // Complete ElementStride certificates retain extra layout-proof rows.
-    // This fixture converges at about 36,400 rows with those proofs present;
-    // retain a bound over every table, including proof metadata.
-    let max_rows = 40_000;
+    // Interior view shortcuts and their layout proofs bring this fixture to
+    // about 53,400 rows. Keep a bound over every table, including proof metadata.
+    let max_rows = 60_000;
     for _ in 0..64 {
         assert!(saturate_main_with_limit(&mut graph, max_rows));
         let report = graph
