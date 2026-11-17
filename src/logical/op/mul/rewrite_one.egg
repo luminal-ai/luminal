@@ -1,8 +1,8 @@
 ; THE PRODUCT BY ONE. A `one` is a tensor every element of which is the value
-; 1: the literal 1.0, a view of a one (a view only chooses which element each
-; coordinate reads), a conversion of a one to a float dtype (1 is exact in
-; every float dtype), and the reciprocal of a one (1/1 is 1, exactly, in
-; every float dtype). torch's `x / s` at s = 1.0 (a VAE resnet's
+; 1: the literal 1.0, an iota of the literal 1 (torch's integer scalar 1), a
+; view of a one (a view only chooses which element each coordinate reads), a
+; conversion of a one to a float dtype (1 is exact in every float dtype), and
+; the reciprocal of a one (1/1 is 1, exactly, in every float dtype). torch's `x / s` at s = 1.0 (a VAE resnet's
 ; `/ output_scale_factor`) is recorded in opmath as
 ; `cast(cast(x, F32) * recip(expand(1.0)), Bf16)`; the scalar's own round trip
 ; through Bf16 is the literal already (cast/rewrite.egg).
@@ -17,6 +17,9 @@
 (rule ((= ?c (LogicalConstant 1.0)))
  ((logical-one ?c))
  :ruleset main_ruleset :name "mul/rewrite_one: the literal 1.0 is a one")
+(rule ((= ?i (LogicalIota (IntLit 1) ?shape)))
+ ((logical-one ?i))
+ :ruleset main_ruleset :name "mul/rewrite_one: an iota of the literal 1 is a one")
 (rule ((= ?v (LogicalIndexMapApply ?o ?map ?shape)) (logical-one ?o))
  ((logical-one ?v))
  :ruleset main_ruleset :name "mul/rewrite_one: a view of a one is a one")

@@ -89,7 +89,8 @@ mod tests {
     /// (F32), for every value (signed zeros, infinities, subnormals; a NaN
     /// stays a NaN); widening bf16 to F32 is exact; and the final rounding
     /// to bf16 rounds a value bf16 already represents, which is the identity.
-    /// The same holds for an F32 product by a one directly. A product by 2.0
+    /// The same holds for an F32 product by a one directly, and for torch's
+    /// integer scalar 1 (an iota of the literal 1, converted). A product by 2.0
     /// is not folded, nor is a bf16 value rounded through F16.
     #[test]
     fn a_product_by_one_is_its_operand_rounding_included() {
@@ -110,10 +111,14 @@ mod tests {
 (let twos (LogicalIndexMapApply (LogicalConstant 2.0) (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) shape))
 (let doubled (LogicalMul y twos))
 (let through_f16 (LogicalCast (LogicalCast x (F32)) (F16)))
+(let int_one (LogicalCast (LogicalCast (LogicalIota (IntLit 1) (ShapeLit (IntExprNil))) (Bf16)) (F32)))
+(let int_ones (LogicalIndexMapApply int_one (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) shape))
+(let divided_by_int (LogicalCast (LogicalMul (LogicalCast x (F32)) (LogicalRecip int_ones)) (Bf16)))
 (run-schedule (saturate (run main_ruleset) (run prop)))
 (check (= divided x))
 (check (= scaled y))
 (check (= scaled_left y))
+(check (= divided_by_int x))
 (fail (check (= doubled y)))
 (fail (check (= through_f16 x)))
 "#,
