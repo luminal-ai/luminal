@@ -29,3 +29,31 @@
   :ruleset main_ruleset
   :name "cast/rewrite: an exact constant's round trip through F16 is the constant"
 )
+; Rewrite : a narrow value widened to F32 and rounded back is the value. The
+; widening is exact (every Bf16 / F16 value is an F32 value) and the rounding
+; of a value the narrow dtype represents returns that value; a NaN stays a
+; NaN. torch's opmath records an op over a narrow tensor as
+; `cast(op(cast(x, F32)), narrow)`; where the op is the identity (a product by
+; one, mul/rewrite_one.egg) this is the tensor itself.
+(rule
+  (
+    (= ?narrow (LogicalCast (LogicalCast ?x (F32)) (Bf16)))
+    (= (dtype-of ?x) (Bf16))
+  )
+  (
+    (union ?narrow ?x)
+  )
+  :ruleset main_ruleset
+  :name "cast/rewrite: a Bf16 value widened to F32 and rounded back is the value"
+)
+(rule
+  (
+    (= ?narrow (LogicalCast (LogicalCast ?x (F32)) (F16)))
+    (= (dtype-of ?x) (F16))
+  )
+  (
+    (union ?narrow ?x)
+  )
+  :ruleset main_ruleset
+  :name "cast/rewrite: an F16 value widened to F32 and rounded back is the value"
+)

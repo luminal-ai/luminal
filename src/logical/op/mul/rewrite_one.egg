@@ -1,0 +1,52 @@
+; THE PRODUCT BY ONE. A `one` is a tensor every element of which is the value
+; 1: the literal 1.0, a view of a one (a view only chooses which element each
+; coordinate reads), a conversion of a one to a float dtype (1 is exact in
+; every float dtype), and the reciprocal of a one (1/1 is 1, exactly, in
+; every float dtype). torch's `x / s` at s = 1.0 (a VAE resnet's
+; `/ output_scale_factor`) is recorded in opmath as
+; `cast(cast(x, F32) * recip(expand(1.0)), Bf16)`; the scalar's own round trip
+; through Bf16 is the literal already (cast/rewrite.egg).
+;
+; A float product by a one is its other operand: multiplying by 1.0 is the
+; identity of IEEE arithmetic in the product's own dtype, for every value
+; (signed zeros, infinities and subnormals included; a NaN stays a NaN), so
+; the product's rounding rounds a value that is already representable and
+; changes nothing. One rule per float dtype and per operand position: a float
+; product keeps its operand order (no floating commutativity, mul/rewrite.egg).
+(relation logical-one (LogicalTensor))
+(rule ((= ?c (LogicalConstant 1.0)))
+ ((logical-one ?c))
+ :ruleset main_ruleset :name "mul/rewrite_one: the literal 1.0 is a one")
+(rule ((= ?v (LogicalIndexMapApply ?o ?map ?shape)) (logical-one ?o))
+ ((logical-one ?v))
+ :ruleset main_ruleset :name "mul/rewrite_one: a view of a one is a one")
+(rule ((= ?c (LogicalCast ?o (F32))) (logical-one ?o))
+ ((logical-one ?c))
+ :ruleset main_ruleset :name "mul/rewrite_one: a one converted to F32 is a one")
+(rule ((= ?c (LogicalCast ?o (Bf16))) (logical-one ?o))
+ ((logical-one ?c))
+ :ruleset main_ruleset :name "mul/rewrite_one: a one converted to Bf16 is a one")
+(rule ((= ?c (LogicalCast ?o (F16))) (logical-one ?o))
+ ((logical-one ?c))
+ :ruleset main_ruleset :name "mul/rewrite_one: a one converted to F16 is a one")
+(rule ((= ?r (LogicalRecip ?o)) (logical-one ?o))
+ ((logical-one ?r))
+ :ruleset main_ruleset :name "mul/rewrite_one: the reciprocal of a one is a one")
+(rule ((= ?p (LogicalMul ?x ?o)) (logical-one ?o) (= (dtype-of ?p) (F32)))
+ ((union ?p ?x))
+ :ruleset main_ruleset :name "mul/rewrite_one: an F32 product by a one on the right is the operand")
+(rule ((= ?p (LogicalMul ?o ?x)) (logical-one ?o) (= (dtype-of ?p) (F32)))
+ ((union ?p ?x))
+ :ruleset main_ruleset :name "mul/rewrite_one: an F32 product by a one on the left is the operand")
+(rule ((= ?p (LogicalMul ?x ?o)) (logical-one ?o) (= (dtype-of ?p) (Bf16)))
+ ((union ?p ?x))
+ :ruleset main_ruleset :name "mul/rewrite_one: a Bf16 product by a one on the right is the operand")
+(rule ((= ?p (LogicalMul ?o ?x)) (logical-one ?o) (= (dtype-of ?p) (Bf16)))
+ ((union ?p ?x))
+ :ruleset main_ruleset :name "mul/rewrite_one: a Bf16 product by a one on the left is the operand")
+(rule ((= ?p (LogicalMul ?x ?o)) (logical-one ?o) (= (dtype-of ?p) (F16)))
+ ((union ?p ?x))
+ :ruleset main_ruleset :name "mul/rewrite_one: an F16 product by a one on the right is the operand")
+(rule ((= ?p (LogicalMul ?o ?x)) (logical-one ?o) (= (dtype-of ?p) (F16)))
+ ((union ?p ?x))
+ :ruleset main_ruleset :name "mul/rewrite_one: an F16 product by a one on the left is the operand")
