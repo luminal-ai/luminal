@@ -4,12 +4,10 @@
 ; while the existing guarded int-subst machinery remains the authority for
 ; whether every coordinate substitution is valid.
 (relation index-map-entry-subst-demand (IntExprList IndexMap))
-(relation index-map-entry-subst-complete (IntExprList IndexMap))
 (relation index-map-entry-subst-result (IntExprList IndexMap IntExprList))
 (relation index-map-input-list (BufferTensorList))
 (relation index-map-read-only-input-buffer (BufferId))
 (relation index-map-bound-output-list (BufferTensorList))
-(relation index-map-bound-output (LogicalTensor))
 (relation index-map-bound-read-only-alias-output (LogicalTensor))
 
 (rule
@@ -45,17 +43,10 @@
 )
 
 (rule
-  (
-    (index-map-bound-output-list (BufferTensorCons ?head ?tail))
-    (= ?head (BufferTensorLit ?layout-tensor ?buffer))
-    (= ?layout-tensor (LayoutTensorLit ?logical ?layout))
-  )
-  (
-    (index-map-bound-output ?logical)
-    (index-map-bound-output-list ?tail)
-  )
+  ((index-map-bound-output-list (BufferTensorCons ?head ?tail)))
+  ((index-map-bound-output-list ?tail))
   :ruleset main_ruleset
-  :name "index_map_apply/compose: mark one bound output and walk the suffix"
+  :name "index_map_apply/compose: walk the bound-output suffix"
 )
 
 ; A logical output bound onto the same read-only buffer as an input must be a
@@ -76,8 +67,7 @@
 
 (rule
   ((index-map-entry-subst-demand (IntExprNil) ?map))
-  ((index-map-entry-subst-result (IntExprNil) ?map (IntExprNil))
-   (index-map-entry-subst-complete (IntExprNil) ?map))
+  ((index-map-entry-subst-result (IntExprNil) ?map (IntExprNil)))
   :ruleset main_ruleset
   :name "index_map_apply/compose: empty entry substitution is complete"
 )
@@ -93,32 +83,26 @@
 (rule
   (
     (index-map-entry-subst-demand (IntExprCons ?head ?tail) ?map)
-    (int-subst-closed ?head ?map)
-    (index-map-entry-subst-complete ?tail ?map)
+    (= ?head-image (int-subst-of ?head ?map))
     (index-map-entry-subst-result ?tail ?map ?tail-image)
   )
   (
     (index-map-entry-subst-result
       (IntExprCons ?head ?tail)
       ?map
-      (IntExprCons (int-subst-of ?head ?map) ?tail-image))
-    (index-map-entry-subst-complete (IntExprCons ?head ?tail) ?map)
+      (IntExprCons ?head-image ?tail-image))
   )
   :ruleset main_ruleset
   :name "index_map_apply/compose: complete one substituted entry"
 )
 
-; Seed only from an actually adjacent pair whose outer map states the inner
-; view's output shape as its source domain, and only when the result is a
-; bound output value.  Interior views already compose at the layout level;
-; publishing every logical prefix of every interior chain is quadratic and
-; needlessly expands saturation.  A malformed cross-domain pair therefore
-; never files substitution demands.
+; Match adjacent applies whose map tags agree with their parents' shapes.
+; Composed applies can match again, so every segment of a view chain can
+; acquire a direct apply from its first tensor to its last.
 (rule
   (
     (= ?inner (LogicalIndexMapApply ?root ?inner-map ?inner-shape))
     (= ?outer (LogicalIndexMapApply ?inner ?outer-map ?out-shape))
-    (index-map-bound-output ?outer)
     (= ?inner-map (IndexMapLit ?inner-entries ?root-shape))
     (= ?outer-map (IndexMapLit ?outer-entries ?inner-shape))
     (= ?root-shape (shape-of ?root))
@@ -139,7 +123,6 @@
     (= ?root-shape (shape-of ?root))
     (= ?inner-shape (shape-of ?inner))
     (= ?out-shape (shape-of ?outer))
-    (index-map-entry-subst-complete ?inner-entries ?outer-map)
     (index-map-entry-subst-result ?inner-entries ?outer-map ?composed-entries)
   )
   ((union
