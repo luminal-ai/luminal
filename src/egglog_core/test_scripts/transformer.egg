@@ -134,16 +134,20 @@
 (let wk_logical (LogicalTensorInputLit (LogicalIdLit "w_k") projection_weight_shape (F32)))
 (let wv_logical (LogicalTensorInputLit (LogicalIdLit "w_v") projection_weight_shape (F32)))
 
-; Masking inputs for the causal softmax. SelectWhere is gone (R6: luminal
-; parity), so masking is STRICT mask arithmetic:
+; Masking inputs for the causal softmax. This test exercises the LEGACY
+; arithmetic mask pattern:
 ;   masked = scores * keep_mask + fill * (1 - keep_mask)
 ; with the complement supplied as its own input (the logical op set has no
 ; subtraction or scalar constants). The fill tensor must be a FINITE
 ; sentinel (f32::MIN-style), never a true -inf: the arithmetic form
-; multiplies the untaken branch by zero, and 0 * (-inf) = NaN in IEEE 754 —
-; a genuine -inf fill would NaN-poison every KEPT position. A finite
-; sentinel is numerically exact for softmax (exp(sentinel - row_max)
-; underflows to zero).
+; multiplies the untaken branch by zero, and 0 * (-inf) = NaN in IEEE 754.
+;
+; NOTE: luminal_nn now avoids this pattern — causal_bias() and friends use
+; LogicalSelect to produce exact f32::NEG_INFINITY without NaN risk. This
+; test retains the arithmetic form for compiler/optimizer compatibility:
+; external graphs may still emit it, and the compiler must handle it
+; correctly. The arithmetic pattern is ONLY safe with a finite sentinel;
+; using f32::NEG_INFINITY as the fill value will silently produce NaN.
 (let causal_mask_logical (LogicalTensorInputLit (LogicalIdLit "causal_mask") attn_scores_shape (F32)))
 (let inverted_causal_mask_logical (LogicalTensorInputLit (LogicalIdLit "inverted_causal_mask") attn_scores_shape (F32)))
 (let masked_fill_scores_logical (LogicalTensorInputLit (LogicalIdLit "masked_fill_scores") attn_scores_shape (F32)))
