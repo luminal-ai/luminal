@@ -15,6 +15,44 @@
 
 use test_runtime::test_support::bufferize_mock;
 
+#[test]
+fn sine_and_cosine_lower_to_one_compute_op_in_each_form() {
+    use luminal::{bufferize::BufferNode, prelude::*};
+
+    let ops = [
+        ("Sin", GraphTensor::sin as fn(GraphTensor) -> GraphTensor),
+        ("Cos", GraphTensor::cos),
+    ];
+    for (name, op) in ops {
+        let mut cx = Graph::new();
+        let input = cx.tensor([2, 3], DType::F32);
+        let output = op(input);
+        assert_eq!(output.dims(), input.dims());
+        assert_eq!(output.dtype, input.dtype);
+        let fixture = test_runtime::bind_leaves(&cx);
+
+        for form in ["Functional", "Mutating"] {
+            let label = format!("{name}{form}Generic");
+            let constructor = format!("LayoutTensorOp{label}");
+            let (graph, _) = test_runtime::extract_fixture_with_genome(&fixture, &[&constructor]);
+            let plan = bufferize_mock(&luminal::dps::dps_rewrite(&graph)).expect("bufferizes");
+            let computes: Vec<_> = plan
+                .dag
+                .node_weights()
+                .filter_map(|node| match node {
+                    BufferNode::Compute { op, .. }
+                        if !matches!(op.label(), "BufferAlloc" | "BufferFree") =>
+                    {
+                        Some(op.label())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(computes, [label.as_str()]);
+        }
+    }
+}
+
 /// Idempotency: DPS forms answer to_dps() = None, so a second rewrite is a
 /// no-op (same node and edge counts).
 #[test]

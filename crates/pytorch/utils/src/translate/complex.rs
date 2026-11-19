@@ -629,8 +629,7 @@ impl Translator<'_> {
                 };
                 let magnitude = magnitude.cast(compute);
                 let angle = angle.cast(compute);
-                let real =
-                    super::util::round_to_storage(magnitude * self.cx_cos(angle), component_dtype);
+                let real = super::util::round_to_storage(magnitude * angle.cos(), component_dtype);
                 let imag = super::util::round_to_storage(magnitude * angle.sin(), component_dtype);
                 self.store_complex(output_name, ComplexTensor::new(real, imag, dtype));
             }
@@ -1647,12 +1646,6 @@ impl Translator<'_> {
         (input * log2_e).exp2()
     }
 
-    /// `cos(x) = sin(pi/2 - x)`, keeping pi/2 in the tensor's dtype.
-    fn cx_cos(&mut self, input: GraphTensor) -> GraphTensor {
-        let half_pi = self.constant_like(input, std::f64::consts::FRAC_PI_2);
-        (half_pi - input).sin()
-    }
-
     fn cx_sinh(&mut self, input: GraphTensor) -> GraphTensor {
         let half = self.constant_like(input, 0.5);
         half * (self.cx_exp(input) - self.cx_exp(input * -1.0))
@@ -1876,7 +1869,7 @@ impl Translator<'_> {
     fn complex_exp(&mut self, value: ComplexTensor) -> ComplexTensor {
         let scale = self.cx_exp(value.real);
         ComplexTensor::new(
-            scale * self.cx_cos(value.imag),
+            scale * value.imag.cos(),
             scale * value.imag.sin(),
             value.torch_dtype,
         )
@@ -1887,7 +1880,7 @@ impl Translator<'_> {
         let sinh = self.cx_sinh(value.imag);
         ComplexTensor::new(
             value.real.sin() * cosh,
-            self.cx_cos(value.real) * sinh,
+            value.real.cos() * sinh,
             value.torch_dtype,
         )
     }
@@ -1896,7 +1889,7 @@ impl Translator<'_> {
         let sinh = self.cx_sinh(value.real);
         let cosh = self.cx_cosh(value.real);
         ComplexTensor::new(
-            sinh * self.cx_cos(value.imag),
+            sinh * value.imag.cos(),
             cosh * value.imag.sin(),
             value.torch_dtype,
         )
@@ -1967,7 +1960,7 @@ impl Translator<'_> {
         let cosh = self.cx_cosh(value.imag);
         let sinh = self.cx_sinh(value.imag);
         ComplexTensor::new(
-            self.cx_cos(value.real) * cosh,
+            value.real.cos() * cosh,
             value.real.sin() * sinh * -1.0,
             value.torch_dtype,
         )
@@ -1977,7 +1970,7 @@ impl Translator<'_> {
         let cosh = self.cx_cosh(value.real);
         let sinh = self.cx_sinh(value.real);
         ComplexTensor::new(
-            cosh * self.cx_cos(value.imag),
+            cosh * value.imag.cos(),
             sinh * value.imag.sin(),
             value.torch_dtype,
         )
@@ -2055,8 +2048,7 @@ impl Translator<'_> {
             )
             .expand_rhs(phases.dims());
         let phase = phases * tau / length;
-        let quarter = self.constant_like(phase, std::f64::consts::FRAC_PI_2);
-        let cosine = (quarter - phase).sin();
+        let cosine = phase.cos();
         let sine = phase.sin();
         let real = (matrix.real * cosine - matrix.imag * sine).sum(&[input_axis]);
         let imag = (matrix.real * sine + matrix.imag * cosine).sum(&[input_axis]);

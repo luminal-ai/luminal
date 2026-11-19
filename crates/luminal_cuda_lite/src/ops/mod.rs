@@ -37,6 +37,7 @@ pub mod bools_to_bits;
 pub mod cast;
 pub mod ceil;
 pub mod constant;
+pub mod cos;
 pub mod cublaslt;
 pub mod div;
 pub mod exp;
@@ -281,6 +282,7 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(exp2::Exp2FunctionalMatcher, exp2::Exp2Functional),
         reg(log2::Log2FunctionalMatcher, log2::Log2Functional),
         reg(sin::SinFunctionalMatcher, sin::SinFunctional),
+        reg(cos::CosFunctionalMatcher, cos::CosFunctional),
         reg(tanh::TanhFunctionalMatcher, tanh::TanhFunctional),
         reg(recip::RecipFunctionalMatcher, recip::RecipFunctional),
         reg(modulo::ModFunctionalMatcher, modulo::ModFunctional),

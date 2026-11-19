@@ -1,0 +1,12 @@
+; Shape Propagation : LogicalCos
+(rule
+  (
+    (= ?out_logical (LogicalCos ?in_logical))
+    (= ?shape (shape-of ?in_logical))
+  )
+  (
+    (set (shape-of ?out_logical) ?shape)
+  )
+  :ruleset prop
+  :name "cos/shape: shape of LogicalCos from its operand"
+)

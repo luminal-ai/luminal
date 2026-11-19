@@ -381,22 +381,19 @@ def test_sqrt(device: torch.device):
     assert torch.allclose(output, original)
 
 
-def test_sin(device: torch.device):
-    sin_test_model: torch.nn.Module = SinTestModel().to(device)
-    sin_test_model_compiled = torch.compile(sin_test_model, backend=luminal_backend)
-    x = torch.rand(100, device=device)
-    output = sin_test_model_compiled(x)
-    original = sin_test_model(x)
-    assert torch.allclose(output, original)
-
-
-def test_cos(device: torch.device):
-    cos_test_model: torch.nn.Module = CosTestModel().to(device)
-    cos_test_model_compiled = torch.compile(cos_test_model, backend=luminal_backend)
-    x = torch.rand(100, device=device)
-    output = cos_test_model_compiled(x)
-    original = cos_test_model(x)
-    assert torch.allclose(output, original)
+@pytest.mark.parametrize("model_type", (SinTestModel, CosTestModel), ids=("sin", "cos"))
+@pytest.mark.parametrize("dtype", (torch.float32, torch.int32))
+def test_trig(
+    device: torch.device, model_type: type[torch.nn.Module], dtype: torch.dtype
+):
+    model = model_type().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    x = torch.tensor(
+        [-30000.0, -3500.0, 0.0, 1.5707963267948966, 10.0, 300.0, 3500.0, 30000.0],
+        device=device,
+        dtype=dtype,
+    )
+    torch.testing.assert_close(compiled(x), model(x), rtol=1e-6, atol=1e-8)
 
 
 def test_acos(device: torch.device):

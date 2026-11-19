@@ -41,7 +41,7 @@ impl LayoutIrOp for SinFunctional {}
 /// Destination-passing form of [`SinFunctional`], signature spelled slot by slot:
 ///
 /// ```text
-/// SinGeneric(input: read, dest0: write-only ↔ out0) -> out0
+/// SinFunctionalGeneric(input: read, dest0: write-only ↔ out0) -> out0
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SinFunctionalDps;
@@ -137,5 +137,5 @@ pub(crate) fn kernel(
     _op: &dyn BufferTensorIrOp,
     ctx: &mut ReferenceKernelCtx,
 ) -> anyhow::Result<()> {
-    ctx.unary_elementwise_typed(|x| x.sin(), |x| x.sin())
+    ctx.unary_elementwise_typed(f32::sin, f64::sin)
 }

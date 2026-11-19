@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpCosFunctionalGeneric (LayoutTensor Layout) LayoutTensorOp)

@@ -123,7 +123,8 @@ impl GraphTensor {
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
-    /// The sin(x) function
+    /// Elementwise sine of floating-point angles in radians.
+    /// Preserves the input shape and dtype. NaN and infinities produce NaN.
     pub fn sin(self) -> GraphTensor {
         let new_id = self.graph().logical.op(
             LogicalOp::Sin,
@@ -134,10 +135,16 @@ impl GraphTensor {
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
-    /// The cos(x) function
+    /// Elementwise cosine of floating-point angles in radians.
+    /// Preserves the input shape and dtype. NaN and infinities produce NaN.
     pub fn cos(self) -> GraphTensor {
-        (self.elementary_constant(std::f32::consts::PI / 2., std::f64::consts::FRAC_PI_2) - self)
-            .sin()
+        let new_id = self.graph().logical.op(
+            LogicalOp::Cos,
+            &[(self.id, self.dims())],
+            self.dims(),
+            self.dtype,
+        );
+        GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
     /// Square every element in the tensor

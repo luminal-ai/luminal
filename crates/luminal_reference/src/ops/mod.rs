@@ -34,6 +34,7 @@ mod bools_to_bits_view;
 pub(crate) mod cast;
 pub(crate) mod ceil;
 pub(crate) mod constant;
+pub(crate) mod cos;
 pub(crate) mod div;
 pub(crate) mod exp;
 pub(crate) mod exp2;
@@ -91,6 +92,7 @@ pub use bools_to_bits::BoolsToBitsDps;
 pub use cast::Cast;
 pub use ceil::CeilFunctional;
 pub use constant::Constant;
+pub use cos::CosFunctional;
 pub use div::DivFunctional;
 pub use exp::ExpFunctional;
 pub use exp2::Exp2Functional;
@@ -133,6 +135,7 @@ pub use add::AddFunctionalDps;
 pub use cast::CastDps;
 pub use ceil::CeilFunctionalDps;
 pub use constant::ConstantDps;
+pub use cos::CosFunctionalDps;
 pub use div::DivFunctionalDps;
 pub use exp::ExpFunctionalDps;
 pub use exp2::Exp2FunctionalDps;
@@ -171,6 +174,7 @@ pub use add::AddFunctionalMatcher;
 pub use cast::CastMatcher;
 pub use ceil::CeilFunctionalMatcher;
 pub use constant::ConstantMatcher;
+pub use cos::CosFunctionalMatcher;
 pub use div::DivFunctionalMatcher;
 pub use exp::ExpFunctionalMatcher;
 pub use exp2::Exp2FunctionalMatcher;
@@ -406,6 +410,10 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(SinFunctionalMatcher),
                 kernel: entry::<SinFunctionalDps>("SinFunctionalGeneric", sin::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(CosFunctionalMatcher),
+                kernel: entry::<CosFunctionalDps>("CosFunctionalGeneric", cos::kernel),
             },
             ReferenceOp {
                 matcher: || Box::new(TanhFunctionalMatcher),

@@ -493,6 +493,7 @@ impl OpWire {
             ops::Log2FunctionalDps,
             ops::RecipFunctionalDps,
             ops::SinFunctionalDps,
+            ops::CosFunctionalDps,
             ops::SqrtFunctionalDps,
             ops::LessThanDps,
             ops::SelectFunctionalDps
@@ -579,6 +580,7 @@ impl OpWire {
             ops::Log2FunctionalDps,
             ops::RecipFunctionalDps,
             ops::SinFunctionalDps,
+            ops::CosFunctionalDps,
             ops::SqrtFunctionalDps,
             ops::LessThanDps,
             ops::SelectFunctionalDps

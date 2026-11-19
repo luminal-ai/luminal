@@ -17,6 +17,7 @@
 pub mod add;
 pub mod cast;
 pub mod constant;
+pub mod cos;
 pub mod div;
 pub mod exp;
 pub mod exp2;
@@ -47,6 +48,7 @@ pub fn functional_matchers() -> Vec<Box<dyn luminal::layout_ir::OpMatcher>> {
         Box::new(add::AddFunctionalMatcher),
         Box::new(cast::CastMatcher),
         Box::new(constant::ConstantMatcher),
+        Box::new(cos::CosFunctionalMatcher),
         Box::new(div::DivFunctionalMatcher),
         Box::new(exp::ExpFunctionalMatcher),
         Box::new(exp2::Exp2FunctionalMatcher),

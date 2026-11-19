@@ -142,6 +142,7 @@ pub enum LogicalOp {
     Exp2,
     Log2,
     Sin,
+    Cos,
     Tanh,
     Floor,
     Ceil,
@@ -236,6 +237,7 @@ impl LogicalOp {
             Self::Exp2 => "LogicalExp2",
             Self::Log2 => "LogicalLog2",
             Self::Sin => "LogicalSin",
+            Self::Cos => "LogicalCos",
             Self::Tanh => "LogicalTanh",
             Self::Floor => "LogicalFloor",
             Self::Ceil => "LogicalCeil",
@@ -289,6 +291,7 @@ impl LogicalOp {
             | Self::Exp2
             | Self::Log2
             | Self::Sin
+            | Self::Cos
             | Self::Tanh
             | Self::Floor
             | Self::Ceil
@@ -350,6 +353,7 @@ impl LogicalOp {
             | Self::Exp2
             | Self::Log2
             | Self::Sin
+            | Self::Cos
             | Self::Tanh
             | Self::Floor
             | Self::Ceil
@@ -717,6 +721,17 @@ impl LogicalGraph {
                 Err(reason) => {
                     self.refuse(reason);
                 }
+            }
+        }
+        if matches!(op, LogicalOp::Sin | LogicalOp::Cos) {
+            let source = &self.graph[ids[0]];
+            if !matches!(source.dtype, DType::F32 | DType::F64 | DType::TF32)
+                && !source.dtype.is_narrow_float()
+            {
+                self.refuse(format!("{constructor} requires a floating-point input"));
+            }
+            if source.dims != out_dims || source.dtype != out_dtype {
+                self.refuse(format!("{constructor} must preserve shape and dtype"));
             }
         }
         if let LogicalOp::AllGather {
