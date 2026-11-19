@@ -62,19 +62,15 @@ impl Translator<'_> {
 
     pub(super) fn translate_tan(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.unary_input(node)?;
-        let cosine = self.real_cos(x);
-        Ok(x.sin() / cosine)
+        Ok(x.sin() / x.cos())
+    }
+
+    pub(super) fn translate_sin(&mut self, node: &Node) -> Result<GraphTensor> {
+        Ok(self.unary_input(node)?.sin())
     }
 
     pub(super) fn translate_cos(&mut self, node: &Node) -> Result<GraphTensor> {
-        let x = self.unary_input(node)?;
-        Ok(self.real_cos(x))
-    }
-
-    /// `cos(x) = sin(pi/2 - x)`, keeping pi/2 in the tensor's dtype.
-    fn real_cos(&mut self, input: GraphTensor) -> GraphTensor {
-        let half_pi = self.constant_like(input, std::f64::consts::FRAC_PI_2);
-        (half_pi - input).sin()
+        Ok(self.unary_input(node)?.cos())
     }
 
     pub(super) fn translate_asin(&mut self, node: &Node) -> Result<GraphTensor> {

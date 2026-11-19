@@ -14,6 +14,7 @@
 //! its egglog rules on each saturation.
 
 pub mod add;
+pub mod cos;
 pub mod div;
 pub mod exp;
 pub mod exp2;
@@ -28,6 +29,7 @@ pub mod sqrt;
 pub use add::{
     AddMutating, AddMutatingInputAliasSafe, AddMutatingInputAliasSafeMatcher, AddMutatingMatcher,
 };
+pub use cos::{CosMutating, CosMutatingMatcher};
 pub use div::{DivMutating, DivMutatingMatcher};
 pub use exp::{ExpMutating, ExpMutatingMatcher};
 pub use exp2::{Exp2Mutating, Exp2MutatingMatcher};
@@ -44,6 +46,7 @@ pub fn mutating_matchers() -> Vec<Box<dyn luminal::layout_ir::OpMatcher>> {
     vec![
         Box::new(add::AddMutatingMatcher),
         Box::new(add::AddMutatingInputAliasSafeMatcher),
+        Box::new(cos::CosMutatingMatcher),
         Box::new(div::DivMutatingMatcher),
         Box::new(exp::ExpMutatingMatcher),
         Box::new(exp2::Exp2MutatingMatcher),

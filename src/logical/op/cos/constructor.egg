@@ -1,0 +1,1 @@
+(constructor LogicalCos (LogicalTensor) LogicalTensor)

@@ -3,7 +3,7 @@
 //!
 //! Everything is built from recorder-frontend primitives. Helpers the parked
 //! translator kept private to its own module (`real_atan`, `real_exp`,
-//! `real_cos`, the polynomial evaluators, `real_atan2`) are duplicated here
+//! the polynomial evaluators, `real_atan2`) are duplicated here
 //! under a `special_` prefix so no sibling port's method table is touched.
 //! `translate_erfc`/`translate_erf` and the plain unary real-domain helpers
 //! stay in `unary.rs`.
@@ -89,12 +89,6 @@ impl Translator<'_> {
     fn special_exp(&mut self, input: GraphTensor) -> GraphTensor {
         let log2_e = self.constant_like(input, std::f64::consts::LOG2_E);
         (input * log2_e).exp2()
-    }
-
-    /// `cos(x) = sin(pi/2 - x)`, keeping pi/2 in the tensor's dtype.
-    fn special_cos(&mut self, input: GraphTensor) -> GraphTensor {
-        let half_pi = self.constant_like(input, std::f64::consts::FRAC_PI_2);
-        (half_pi - input).sin()
     }
 
     fn special_sinh(&mut self, input: GraphTensor) -> GraphTensor {
@@ -307,7 +301,7 @@ impl Translator<'_> {
             * self.special_polynomial_evaluate(reciprocal_square, qp)
             / self.special_polynomial_evaluate(reciprocal_square, qq);
         let angle = value - self.constant_like(value, phase);
-        let cosine = self.special_cos(angle);
+        let cosine = angle.cos();
         let sine = angle.sin();
         let oscillation = if second_kind {
             p * sine + q * cosine
@@ -539,7 +533,7 @@ impl Translator<'_> {
             / self.special_polynomial_evaluate(z_squared, &AGD);
         let angle = negative_phase + self.constant_like(value, std::f64::consts::FRAC_PI_4);
         let negative = self.constant_like(value, 0.564189583547756286948) / negative_root.sqrt()
-            * (angle.sin() * f - self.special_cos(angle) * g);
+            * (angle.sin() * f - angle.cos() * g);
 
         let positive_root = value.sqrt();
         let two_thirds = self.constant_like(value, 2.0 / 3.0);
@@ -807,9 +801,9 @@ impl Translator<'_> {
         let absolute = self.real_abs(value);
         let angle = self.special_acos(value);
         let inside = match kind {
-            0 => self.special_cos(degree * angle),
+            0 => (degree * angle).cos(),
             1 => (degree_plus_one * angle).sin() / angle.sin(),
-            2 => self.special_cos((degree + half) * angle) / self.special_cos(angle * 0.5),
+            2 => ((degree + half) * angle).cos() / (angle * 0.5).cos(),
             3 => ((degree + half) * angle).sin() / (angle * 0.5).sin(),
             _ => unreachable!(),
         };

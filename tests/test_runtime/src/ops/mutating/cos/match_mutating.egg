@@ -1,0 +1,18 @@
+; Layout Tensor Op Cos Mutating
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?layout))
+    (= ?out_logical (LogicalCos ?in_logical))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op (LayoutTensorOpCosMutatingGeneric ?in_layout_tensor))
+  )
+  :ruleset backend
+  :name "test_runtime/ops/mutating/cos/match_mutating: Cos mutating in-place on its one operand"
+)

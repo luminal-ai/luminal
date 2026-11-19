@@ -2,7 +2,7 @@
 //! Reads follow composed layouts; egglog match rules require dense destinations.
 
 use crate::symbolic::Expr;
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use luminal::buffer_tensor_ir::BufferTensorIrOp;
 use luminal::bufferize::SlotDescriptor;
 use luminal::dtype::PlanDtype;
@@ -489,6 +489,17 @@ pub(crate) fn unary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> {
     let to = metal_type(ctx.dest_dtypes[0])?;
     let sig = format!("device const {ta}* a");
     elementwise(ctx, expr, &["a"], &sig, to)
+}
+
+pub(crate) fn unary_trig(ctx: &CodegenCtx, function: &str) -> Result<Vec<KernelSource>> {
+    let dtype = ctx.operand_dtypes[0];
+    ensure!(
+        matches!(dtype, PlanDtype::F16 | PlanDtype::F32) && ctx.dest_dtypes[0] == dtype,
+        "Metal {function} requires matching F16 or F32 input and output dtypes"
+    );
+    // The half sine intrinsic loses the sign of negative zero. The input
+    // converts exactly to float, and the typed store rounds the result.
+    unary(ctx, &format!("{function}(float(a[i]))"))
 }
 
 fn elementwise(

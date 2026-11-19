@@ -1,0 +1,11 @@
+; Forward LayoutTensor Propagation : Logical Cos
+(rule
+  (
+    (= ?out_logical (LogicalCos ?in_logical))
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+  )
+  (
+    (let new_out_layout_tensor (LayoutTensorLit ?out_logical ?in_layout)) ; Forward Propagation
+  )
+  :ruleset main_ruleset :name "cos/forward_layout: LogicalCos result in the operand's layout"
+)

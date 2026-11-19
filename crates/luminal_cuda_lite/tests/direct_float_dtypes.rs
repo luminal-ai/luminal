@@ -20,23 +20,23 @@ fn plan_dtype(dtype: DType) -> PlanDtype {
     }
 }
 
-fn payload(dtype: DType, values: &[f32]) -> HostBuffer {
+fn payload(dtype: DType, values: &[f64]) -> HostBuffer {
     let bytes = match dtype {
         DType::F32 => values
             .iter()
-            .flat_map(|value| value.to_ne_bytes())
+            .flat_map(|value| (*value as f32).to_ne_bytes())
             .collect(),
         DType::F64 => values
             .iter()
-            .flat_map(|value| f64::from(*value).to_ne_bytes())
+            .flat_map(|value| value.to_ne_bytes())
             .collect(),
         DType::F16 => values
             .iter()
-            .flat_map(|value| f16::from_f32(*value).to_bits().to_ne_bytes())
+            .flat_map(|value| f16::from_f64(*value).to_bits().to_ne_bytes())
             .collect(),
         DType::Bf16 => values
             .iter()
-            .flat_map(|value| bf16::from_f32(*value).to_bits().to_ne_bytes())
+            .flat_map(|value| bf16::from_f64(*value).to_bits().to_ne_bytes())
             .collect(),
         other => panic!("not one of the four floating test dtypes: {other:?}"),
     };
@@ -100,6 +100,7 @@ fn direct_float_matches_execute_for_f32_f64_f16_and_bf16() {
             + x.exp2()
             + x.log2()
             + x.sin()
+            + x.cos()
             + x.tanh()
             + x.floor()
             + x.ceil()
@@ -147,6 +148,7 @@ fn direct_float_matches_execute_for_f32_f64_f16_and_bf16() {
             "Exp2FunctionalGeneric",
             "Log2FunctionalGeneric",
             "SinFunctionalGeneric",
+            "CosFunctionalGeneric",
             "TanhFunctionalGeneric",
             "FloorFunctionalGeneric",
             "CeilFunctionalGeneric",
@@ -186,5 +188,84 @@ fn direct_float_matches_execute_for_f32_f64_f16_and_bf16() {
         let values = decoded_f64(&result);
         assert_eq!(values.len(), 1, "{dtype:?} output is not scalar");
         assert!(values[0].is_finite(), "{dtype:?} output is {values:?}");
+    }
+}
+
+#[test]
+fn sine_and_cosine_preserve_wide_angles_and_exceptional_values() {
+    for dtype in [DType::F32, DType::F64, DType::F16, DType::Bf16] {
+        let (large, moderate) = match dtype {
+            DType::F64 => (1e300, 300.0),
+            // sin(300) in F32 lands on an F16 rounding midpoint.
+            DType::F16 => (30000.0, 301.0),
+            _ => (30000.0, 300.0),
+        };
+        let angles = [
+            -large,
+            -3500.0,
+            -700.0,
+            -std::f64::consts::FRAC_PI_2,
+            -0.0,
+            0.0,
+            std::f64::consts::PI,
+            moderate,
+            3500.0,
+            large,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        let mut graph = Graph::new();
+        let input = graph.tensor([angles.len()], dtype);
+        let outputs = [
+            ("sin", input.sin(), f64::sin as fn(f64) -> f64),
+            ("cos", input.cos(), f64::cos),
+        ];
+        let data = payload(dtype, &angles);
+        let stored_angles = decoded_f64(&data);
+        let inputs = [(input.id, data.clone())].into_iter().collect();
+        let mut runtime = CudaRuntime::load(&graph).unwrap();
+        runtime
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &inputs,
+                &luminal_cuda_lite::harness_search_options(),
+            )
+            .unwrap_or_else(|error| panic!("{dtype:?} trig search failed: {error:#}"));
+        let mut arena = support::allocate_arena(&runtime).unwrap();
+        let mut staging = runtime.allocate_staging().unwrap();
+        runtime.upload(&mut arena, input.id, data).unwrap();
+        runtime.execute(arena.arena(), &mut staging).unwrap();
+        let tolerance = match dtype {
+            DType::F32 => 1e-6,
+            DType::F64 => 2e-15,
+            _ => 0.0,
+        };
+        for (name, output, reference) in outputs {
+            let result = runtime.download(&arena, output.id).unwrap().0;
+            assert_eq!(result.dtype, plan_dtype(dtype));
+            assert_eq!(result.len(), angles.len());
+
+            let expected: Vec<_> = stored_angles.iter().copied().map(reference).collect();
+            let rounded = decoded_f64(&payload(dtype, &expected));
+            for ((&angle, want), got) in stored_angles.iter().zip(rounded).zip(decoded_f64(&result))
+            {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{dtype:?} {name}({angle}) got {got}");
+                } else if want == 0.0 {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{dtype:?} {name}({angle}) expected {want}, got {got}"
+                    );
+                } else {
+                    assert!(
+                        (got - want).abs() <= tolerance,
+                        "{dtype:?} {name}({angle}) expected {want}, got {got}"
+                    );
+                }
+            }
+        }
     }
 }

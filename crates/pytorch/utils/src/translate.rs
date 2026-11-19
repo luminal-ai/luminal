@@ -1396,7 +1396,6 @@ impl Translator<'_> {
             "silu.default" => self.operand(&n[0])?.silu(),
             "gelu.default" => self.translate_gelu(node)?,
             "reciprocal.default" => self.operand(&n[0])?.reciprocal(),
-            "sin.default" => self.operand(&n[0])?.sin(),
             "square.default" => {
                 let x = self.operand(&n[0])?;
                 if Self::torch_wraps(x.dtype) {
@@ -1679,6 +1678,7 @@ impl Translator<'_> {
             "sinh.default" => self.translate_sinh(node)?,
             "cosh.default" => self.translate_cosh(node)?,
             "tan.default" => self.translate_tan(node)?,
+            "sin.default" => self.translate_sin(node)?,
             "cos.default" => self.translate_cos(node)?,
             "asin.default" => self.translate_asin(node)?,
             "acos.default" => self.translate_acos(node)?,

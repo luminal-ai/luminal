@@ -3,7 +3,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, unary_trig};
 use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +81,7 @@ impl LayoutIrOp for SinFunctionalDps {}
 
 impl KernelOp for SinFunctionalDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-        unary(ctx, "sin(a[i])")
+        unary_trig(ctx, "sin")
     }
 }
 

@@ -12,13 +12,9 @@ use luminal::layout_ir::{
 
 /// `SinMutatingGeneric(x: read+write) -> out`
 ///
-/// Mutating form: the kernel reads and overwrites ONE storage — its
-/// single operand's. Matched in egglog only when the output layout equals
-/// that operand's layout AND the written tensor is provably injective, so an
-/// admitted tie is descriptor-exact by construction. The tie is `May` in the
-/// relocation sense: a rejected mutation relocates the operand into the tied
-/// result's fresh buffer (copy-in) and mutates there — the kernel's
-/// one-buffer contract is invariant under relocation, never a hard error.
+/// Reads and overwrites one buffer. The matcher requires identical input
+/// and output layouts and an injective output. If the input's storage is
+/// unavailable for mutation, the bufferizer copies it to the destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SinMutating;
 

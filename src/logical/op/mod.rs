@@ -149,6 +149,7 @@ mod cast;
 mod ceil;
 mod constant;
 mod constant_f64;
+mod cos;
 mod div;
 mod exp;
 mod exp2;
@@ -198,6 +199,7 @@ pub use cast::LogicalCast;
 pub use ceil::LogicalCeil;
 pub use constant::LogicalConstant;
 pub use constant_f64::LogicalConstantF64;
+pub use cos::LogicalCos;
 pub use div::LogicalDiv;
 pub use exp::LogicalExp;
 pub use exp2::LogicalExp2;
@@ -279,6 +281,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalExp2),
             Box::new(LogicalLog2),
             Box::new(LogicalSin),
+            Box::new(LogicalCos),
             Box::new(LogicalTanh),
             Box::new(LogicalRecip),
             Box::new(LogicalMod),

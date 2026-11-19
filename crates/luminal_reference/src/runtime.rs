@@ -75,6 +75,7 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
         | "HypotFunctionalGeneric"
         | "CeilFunctionalGeneric"
         | "ConstantGeneric"
+        | "CosFunctionalGeneric"
         | "DivFunctionalGeneric"
         | "Exp2FunctionalGeneric"
         | "ExpFunctionalGeneric"
@@ -1265,6 +1266,7 @@ mod tests {
             "LayoutTensorOpCastGeneric",
             "LayoutTensorOpCeilFunctionalGeneric",
             "LayoutTensorOpConstantGeneric",
+            "LayoutTensorOpCosFunctionalGeneric",
             // No CopyGeneric: `materialize_layout_copy` left this runtime
             // with the split (PR #425). Its kernel only ever copied under
             // IDENTICAL geometry — it asserted that rather than assuming
