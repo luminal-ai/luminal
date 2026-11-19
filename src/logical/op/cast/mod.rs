@@ -47,6 +47,10 @@ impl LogicalOp for LogicalCast {
                 text: include_str!("rewrite_view.egg"),
             },
             EgglogSnippet {
+                category: SpliceCategory::Rewrites,
+                text: include_str!("rewrite.egg"),
+            },
+            EgglogSnippet {
                 category: SpliceCategory::Shape,
                 text: include_str!("shape.egg"),
             },
@@ -90,5 +94,109 @@ mod tests {
                 .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
                 .unwrap();
         }
+    }
+
+    const SCHEDULE: &str = "(run-schedule (saturate (run prop))
+  (saturate (saturate (run main_ruleset) (run prop)) (run subst-walk)))";
+
+    fn run(script: &str) {
+        new_egraph()
+            .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
+            .unwrap_or_else(|error| panic!("cast script: {error}"));
+    }
+
+    #[test]
+    fn a_cast_to_the_operand_dtype_is_the_operand() {
+        run(&format!(
+            r#"
+(let shape (ShapeLit (IntExprCons (IntLit 4) (IntExprNil))))
+(let x (LogicalTensorInputLit (LogicalIdLit "x") shape (F32)))
+(let same (LogicalCast x (F32)))
+(let other (LogicalCast x (Bf16)))
+{SCHEDULE}
+(check (= same x))
+(fail (check (= other x)))
+"#
+        ));
+    }
+
+    /// Int -> Int64 -> Int is the source wherever the source is proven to
+    /// lie in the Int range, and nowhere else: an exact add of two
+    /// unbounded Int inputs keeps its honest interval, which a union with
+    /// the checked narrowing cast would replace by the Int range.
+    #[test]
+    fn int32_widening_round_trip_collapses_only_onto_a_proven_source() {
+        let inputs = r#"
+(let shape (ShapeLit (IntExprCons (IntLit 4) (IntExprNil))))
+(let a (LogicalTensorInputLit (LogicalIdLit "a") shape (Int)))
+(let b (LogicalTensorInputLit (LogicalIdLit "b") shape (Int)))
+"#;
+        // A stored Int input, read through a view.
+        run(&format!(
+            r#"
+(let stored (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 4) (IntExprNil)))))
+(let turned (ShapeLit (IntExprCons (IntLit 4) (IntExprCons (IntLit 2) (IntExprNil)))))
+(let ids (LogicalTensorInputLit (LogicalIdLit "ids") stored (Int)))
+(let map (IndexMapLit (IntExprCons (CoordVar turned 1) (IntExprCons (CoordVar turned 0) (IntExprNil))) stored))
+(let view (LogicalIndexMapApply ids map turned))
+(let trip (LogicalCast (LogicalCast view (Int64)) (Int)))
+(let wide (LogicalTensorInputLit (LogicalIdLit "wide") stored (Int64)))
+(let lossy (LogicalCast (LogicalCast wide (Int)) (Int64)))
+{SCHEDULE}
+(check (= trip view))
+(fail (check (= lossy wide)))
+"#
+        ));
+        // An exact add nothing bounds: no union, and its interval stays honest.
+        run(&format!(
+            r#"{inputs}
+(let sum (LogicalAdd a b))
+(let trip (LogicalCast (LogicalCast sum (Int64)) (Int)))
+{SCHEDULE}
+(fail (check (= trip sum)))
+(check (= (value-upper-bound-of sum) (bigint 4294967294)))
+"#
+        ));
+        // The same add with operands proven small.
+        run(&format!(
+            r#"{inputs}
+(set (value-lower-bound-of a) (bigint -100)) (set (value-upper-bound-of a) (bigint 100))
+(set (value-lower-bound-of b) (bigint -100)) (set (value-upper-bound-of b) (bigint 100))
+(let sum (LogicalAdd a b))
+(let trip (LogicalCast (LogicalCast sum (Int64)) (Int)))
+{SCHEDULE}
+(check (= trip sum))
+"#
+        ));
+    }
+
+    /// A cast of a view is also the same view of the cast parent when the
+    /// view keeps the parent's element count; the commuted term is named
+    /// only inside the check, so nothing but the rule can have built it.
+    #[test]
+    fn a_cast_commutes_with_a_view_of_the_same_element_count() {
+        run(&format!(
+            r#"
+(let inner (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 4) (IntExprNil)))))
+(let outer (ShapeLit (IntExprCons (IntLit 4) (IntExprCons (IntLit 2) (IntExprNil)))))
+(let weight (LogicalTensorInputLit (LogicalIdLit "weight") inner (Bf16)))
+(let map (IndexMapLit (IntExprCons (CoordVar outer 1) (IntExprCons (CoordVar outer 0) (IntExprNil))) inner))
+(let cast (LogicalCast (LogicalIndexMapApply weight map outer) (F32)))
+{SCHEDULE}
+(check (= cast (LogicalIndexMapApply (LogicalCast weight (F32)) map outer)))
+"#
+        ));
+        // A view that reads two of four elements: the parent is not cast whole.
+        run(&format!(
+            r#"
+(let inner (ShapeLit (IntExprCons (IntLit 4) (IntExprNil))))
+(let outer (ShapeLit (IntExprCons (IntLit 2) (IntExprNil))))
+(let weight (LogicalTensorInputLit (LogicalIdLit "weight") inner (Bf16)))
+(let map (IndexMapLit (IntExprCons (CoordVar outer 0) (IntExprNil)) inner))
+(let cast (LogicalCast (LogicalIndexMapApply weight map outer) (F32)))
+{SCHEDULE}
+(fail (check (= cast (LogicalIndexMapApply (LogicalCast weight (F32)) map outer))))
+"#
+        ));
     }
 }

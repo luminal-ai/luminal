@@ -1,0 +1,50 @@
+; A cast to the existing dtype preserves every value, including encodings.
+(rule ((= ?out (LogicalCast ?in ?dtype)) (= (dtype-of ?in) ?dtype))
+      ((union ?out ?in))
+      :ruleset main_ruleset :name "cast/rewrite: identity dtype")
+
+; Signed int32 widens exactly to int64, and casting that result back to
+; int32 restores the original value. The source must already be proven to
+; lie in the int32 range: the narrowing cast's result carries that range
+; because the cast is checked, so unioning it with an unproven source (an
+; exact add whose bounds exceed the width) would hand that source a range
+; nothing proved. The reverse round trip is lossy and has no such identity.
+(rule ((= ?out (LogicalCast (LogicalCast ?in (Int64)) (Int)))
+       (= (dtype-of ?in) (Int))
+       (>= (value-lower-bound-of ?in) (bigint -2147483648))
+       (<= (value-upper-bound-of ?in) (bigint 2147483647)))
+      ((union ?out ?in))
+      :ruleset main_ruleset :name "cast/rewrite: exact int32 widening round trip")
+
+; A cast acts on each element alone, so it commutes with every view: casting
+; the elements a view selects equals selecting from the cast parent, value
+; for value (encodings included). Commuting lets view chains around a cast
+; compose: a weight permuted, cast, then permuted back reads as the cast
+; weight in its stored order instead of two materialized transposes.
+; Restricted to views with the same static element count as their parent,
+; so the commuted cast never converts more elements than the original.
+; It can convert parent elements the view never reads (such a view repeats
+; some elements and skips others). No reader observes those results; a
+; backend that checks every element it converts can still refuse on one.
+(relation cast-view-numel-demand (IntExprList))
+(function cast-view-numel-of (IntExprList) i64 :merge (min old new))
+(rule ((= ?out (LogicalCast (LogicalIndexMapApply ?in ?map (ShapeLit ?outer)) ?dtype))
+       (= (shape-of ?in) (ShapeLit ?inner)))
+      ((cast-view-numel-demand ?outer) (cast-view-numel-demand ?inner))
+      :ruleset main_ruleset :name "cast/rewrite: demand static element counts of a cast view")
+(rule ((cast-view-numel-demand (IntExprCons ?head ?rest)))
+      ((cast-view-numel-demand ?rest))
+      :ruleset main_ruleset :name "cast/rewrite: demand walks the dim list")
+(rule ((cast-view-numel-demand ?list) (= ?list (IntExprNil)))
+      ((set (cast-view-numel-of ?list) 1))
+      :ruleset main_ruleset :name "cast/rewrite: empty dim list has one element")
+(rule ((cast-view-numel-demand ?list) (= ?list (IntExprCons (IntLit ?n) ?rest))
+       (= ?count (cast-view-numel-of ?rest)) (>= ?n 0) (<= ?n 2147483647) (<= ?count 2147483647))
+      ((set (cast-view-numel-of ?list) (* ?n ?count)))
+      :ruleset main_ruleset :name "cast/rewrite: static dim list element count")
+(rule ((= ?out (LogicalCast (LogicalIndexMapApply ?in ?map (ShapeLit ?outer)) ?dtype))
+       (= (shape-of ?in) (ShapeLit ?inner))
+       (= ?count (cast-view-numel-of ?outer))
+       (= ?count (cast-view-numel-of ?inner)))
+      ((union ?out (LogicalIndexMapApply (LogicalCast ?in ?dtype) ?map (ShapeLit ?outer))))
+      :ruleset main_ruleset :name "cast/rewrite: a cast commutes with an element-count preserving view")

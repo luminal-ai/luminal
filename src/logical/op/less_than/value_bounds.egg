@@ -1,0 +1,24 @@
+; Value bounds : LogicalLessThan over integer operands. The result is the
+; indicator [0, 1], decided when the operand intervals do not overlap:
+; a >= b everywhere gives [0, 0] and a < b everywhere gives [1, 1].
+; Integer operands only: a float operand's interval says nothing about NaN.
+(relation IntegerValueBoundsDtype (Dtype))
+(IntegerValueBoundsDtype (Int))
+(IntegerValueBoundsDtype (Int64))
+(rule ((= ?out (LogicalLessThan ?a ?b))
+       (= ?d (dtype-of ?a)) (= ?d (dtype-of ?b)) (IntegerValueBoundsDtype ?d))
+      ((set (value-lower-bound-of ?out) (bigint 0))
+       (set (value-upper-bound-of ?out) (bigint 1)))
+      :ruleset main_ruleset :name "less_than/value_bounds: an integer comparison is an indicator")
+(rule ((= ?out (LogicalLessThan ?a ?b))
+       (= ?d (dtype-of ?a)) (= ?d (dtype-of ?b)) (IntegerValueBoundsDtype ?d)
+       (= ?a_lower (value-lower-bound-of ?a)) (= ?b_upper (value-upper-bound-of ?b))
+       (>= ?a_lower ?b_upper))
+      ((set (value-upper-bound-of ?out) (bigint 0)))
+      :ruleset main_ruleset :name "less_than/value_bounds: a >= b everywhere is false")
+(rule ((= ?out (LogicalLessThan ?a ?b))
+       (= ?d (dtype-of ?a)) (= ?d (dtype-of ?b)) (IntegerValueBoundsDtype ?d)
+       (= ?a_upper (value-upper-bound-of ?a)) (= ?b_lower (value-lower-bound-of ?b))
+       (< ?a_upper ?b_lower))
+      ((set (value-lower-bound-of ?out) (bigint 1)))
+      :ruleset main_ruleset :name "less_than/value_bounds: a < b everywhere is true")
