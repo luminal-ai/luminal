@@ -143,3 +143,23 @@
  ((set (value-lower-bound-of ?out) (bigint -9223372036854775808))
   (set (value-upper-bound-of ?out) (bigint 9223372036854775807)))
  :ruleset main_ruleset :name "cast/value_bounds: UInt64 to Int64 lies in the Int64 range")
+
+; A decided comparison stays decided through its indicator cast: the Bool
+; input's own interval (when the comparison is known false or true)
+; tightens the [0, 1] indicator above.
+(rule ((= ?out (LogicalCast ?in (Int))) (= (dtype-of ?in) (Bool))
+       (= ?lower (value-lower-bound-of ?in)))
+      ((set (value-lower-bound-of ?out) ?lower))
+      :ruleset main_ruleset :name "cast/value_bounds: Bool to Int keeps a decided lower bound")
+(rule ((= ?out (LogicalCast ?in (Int))) (= (dtype-of ?in) (Bool))
+       (= ?upper (value-upper-bound-of ?in)))
+      ((set (value-upper-bound-of ?out) ?upper))
+      :ruleset main_ruleset :name "cast/value_bounds: Bool to Int keeps a decided upper bound")
+(rule ((= ?out (LogicalCast ?in (Int64))) (= (dtype-of ?in) (Bool))
+       (= ?lower (value-lower-bound-of ?in)))
+      ((set (value-lower-bound-of ?out) ?lower))
+      :ruleset main_ruleset :name "cast/value_bounds: Bool to Int64 keeps a decided lower bound")
+(rule ((= ?out (LogicalCast ?in (Int64))) (= (dtype-of ?in) (Bool))
+       (= ?upper (value-upper-bound-of ?in)))
+      ((set (value-upper-bound-of ?out) ?upper))
+      :ruleset main_ruleset :name "cast/value_bounds: Bool to Int64 keeps a decided upper bound")
