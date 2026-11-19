@@ -94,8 +94,10 @@ fn check_original_angles(op: fn(GraphTensor) -> GraphTensor, cpu: fn(f32) -> f32
     let (actual, _) = runtime.download(&arena, half_y.id).unwrap();
     assert_eq!(actual.dtype, PlanDtype::F16);
     assert_eq!(actual.len(), half_angles.len());
-    for (input, actual) in half_angles.into_iter().zip(actual.bytes.chunks_exact(2)) {
-        let actual = f16::from_ne_bytes(actual.try_into().unwrap());
+    let (actual, remainder) = actual.bytes.as_chunks::<2>();
+    assert!(remainder.is_empty());
+    for (input, &actual) in half_angles.into_iter().zip(actual) {
+        let actual = f16::from_ne_bytes(actual);
         if input.is_finite() {
             let expected = f16::from_f32(cpu(input.to_f32()));
             assert_eq!(actual.to_bits(), expected.to_bits(), "input {input}");
