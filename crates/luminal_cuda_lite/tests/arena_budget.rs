@@ -54,8 +54,10 @@ fn available_arena_includes_unused_cuda_pool_reservations() {
     let reusable = device.available_arena_bytes().unwrap();
     assert!(
         reusable >= free + bytes,
-        "the pool must retain the freed allocation"
+        "arena budget {reusable} must include at least {bytes} retained pool bytes above device free memory {free}"
     );
+    // Compare the occupied and freed states. Returning to the pre-allocation
+    // budget is not required: the first allocation can change device-wide
+    // free memory by more than the bytes tracked by the pool.
     assert!(reusable >= occupied + bytes);
-    assert!(reusable.abs_diff(before) < 1024 * 1024);
 }
