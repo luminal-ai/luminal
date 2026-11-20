@@ -47,6 +47,14 @@ fn run(
                     DType::Int => TypedBuffer::I32((0..elements as i32).collect()),
                     DType::I64 if elements == 1 => TypedBuffer::I64(vec![1]),
                     DType::I64 => TypedBuffer::I64((0..elements as i64).collect()),
+                    // E4M3FN saturates to +/-448, matching the reference cast
+                    // kernel, so the clamp is applied here too.
+                    DType::F8E4M3FN => TypedBuffer::F8E4M3FN(
+                        values(elements, seed)
+                            .into_iter()
+                            .map(|v| float8::F8E4M3::from_f32(v.clamp(-448.0, 448.0)))
+                            .collect(),
+                    ),
                     other => panic!("unsupported mini smoke input dtype {other:?}"),
                 }
             };
@@ -309,4 +317,93 @@ fn mini_flux_runs() {
         joint_base,
     );
     run(cx, &[output], []);
+}
+
+#[test]
+fn llama3_1_fp8_runs() {
+    use luminal_nn::{KvCache, KvCachePool, rope_pairing_matrix, rope_tables_split_half};
+    use model_zoo::llama3_1_fp8::Fp8Dims;
+    use model_zoo::llama3_1_fp8::model::Llama31Fp8;
+
+    const SLOTS: usize = 4;
+    // Small enough to search quickly, structurally identical to the 8B model.
+    let dims = Fp8Dims {
+        vocab: 32,
+        hidden: 16,
+        intermediate: 32,
+        head_dim: 8,
+        n_heads: 2,
+        n_kv_heads: 1,
+        layers: 2,
+        rope_theta: 10_000.0,
+        rope_factor: 1.0,
+        rope_low_freq_factor: 1.0,
+        rope_high_freq_factor: 4.0,
+        rope_original_max: 8192.0,
+        rms_eps: 1e-5,
+    };
+
+    let mut cx = Graph::new();
+    let model = Llama31Fp8::init(&mut cx, &dims);
+    let token = cx.tensor(vec![1], DType::Int);
+    let q_pos = cx.tensor(vec![1], DType::Int);
+    let rope_cos = cx.tensor(vec![1, dims.head_dim], DType::F32);
+    let rope_sin = cx.tensor(vec![1, dims.head_dim], DType::F32);
+    let rope_rot = cx.tensor(vec![dims.head_dim, dims.head_dim], DType::F32);
+    let gather_idx = cx.tensor(vec![SLOTS], DType::Int);
+    let scatter_idx = cx.tensor(vec![1], DType::Int);
+    let pool = KvCachePool::from_layers((0..dims.layers).map(|_| {
+        KvCache::new(
+            cx.tensor(vec![SLOTS, dims.kv_dim()], DType::F32),
+            cx.tensor(vec![SLOTS, dims.kv_dim()], DType::F32),
+        )
+    }));
+
+    let (logits, caches) = model.forward(
+        token,
+        q_pos,
+        rope_cos,
+        rope_sin,
+        rope_rot,
+        &pool,
+        gather_idx,
+        scatter_idx,
+    );
+
+    // Every fp8 projection carries rank-0 `input_scale`/`weight_scale`, and
+    // `fp8_linear` takes `input_scale.reciprocal()`. The generic F32 filler can
+    // hand those a zero, which yields NaN logits that still satisfy the
+    // non-empty readback assertion. Pin every rank-0 F32 input to 1.0.
+    let scale_overrides = cx
+        .logical
+        .input_specs()
+        .into_iter()
+        .filter(|spec| spec.dtype == DType::F32 && spec.dims.is_empty())
+        .map(|spec| (spec.id, TypedBuffer::F32(vec![1.0])))
+        .collect::<Vec<_>>();
+    assert!(
+        !scale_overrides.is_empty(),
+        "fp8 model should expose rank-0 scale inputs"
+    );
+
+    let (cos, sin) = rope_tables_split_half(&[1.0], dims.head_dim, dims.rope_theta, 1.0);
+    let overrides = scale_overrides.into_iter().chain([
+        (rope_cos.id, TypedBuffer::F32(cos)),
+        (rope_sin.id, TypedBuffer::F32(sin)),
+        (
+            rope_rot.id,
+            TypedBuffer::F32(rope_pairing_matrix(dims.head_dim, false)),
+        ),
+        (token.id, TypedBuffer::I32(vec![3])),
+        (q_pos.id, TypedBuffer::I32(vec![1])),
+        (gather_idx.id, TypedBuffer::I32((0..SLOTS as i32).collect())),
+        (scatter_idx.id, TypedBuffer::I32(vec![1])),
+    ]);
+
+    let mut outputs = vec![logits];
+    for (k, v) in caches {
+        outputs.push(k);
+        outputs.push(v);
+    }
+    run(cx, &outputs, overrides);
 }
