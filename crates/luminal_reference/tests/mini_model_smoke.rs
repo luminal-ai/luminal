@@ -23,7 +23,7 @@ fn run(
     cx: Graph,
     outputs: &[GraphTensor],
     overrides: impl IntoIterator<Item = (NodeIndex, TypedBuffer)>,
-) {
+) -> Vec<Vec<f32>> {
     let mut overrides = overrides
         .into_iter()
         .collect::<std::collections::HashMap<_, _>>();
@@ -53,6 +53,7 @@ fn run(
             (spec.id, value)
         })
         .collect::<Vec<(NodeIndex, TypedBuffer)>>();
+    assert!(overrides.is_empty(), "unused mini smoke input overrides");
     let data = pairs.iter().cloned().collect();
     // The KV-cache outputs are consumed by the same graph (attention reads
     // the updated cache), so they are not leaves and the default binding
@@ -73,15 +74,54 @@ fn run(
         runtime.set_data(id, value);
     }
     runtime.execute().expect("mini graph executes");
-    for output in outputs {
-        assert!(
-            !runtime
-                .get_f32(output.id)
-                .expect("mini output readback")
-                .is_empty(),
-            "mini output is empty"
-        );
+    outputs
+        .iter()
+        .map(|output| {
+            let values = runtime.get_f32(output.id).expect("mini output readback");
+            assert!(!values.is_empty(), "mini output is empty");
+            values.clone()
+        })
+        .collect()
+}
+
+#[test]
+fn yolo_v11_detection_head_runs() {
+    use model_zoo::yolo_v11::model::{Detect, NC, STRIDES, dfl_weight, make_anchors_and_strides};
+
+    let mut cx = Graph::new();
+    let channels = [4usize, 8, 16];
+    let sizes = [4usize, 2, 1];
+    let model = Detect::new("detect", &channels, &sizes, &mut cx);
+    let features = channels
+        .iter()
+        .zip(sizes)
+        .map(|(&channels, size)| cx.tensor(vec![1, channels, size, size], DType::F32))
+        .collect::<Vec<_>>();
+    let output = model.forward(&features);
+    let dfl_input = cx
+        .logical
+        .input_specs()
+        .into_iter()
+        .find(|spec| spec.label == "detect.dfl.conv.weight")
+        .expect("DFL weight input")
+        .id;
+    let mut overrides = vec![(dfl_input, TypedBuffer::F32(dfl_weight()))];
+    for (scale, (&size, &stride)) in sizes.iter().zip(&STRIDES).enumerate() {
+        let (anchors, strides) = make_anchors_and_strides(&[size], &[stride]);
+        overrides.push((model.anchors[scale].id, TypedBuffer::F32(anchors)));
+        overrides.push((model.strides[scale].id, TypedBuffer::F32(strides)));
     }
+
+    let outputs = run(cx, &[output], overrides);
+    let predictions = &outputs[0];
+    let anchors = sizes.iter().map(|size| size * size).sum::<usize>();
+    assert_eq!(predictions.len(), (NC + 4) * anchors);
+    assert!(predictions.iter().all(|value| value.is_finite()));
+    assert!(
+        predictions[4 * anchors..]
+            .iter()
+            .all(|value| (0.0..=1.0).contains(value))
+    );
 }
 
 #[test]
