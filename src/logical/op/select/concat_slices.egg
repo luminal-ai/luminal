@@ -265,6 +265,13 @@
 ; on exit and join them on entry). The parts are the two row slices of one
 ; x of the concatenation's own shape, and the certificate makes the
 ; select their concatenation.
+;
+; The select is then retired (subsumed): its class holds x, and the select
+; reads views of views of that same class, a cycle. When x is a cast (a
+; narrow sum is computed wide and cast back), cast/rewrite_view.egg lifts
+; the cast through the cycle's views once per trip and saturation never
+; ends (`rejoin_of_a_cast_saturates`). The class keeps x and the two
+; slices; only the select row stops matching.
 (rule
   (
     (concat-template ?select ?axis ?split ?condition ?true_map ?false_map ?shape)
@@ -274,8 +281,12 @@
     (= ?low_part (LogicalIndexMapApply ?x ?low ?low_shape))
     (= ?high_part (LogicalIndexMapApply ?x ?high ?high_shape))
     (= ?shape (shape-of ?x))
+    (= ?select (LogicalSelect ?condition ?true_view ?false_view))
   )
-  ((union ?select ?x))
+  (
+    (union ?select ?x)
+    (subsume (LogicalSelect ?condition ?true_view ?false_view))
+  )
   :ruleset main_ruleset
   :name "select/concat_slices: the concatenation of a tensor's two row slices is the tensor"
 )

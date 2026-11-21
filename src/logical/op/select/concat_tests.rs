@@ -475,3 +475,41 @@ fn a_rotary_table_read_by_a_stream_is_the_table_of_its_rows() {
     let expected = (a * table(t.slice_along(..A, 0))).concat_along(b * table(t.slice_along(A.., 0)), 1);
     holds(&cx, &[same(&cx, product, expected)]);
 }
+
+/// The rejoin of a cast's own two row slices saturates, and is the cast: `y = cast(x)`,
+/// `cat(y[:A], y[A:]) = y`. The rejoin puts the select in y's class, a cycle through views
+/// of that class; the cast rules once lifted the cast through it without end.
+#[test]
+fn rejoin_of_a_cast_saturates() {
+    let mut cx = Graph::new();
+    let x = cx.named_tensor("x", vec![S], DType::F32);
+    let y = x.cast(DType::Bf16);
+    let joined = y.slice_along(..A, 0).concat_along(y.slice_along(A.., 0), 0);
+    holds(&cx, &[same(&cx, joined, y)]);
+}
+
+/// ... and so does the rejoin of a narrow sum as the PyTorch translator spells it (computed
+/// in F32 and cast back), at the size of a FLUX single block's output.
+#[test]
+fn rejoin_of_a_narrow_sum_saturates() {
+    let mut cx = Graph::new();
+    let dims = vec![1, 56000, 3072];
+    let x = cx.named_tensor("x", dims.clone(), DType::Bf16);
+    let m = cx.named_tensor("m", dims, DType::Bf16);
+    let y = (x.cast(DType::F32) + m.cast(DType::F32)).cast(DType::Bf16);
+    let joined = y.slice_along(..512, 1).concat_along(y.slice_along(512.., 1), 1);
+    holds(&cx, &[same(&cx, joined, y)]);
+}
+
+/// Runs the egglog file `EGG_FILE` (facts and its own schedule) after core's program, and
+/// prints the e-graph's size: a reproducer kept as text.
+#[test]
+#[ignore = "runs the file EGG_FILE names"]
+fn saturate_egg_file() {
+    let text = std::fs::read_to_string(std::env::var("EGG_FILE").unwrap()).unwrap();
+    let mut egraph = new_egraph();
+    egraph.parse_and_run_program(None, &assembled_program_for(&[])).unwrap();
+    let start = std::time::Instant::now();
+    egraph.parse_and_run_program(None, &text).unwrap();
+    eprintln!("saturated: {} rows in {:.2} s", egraph.num_tuples(), start.elapsed().as_secs_f64());
+}
