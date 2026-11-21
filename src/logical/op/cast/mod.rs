@@ -170,6 +170,44 @@ mod tests {
         ));
     }
 
+    /// An Int64 -> Int cast keeps its source bounds only when every source
+    /// value fits in Int. A wider range can wrap on the device (2^32 stores as
+    /// 0), so the result is just the Int range.
+    #[test]
+    fn int64_to_int_keeps_source_bounds_only_when_they_fit() {
+        const INT_MIN: i64 = -2_147_483_648;
+        const INT_MAX: i64 = 2_147_483_647;
+        // (source lower, source upper, result lower, result upper)
+        let cases: [(i64, i64, i64, i64); 8] = [
+            // The whole range fits.
+            (1, 100, 1, 100),
+            (1, INT_MAX, 1, INT_MAX),
+            (INT_MIN, INT_MAX, INT_MIN, INT_MAX),
+            // One value past either end.
+            (1, INT_MAX + 1, INT_MIN, INT_MAX),
+            (INT_MIN - 1, 100, INT_MIN, INT_MAX),
+            // Up to 2^32, and exactly 2^32.
+            (1, 4_294_967_296, INT_MIN, INT_MAX),
+            (4_294_967_296, 4_294_967_296, INT_MIN, INT_MAX),
+            // Entirely outside the Int range.
+            (4_294_967_297, 4_294_967_300, INT_MIN, INT_MAX),
+        ];
+        for (lo, hi, want_lo, want_hi) in cases {
+            run(&format!(
+                r#"
+(let shape (ShapeLit (IntExprCons (IntLit 4) (IntExprNil))))
+(let wide (LogicalTensorInputLit (LogicalIdLit "wide") shape (Int64)))
+(set (value-lower-bound-of wide) (bigint {lo}))
+(set (value-upper-bound-of wide) (bigint {hi}))
+(let narrow (LogicalCast wide (Int)))
+{SCHEDULE}
+(check (= (value-lower-bound-of narrow) (bigint {want_lo})))
+(check (= (value-upper-bound-of narrow) (bigint {want_hi})))
+"#
+            ));
+        }
+    }
+
     /// A cast of a view is also the same view of the cast parent when the
     /// view keeps the parent's element count; the commuted term is named
     /// only inside the check, so nothing but the rule can have built it.
