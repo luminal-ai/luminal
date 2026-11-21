@@ -1,6 +1,6 @@
 ; Value bounds : LogicalCast. The Bool -> Int indicator is [0, 1];
 ; Int <-> Int64 conversions preserve values (the runtime checks
-; narrowing exactness; bounds carry over soundly either way).
+; narrowing exactness; bounds carry over when they fit).
 (rule
   (
     (= ?out (LogicalCast ?in (Int)))
@@ -41,23 +41,23 @@
   ((set (value-upper-bound-of ?out) ?upper))
   :ruleset main_ruleset :name "cast/value_bounds: Int to Int64 cast carries the upper bound"
 )
+; A bounded Int64 -> Int conversion preserves its interval when every
+; source value fits. Outside this interval the conversion may wrap on the
+; device (2^32 stores as 0), so the bounds are not carried.
 (rule
   (
     (= ?out (LogicalCast ?in (Int)))
     (= (dtype-of ?in) (Int64))
     (= ?lower (value-lower-bound-of ?in))
-  )
-  ((set (value-lower-bound-of ?out) ?lower))
-  :ruleset main_ruleset :name "cast/value_bounds: Int64 to Int cast carries the lower bound"
-)
-(rule
-  (
-    (= ?out (LogicalCast ?in (Int)))
-    (= (dtype-of ?in) (Int64))
     (= ?upper (value-upper-bound-of ?in))
+    (>= ?lower (bigint -2147483648))
+    (<= ?upper (bigint 2147483647))
   )
-  ((set (value-upper-bound-of ?out) ?upper))
-  :ruleset main_ruleset :name "cast/value_bounds: Int64 to Int cast carries the upper bound"
+  (
+    (set (value-lower-bound-of ?out) ?lower)
+    (set (value-upper-bound-of ?out) ?upper)
+  )
+  :ruleset main_ruleset :name "cast/value_bounds: in-range Int64 to Int preserves bounds"
 )
 
 ; UInt64 is a wrapping unsigned ring. Its domain bounds are always sound;
