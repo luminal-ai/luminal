@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::arena::{ARENA_ALIGN, ArenaSlice, SlabAlgorithm, SlabBuffer, plan_slab};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceId(pub u64);
@@ -33,6 +33,47 @@ pub struct SharedArenaPlan {
 }
 
 impl SharedArenaPlan {
+    /// The largest per-program scratch that still COMPOSES inside
+    /// `capacity` next to `persistent`.
+    ///
+    /// [`Self::build`] places one shared scratch region and every declared
+    /// resource against a single execution node, so none of them overlap and
+    /// the arena is scratch PLUS the whole persistent footprint. A search
+    /// that admits plans on scratch alone against a device capacity is
+    /// therefore spending memory the weights already own: it accepts plans
+    /// that `build` must then refuse, and it only finds out after the search
+    /// has finished. Searching against this value instead keeps admission and
+    /// composition on the same budget.
+    ///
+    /// Resources dedup by [`ResourceId`] at their largest declared size, the
+    /// same rule `build` applies. The result is rounded down to
+    /// [`ARENA_ALIGN`] so a plan reporting exactly this many scratch bytes
+    /// composes without the alignment pushing it over.
+    pub fn scratch_budget(
+        persistent: impl IntoIterator<Item = (ResourceId, usize)>,
+        capacity: usize,
+    ) -> Result<usize> {
+        let mut resources = BTreeMap::<ResourceId, usize>::new();
+        for (resource, bytes) in persistent {
+            let entry = resources.entry(resource).or_default();
+            *entry = (*entry).max(bytes);
+        }
+        let mut reserved = 0usize;
+        for &bytes in resources.values() {
+            let slice = ArenaSlice { offset: 0, bytes };
+            reserved = reserved
+                .checked_add(slice.reserved())
+                .context("persistent footprint overflows usize")?;
+        }
+        let free = capacity.checked_sub(reserved).with_context(|| {
+            format!(
+                "persistent resources reserve {reserved} bytes, more than the \
+                 {capacity} byte budget"
+            )
+        })?;
+        Ok(free / ARENA_ALIGN * ARENA_ALIGN)
+    }
+
     pub fn build(programs: &[ProgramMemory], capacity: usize) -> Result<Self> {
         ensure!(!programs.is_empty(), "no programs to allocate");
         let scratch_bytes = programs
@@ -135,5 +176,85 @@ mod tests {
         assert_eq!(plan.homes[&ResourceId(0)].bytes, 300);
         assert_eq!(plan.bytes, 1024);
         assert!(SharedArenaPlan::build(&programs, 1023).is_err());
+    }
+
+    /// THE GAP `scratch_budget` CLOSES: a plan whose scratch fits the whole
+    /// device budget is admissible to a search that checks scratch alone,
+    /// yet composition has to seat the weights in that same arena.
+    #[test]
+    fn scratch_inside_the_whole_budget_can_still_fail_composition() {
+        const BUDGET: usize = 8 << 20;
+        let bindings = vec![PersistentBinding {
+            resource: ResourceId(0),
+            buffer: 1,
+            bytes: 6 << 20,
+        }];
+        let scratch = 3 << 20;
+        assert!(scratch <= BUDGET, "a scratch-only check admits this plan");
+        let programs = [ProgramMemory {
+            scratch_bytes: scratch,
+            bindings: bindings.clone(),
+        }];
+        assert!(SharedArenaPlan::build(&programs, BUDGET).is_err());
+        let budget = SharedArenaPlan::scratch_budget([(ResourceId(0), 6 << 20)], BUDGET).unwrap();
+        assert!(
+            budget < scratch,
+            "the honest budget rules the plan out up front"
+        );
+    }
+
+    #[test]
+    fn scratch_budget_is_the_exact_composable_remainder() {
+        let bindings = vec![
+            PersistentBinding {
+                resource: ResourceId(0),
+                buffer: 1,
+                bytes: 300,
+            },
+            PersistentBinding {
+                resource: ResourceId(1),
+                buffer: 2,
+                bytes: 100,
+            },
+        ];
+        // 300 reserves 512 and 100 reserves 256, so 768 of 2048 is spoken for.
+        let budget =
+            SharedArenaPlan::scratch_budget(bindings.iter().map(|b| (b.resource, b.bytes)), 2048)
+                .unwrap();
+        assert_eq!(budget, 1280);
+        let fits = [ProgramMemory {
+            scratch_bytes: budget,
+            bindings: bindings.clone(),
+        }];
+        assert_eq!(SharedArenaPlan::build(&fits, 2048).unwrap().bytes, 2048);
+        let over = [ProgramMemory {
+            scratch_bytes: budget + 1,
+            bindings,
+        }];
+        assert!(
+            SharedArenaPlan::build(&over, 2048).is_err(),
+            "one byte past the budget must not compose"
+        );
+    }
+
+    #[test]
+    fn scratch_budget_dedups_a_resource_bound_by_several_programs() {
+        let shared = [
+            (ResourceId(0), 300),
+            (ResourceId(0), 100),
+            (ResourceId(1), 100),
+        ];
+        // ResourceId(0) counts once at its largest size, so 512 + 256.
+        assert_eq!(SharedArenaPlan::scratch_budget(shared, 2048).unwrap(), 1280);
+    }
+
+    #[test]
+    fn scratch_budget_refuses_a_budget_the_weights_alone_exceed() {
+        let err = SharedArenaPlan::scratch_budget([(ResourceId(0), 4096)], 2048)
+            .expect_err("weights larger than the budget leave no scratch");
+        assert!(
+            format!("{err:#}").contains("more than the 2048 byte budget"),
+            "the refusal must name the budget: {err:#}"
+        );
     }
 }

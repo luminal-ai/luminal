@@ -1,6 +1,6 @@
 //! The Metal runtime's boundary statement for this example's chat graph,
 //! and the execution loop over it.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use llm_chat::{
     Inputs, TensorData,
     graph::{LlmGraph, StateBinding},
@@ -72,6 +72,21 @@ impl MetalBackend {
         let mut data: FxHashMap<_, HostBuffer> =
             weights.into_iter().map(|(id, v)| (id, host(v))).collect();
         let resources: Vec<_> = data.keys().copied().collect();
+        // Metal already enforced a requested budget per candidate, but
+        // composed the shared arena unbounded, so the limit bounded scratch
+        // and not the arena the weights share with it.
+        let mut resolved_options = options.clone();
+        if let Some(capacity) = options.device_budget_bytes {
+            resolved_options.device_budget_bytes = Some(
+                SharedArenaPlan::scratch_budget(
+                    resources
+                        .iter()
+                        .map(|id| (ResourceId(id.index() as u64), data[id].bytes.len())),
+                    capacity,
+                )
+                .context("device memory budget cannot seat the model weights")?,
+            );
+        }
         let mut programs = Vec::new();
         let mut reports = Vec::new();
         let mut requirements = Vec::new();
@@ -84,7 +99,8 @@ impl MetalBackend {
             let mut runtime =
                 MetalRuntime::load_with(&graph.graph, bindings(graph), metal_registry())?
                     .with_device(&device)?;
-            let outcome = runtime.search(spec.bounds(), spec.profile_dims(), &data, options)?;
+            let outcome =
+                runtime.search(spec.bounds(), spec.profile_dims(), &data, &resolved_options)?;
             let scratch_bytes = runtime.arena_bytes()?;
             let resource_bindings = resources
                 .iter()
@@ -110,7 +126,10 @@ impl MetalBackend {
             });
             programs.push((spec, (runtime, FxHashMap::default())));
         }
-        let memory = SharedArenaPlan::build(&requirements, usize::MAX)?;
+        let memory = SharedArenaPlan::build(
+            &requirements,
+            options.device_budget_bytes.unwrap_or(usize::MAX),
+        )?;
         let mut arena =
             crate::memory::Allocation::new(device.device(), device.queue(), memory.bytes)?;
         for id in resources {
