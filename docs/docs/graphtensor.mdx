@@ -13,28 +13,31 @@ use luminal::prelude::*;
 
 // Setup graph and tensors
 let mut cx = Graph::new();
-let a = cx.tensor((3, 1)).set([[1.0], [2.0], [3.0]]);
-let b = cx.tensor((1, 4)).set([[1.0, 2.0, 3.0, 4.0]]);
+let a = cx.tensor((3, 1));
+let b = cx.tensor((1, 4));
 
 // Do math...
-let mut c = a.matmul(b).retrieve();
+let c = a.matmul(b).output();
 
-// Compile and run graph
-cx.compile(<(GenericCompiler, CPUCompiler)>::default(), &mut c);
-cx.execute();
+// Build the search space and search for the fastest implementation
+let mut rt = cx.compile(NativeRuntime::default(), CompileOptions::default());
+
+// Set the input data, then run
+rt.set_data(a, vec![1.0, 2.0, 3.0]);
+rt.set_data(b, vec![1.0, 2.0, 3.0, 4.0]);
+rt.execute(&cx.dyn_map);
 
 // Get result
-println!("Result: {:?}", c);
+println!("Result: {:?}", rt.get_f32(c));
 ```
 Wow! A lot is going on here just to add two tensors together. That's because luminal isn't really designed for such simple computation, and there's little benefit to using it here. But we'll see it pay off when we start doing more complex operations.
 
 So what's happening here?
-1) We're setting up a new `Graph` which tracks all computation and actually does execution. We're also defining two new tensors, both of shape (3,). At this point, these "tensors" are actually `GraphTensor`s that don't hold any data. Also, notice we pass in the shape as a type generic. *Types are known at compile time, similar to [dfdx](https://github.com/coreylowman/dfdx)!*
-2) Now we can start doing the thing we came here for: the addition. So we add two `GraphTensor`s together, and get a new `GraphTensor`. Notice this *does not* consume anything, and we're free to use `a` or `b` later on. This is because `GraphTensor` is a super lightweight tracking struct which implements copy. "But wait, we never set the values of `a` and `b`, how can we add them?" **We aren't actually adding them here.** Instead, we're writing this addition to the graph, and getting out `c`, which points to the result when it's actually done.
-Then we set the data for these tensors. But if `GraphTensor` doesn't hold data, how can we set it? Well we aren't actually setting it *in* the tensor, just passing it through to the graph to say *once you run, set this tensor to this value.* We also need to mark the output we want to retrieve later. This is so that when the graph runs, it doesn't delete the data for `c` part-way through execution (a common optimization for unused tensors). Notice we're setting the sources *after* we define the computation. This is backward from a lot of other libs, but it means we can redefine the data and rerun everything without redefining the computation later on.
-
-3) Once we call `cx.execute()`, we've already set all our sources, so our addition actually gets ran and stored in `c`!
-4) Now since we're done computing `c`, we can fetch the data for `c` and see the result.
+1) We're setting up a new `Graph` which tracks all computation, and two new tensors of shape `(3, 1)` and `(1, 4)`. At this point, these "tensors" are actually `GraphTensor`s that don't hold any data. Notice we pass in the shape as a value.
+2) Now we can start doing the thing we came here for: the matmul. So we multiply two `GraphTensor`s together, and get a new `GraphTensor`. Notice this *does not* consume anything, and we're free to use `a` or `b` later on. This is because `GraphTensor` is a super lightweight tracking struct which implements copy. "But wait, we never set the values of `a` and `b`, how can we multiply them?" **We aren't actually multiplying them here.** Instead, we're writing this op to the graph, and getting out `c`, which points to the result when it's actually done. We mark `c` with `.output()` so that when the graph runs, it doesn't delete the data for `c` part-way through execution (a common optimization for unused tensors).
+3) We call `cx.compile(...)` to build the search space and search for a fast implementation, which returns a runtime `rt` we can execute. Then we set the data for the input tensors. But if `GraphTensor` doesn't hold data, how can we set it? Well we aren't actually setting it *in* the tensor, just passing it through to the runtime to say *when you run, set this tensor to this value.* Notice we're setting the sources *after* we define the computation. This is backward from a lot of other libs, but it means we can redefine the data and rerun everything without redefining the computation later on.
+4) Once we call `rt.execute(&cx.dyn_map)`, we've already set all our sources, so our matmul actually gets ran and stored in `c`!
+5) Now since we're done computing `c`, we can fetch the data for `c` with `rt.get_f32(c)` and see the result.
 
 Alright, that was a lot but now we've touched on all the main aspects of running a model in luminal.
 
@@ -45,9 +48,9 @@ We're working with pretty complicated graphs to build our computation on, but we
 Essentially GraphTensors are pointers to a specific node on the graph, as well as some metadata about the output of that node, such as its shape. We can make a new GraphTensor by doing:
 ```rust
 let mut cx = Graph::new(); // We need a graph to build!
-let a: GraphTensor<R1<3>> = cx.tensor(); // Here we create a new node on the graph and get a GraphTensor back, pointing to it.
+let a = cx.tensor((3,)); // Here we create a new node on the graph and get a GraphTensor back, pointing to it.
 ```
-Notice the type of `a`: `GraphTensor<R1<3>>`. So what's that generic all about? It's the shape! We make tensor shapes part of the type, so they're tracked at compile time! In this case, the shape is rank 1, with 3 elements, or in other words, a vector of 3 dimensions. (Side note: `R1<N>` is a typedef of `(Const<N>,)`) It should be impossible to accidentally get a runtime shape mismatch.
+Notice the shape we pass to `tensor`: `(3,)`. That's the shape of the node! In this case, the shape is rank 1, with 3 elements, or in other words, a vector of 3 dimensions. Shapes can be concrete dimensions like this, or symbolic for dynamic dimensions such as sequence length.
 
 Now we can use `a` as you would in a library like PyTorch, performing linear algebra:
 ```rust
