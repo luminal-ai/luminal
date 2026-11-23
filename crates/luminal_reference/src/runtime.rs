@@ -30,6 +30,12 @@ use luminal::layouts::DecodedLayout;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 /// Default per-intermediate allocation ceiling (2 GiB), excluding boundary buffers.
+///
+/// F32 matrix products use the fused `MatrixMultiplyGeneric` op, which never
+/// materializes the `[M, K, N]` product. Other matmuls still lower to a `Mul`
+/// with that intermediate, `M * K * N * element_size` bytes, followed by a
+/// `ReduceSum`. Above this ceiling, search prunes such a plan and fails with
+/// "no candidate genome produced an executable plan after memory pruning".
 pub const DEFAULT_MAX_INTERMEDIATE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Conservative tensor-payload scratch bound for the unchanged reference
@@ -83,6 +89,7 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
         | "IotaGeneric"
         | "LessThanGeneric"
         | "Log2FunctionalGeneric"
+        | "MatrixMultiplyGeneric"
         | "ModFunctionalGeneric"
         | "MulFunctionalGeneric"
         | "PolygammaFunctionalGeneric"
@@ -1285,6 +1292,7 @@ mod tests {
             "LayoutTensorOpLeftSequentialScanSum",
             "LayoutTensorOpLessThanGeneric",
             "LayoutTensorOpLog2FunctionalGeneric",
+            "LayoutTensorOpMatrixMultiplyGeneric",
             "LayoutTensorOpModFunctionalGeneric",
             "LayoutTensorOpMulFunctionalGeneric",
             "LayoutTensorOpPolygammaFunctionalGeneric",

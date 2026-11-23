@@ -1,0 +1,27 @@
+; Layout Tensor Op Matrix Multiply Generic. F32 only: each output element is
+; the sequential sum of a*b in increasing k, the same order and rounding as
+; the decomposed Mul then ReduceSum chain. Other dtypes keep that chain.
+(rule
+  (
+    (= ?a_layout_tensor (LayoutTensorLit ?a_logical ?a_layout))
+    (= ?b_layout_tensor (LayoutTensorLit ?b_logical ?b_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_logical (LogicalHelperMatrixMultiply ?a_logical ?b_logical))
+    (= (dtype-of ?a_logical) (F32))
+    (= (dtype-of ?b_logical) (F32))
+    (= (dtype-of ?out_logical) (F32))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?a_layout_tensor
+          (LayoutTensorCons ?b_layout_tensor (LayoutTensorNil)))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpMatrixMultiplyGeneric ?a_layout_tensor ?b_layout_tensor ?out_layout))
+  )
+  :ruleset backend
+  :name "reference/matrix_multiply/match_functional: MatrixMultiplyGeneric mint, F32"
+)

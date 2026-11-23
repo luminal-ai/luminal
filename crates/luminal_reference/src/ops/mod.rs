@@ -45,6 +45,7 @@ pub(crate) mod index_map_apply_materialize;
 pub(crate) mod iota;
 pub(crate) mod less_than;
 pub(crate) mod log2;
+pub(crate) mod matrix_multiply;
 pub(crate) mod modulo;
 pub(crate) mod mul;
 mod not;
@@ -149,6 +150,7 @@ pub use left_sequential_scan_prod::LeftSequentialScanProdDps;
 pub use left_sequential_scan_sum::LeftSequentialScanSumDps;
 pub use less_than::LessThanDps;
 pub use log2::Log2FunctionalDps;
+pub use matrix_multiply::MatrixMultiplyFunctionalDps;
 pub use modulo::ModFunctionalDps;
 pub use mul::MulFunctionalDps;
 pub use polygamma::PolygammaFunctionalDps;
@@ -188,6 +190,7 @@ pub use left_sequential_scan_prod::LeftSequentialScanProdMatcher;
 pub use left_sequential_scan_sum::LeftSequentialScanSumMatcher;
 pub use less_than::LessThanMatcher;
 pub use log2::Log2FunctionalMatcher;
+pub use matrix_multiply::MatrixMultiplyFunctionalMatcher;
 pub use modulo::ModFunctionalMatcher;
 pub use mul::MulFunctionalMatcher;
 pub use polygamma::PolygammaFunctionalMatcher;
@@ -311,6 +314,13 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(MulFunctionalMatcher),
                 kernel: entry::<MulFunctionalDps>("MulFunctionalGeneric", mul::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(MatrixMultiplyFunctionalMatcher),
+                kernel: entry::<MatrixMultiplyFunctionalDps>(
+                    "MatrixMultiplyGeneric",
+                    matrix_multiply::kernel,
+                ),
             },
             ReferenceOp {
                 matcher: || Box::new(PolygammaFunctionalMatcher),
