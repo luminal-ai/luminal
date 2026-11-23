@@ -3,7 +3,29 @@ use luminal::shape::IntExpr;
 
 use crate::{CacheAccess, KvCache};
 
-const MASKED_SCORE: f32 = -1e10;
+/// Build an additive bias from a Boolean mask: `true` positions receive
+/// `f32::NEG_INFINITY` (fully suppressed by softmax), `false` positions
+/// receive `0.0` (transparent). Uses `LogicalSelect` so no arithmetic
+/// touches the infinity — the old `bool.cast(F32) * sentinel` pattern
+/// risks `0 * -inf = NaN` (IEEE 754) and required a finite sentinel.
+/// **Caller note**: the resulting bias is added to attention scores before
+/// softmax. [`grouped_query_attention`] safely handles rows where all keys
+/// are `-inf` by returning exact zero attention output without producing NaNs.
+fn masked_bias(mask: GraphTensor) -> GraphTensor {
+    assert_eq!(
+        mask.dtype,
+        DType::Bool,
+        "masked_bias requires a Bool tensor, got {:?}",
+        mask.dtype
+    );
+    let dims = mask.dims();
+    let neg_inf = mask
+        .graph()
+        .constant_f32(f32::NEG_INFINITY)
+        .expand_rhs(dims.clone());
+    let zero = mask.graph().constant_f32(0.0).expand_rhs(dims);
+    mask.select(neg_inf, zero)
+}
 
 fn flattened_rows(tensor: GraphTensor) -> (GraphTensor, Vec<IntExpr>) {
     assert!(tensor.rank() >= 2, "row operations require rank >= 2");
@@ -136,23 +158,26 @@ fn assert_vector(tensor: GraphTensor, name: &str) {
 /// Build an additive causal bias from explicit logical token positions.
 ///
 /// Query and key positions need not match their physical cache slots or their
-/// order in the gathered context.
+/// Masked (future) positions receive exact `f32::NEG_INFINITY`; allowed
+/// positions receive `0.0`. If all keys for a query are masked,
+/// [`grouped_query_attention`] treats the row as idle and outputs zero.
 pub fn causal_bias(query_positions: GraphTensor, key_positions: GraphTensor) -> GraphTensor {
     assert_vector(query_positions, "query_positions");
     assert_vector(key_positions, "key_positions");
     let query_count = query_positions.dims1();
     let key_count = key_positions.dims1();
-    query_positions
+    let future = query_positions
         .expand_dim(1, key_count)
-        .lt(key_positions.expand_dim(0, query_count))
-        .cast(DType::F32)
-        * MASKED_SCORE
+        .lt(key_positions.expand_dim(0, query_count));
+    masked_bias(future)
 }
 
 /// Build an additive bias that isolates queries and keys by sequence ID.
 ///
 /// This can be added to [`causal_bias`] or [`sliding_window_bias`] when a
 /// gathered context interleaves multiple sequences in an arbitrary order.
+/// Different-sequence positions receive exact `f32::NEG_INFINITY`;
+/// same-sequence positions receive `0.0`.
 pub fn sequence_isolation_bias(
     query_sequence_ids: GraphTensor,
     key_sequence_ids: GraphTensor,
@@ -161,14 +186,17 @@ pub fn sequence_isolation_bias(
     assert_vector(key_sequence_ids, "key_sequence_ids");
     let query_count = query_sequence_ids.dims1();
     let key_count = key_sequence_ids.dims1();
-    let same_sequence = query_sequence_ids
+    let different_sequence = query_sequence_ids
         .expand_dim(1, key_count)
-        .eq(key_sequence_ids.expand_dim(0, query_count))
-        .cast(DType::F32);
-    same_sequence * -MASKED_SCORE + MASKED_SCORE
+        .ne(key_sequence_ids.expand_dim(0, query_count));
+    masked_bias(different_sequence)
 }
 
 /// Build a causal additive bias restricted to a trailing logical window.
+///
+/// Positions that are either in the future or before the window receive
+/// exact `f32::NEG_INFINITY`; positions within the causal window receive
+/// `0.0`.
 pub fn sliding_window_bias(
     query_positions: GraphTensor,
     key_positions: GraphTensor,
@@ -181,12 +209,18 @@ pub fn sliding_window_bias(
     let key_count = key_positions.dims1();
     let queries = query_positions.expand_dim(1, key_count);
     let keys = key_positions.expand_dim(0, query_count);
-    let future = queries.lt(keys).cast(DType::F32);
+    // Two independent masking conditions:
+    let future = queries.lt(keys); // Bool: key is in the future
     let before_window = keys
         .cast(DType::F32)
-        .lt(queries.cast(DType::F32) - (window as f32 - 1.0))
-        .cast(DType::F32);
-    (future + before_window) * MASKED_SCORE
+        .lt(queries.cast(DType::F32) - (window as f32 - 1.0)); // Bool: key is before window
+    // Boolean OR via arithmetic: (a + b) > 0  →  true if either is true
+    let either_masked =
+        (future.cast(DType::F32) + before_window.cast(DType::F32)).gt(query_positions
+            .graph()
+            .constant_f32(0.0)
+            .expand_rhs(future.dims()));
+    masked_bias(either_masked)
 }
 
 /// Map each item in a packed tensor to the sequence containing it.
@@ -240,13 +274,27 @@ fn packed_position_bias(
         .eq(context_sequence.expand_dim(0, query_count));
     let queries = query_positions.expand_dim(1, context_count);
     let keys = context_positions.expand_dim(0, query_count);
+    // Boolean AND via float multiplication: all conditions must be true.
+    // same_sequence AND (key <= query) AND optionally (key within window).
     let mut allowed = same_sequence.cast(DType::F32) * keys.le(queries).cast(DType::F32);
     if let Some(window) = window {
         allowed *= (queries.cast(DType::F32) - (window as f32 - 1.0))
             .le(keys.cast(DType::F32))
             .cast(DType::F32);
     }
-    allowed * -MASKED_SCORE + MASKED_SCORE
+    // Convert float indicator {0.0, 1.0} to Bool for select.
+    let allowed_bool = allowed.gt(query_positions
+        .graph()
+        .constant_f32(0.0)
+        .expand_rhs(allowed.dims()));
+    // allowed → 0.0 (visible), not allowed → NEG_INFINITY (masked)
+    let dims = allowed_bool.dims();
+    let neg_inf = query_positions
+        .graph()
+        .constant_f32(f32::NEG_INFINITY)
+        .expand_rhs(dims.clone());
+    let zero = query_positions.graph().constant_f32(0.0).expand_rhs(dims);
+    allowed_bool.select(zero, neg_inf)
 }
 
 /// Build an additive causal bias for packed variable-length sequences.
@@ -400,11 +448,59 @@ pub fn grouped_query_apply(
         .finish()
 }
 
+/// Compute softmax along axis 3 (the context axis) for GQA scores of shape
+/// `[kv_heads, groups, queries, context]`.
+///
+/// If an entire query row is fully masked (`-inf` additive bias on all keys),
+/// this produces exact `0.0` attention weights for that row instead of
+/// evaluating `-inf - (-inf) = NaN`, ensuring that idle or padded queries
+/// contribute zero attention output.
+///
+/// **Boundary contract**: this guard specifically handles rows where all keys
+/// are suppressed by `-inf` masking. It assumes pre-masking attention scores are
+/// finite floats (as produced by standard linear projections and QK matmul);
+/// it does not protect against upstream NaNs or positive infinities in raw scores.
+fn safe_gqa_softmax(scores: GraphTensor) -> GraphTensor {
+    let full_shape = scores.dims();
+    let max_scores = scores.max(vec![3]);
+    let neg_inf = max_scores
+        .graph()
+        .constant_f32(f32::NEG_INFINITY)
+        .cast(max_scores.dtype)
+        .expand_rhs(max_scores.dims());
+    let has_valid = max_scores.gt(neg_inf);
+
+    let zero = max_scores
+        .graph()
+        .constant_f32(0.0)
+        .cast(max_scores.dtype)
+        .expand_rhs(max_scores.dims());
+    let safe_max = has_valid
+        .select(max_scores, zero)
+        .expand_to_shape_on_axes(full_shape.clone(), vec![3]);
+
+    let exp = (scores - safe_max).exp();
+    let sum = exp.sum(vec![3]);
+    let one = sum
+        .graph()
+        .constant_f32(1.0)
+        .cast(sum.dtype)
+        .expand_rhs(sum.dims());
+    let safe_sum = has_valid
+        .select(sum, one)
+        .expand_to_shape_on_axes(full_shape, vec![3]);
+
+    exp / safe_sum
+}
+
 /// Grouped-query attention over already materialized keys and values.
 ///
 /// `score_bias` may have shape `[queries, context]`,
 /// `[query_heads, queries, context]`, or the canonical grouped-query score
 /// shape `[kv_heads, groups, queries, context]`.
+///
+/// For any query row where all context positions are masked (`-inf`),
+/// this produces exact `0.0` attention output for that row without producing NaNs.
 pub fn grouped_query_attention(
     query: GraphTensor,
     keys: GraphTensor,
@@ -419,7 +515,8 @@ pub fn grouped_query_attention(
         scores.dims(),
         "attention bias dimensions do not match scores"
     );
-    grouped_query_apply((scores + bias).softmax(vec![3]), values, geometry)
+    let weights = safe_gqa_softmax(scores + bias);
+    grouped_query_apply(weights, values, geometry)
 }
 
 /// Write new keys and values, read the requested context, and evaluate GQA.
@@ -653,6 +750,9 @@ mod tests {
     fn assert_close(ours: &[f32], expected: &[f32]) {
         assert_eq!(ours.len(), expected.len(), "length mismatch");
         for (index, (a, b)) in ours.iter().zip(expected).enumerate() {
+            if a == b {
+                continue; // handles ±inf and exact matches
+            }
             assert!(
                 (a - b).abs() <= 1e-4 * b.abs().max(1.0),
                 "element {index}: ours {a} vs expected {b}"
@@ -1058,8 +1158,21 @@ mod tests {
         assert_close(
             rt.get_f32(bias.id).expect("packed bias"),
             &[
-                0.0, 0.0, -1e10, -1e10, -1e10, 0.0, 0.0, 0.0, -1e10, -1e10, -1e10, -1e10, -1e10,
-                0.0, -1e10,
+                0.0,
+                0.0,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                0.0,
+                0.0,
+                0.0,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                0.0,
+                f32::NEG_INFINITY,
             ],
         );
     }
@@ -1080,7 +1193,13 @@ mod tests {
         );
         assert_close(
             rt.get_f32(bias.id).expect("sliding-window bias"),
-            &[-1e10, -1e10, 0.0, 0.0, -1e10],
+            &[
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                0.0,
+                0.0,
+                f32::NEG_INFINITY,
+            ],
         );
     }
 
@@ -1100,8 +1219,323 @@ mod tests {
         );
         assert_close(
             rt.get_f32(bias.id).expect("sequence-isolation bias"),
-            &[-1e10, 0.0, -1e10, 0.0, 0.0, -1e10, 0.0, -1e10],
+            &[
+                f32::NEG_INFINITY,
+                0.0,
+                f32::NEG_INFINITY,
+                0.0,
+                0.0,
+                f32::NEG_INFINITY,
+                0.0,
+                f32::NEG_INFINITY,
+            ],
         );
+    }
+
+    /// Verify `causal_bias` produces exact `f32::NEG_INFINITY` at future
+    /// positions and `0.0` at allowed positions, with no NaN anywhere.
+    #[test]
+    fn causal_bias_produces_exact_neginf() {
+        let mut cx = Graph::new();
+        let q_pos = cx.tensor(vec![3], DType::Int);
+        let k_pos = cx.tensor(vec![3], DType::Int);
+        let bias = causal_bias(q_pos, k_pos);
+
+        // q_pos = [0, 1, 2], k_pos = [0, 1, 2]
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (q_pos.id, vec![0i32, 1, 2].into()),
+                (k_pos.id, vec![0i32, 1, 2].into()),
+            ],
+        );
+        let out = rt.get_f32(bias.id).expect("causal bias");
+        // Shape [3, 3]: row q, col k. future = q < k.
+        // q=0: [0, -inf, -inf]
+        // q=1: [0,    0, -inf]
+        // q=2: [0,    0,    0]
+        assert_eq!(out.len(), 9);
+        let expected = [
+            0.0,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            0.0,
+            f32::NEG_INFINITY,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        for (i, (&got, &exp)) in out.iter().zip(&expected).enumerate() {
+            assert_eq!(got, exp, "causal_bias[{i}]: got {got}, expected {exp}");
+        }
+        assert!(out.iter().all(|v| !v.is_nan()), "bias must be NaN-free");
+    }
+
+    /// Verify `sequence_isolation_bias` produces `0.0` for same-sequence
+    /// pairs and `f32::NEG_INFINITY` for different-sequence pairs.
+    #[test]
+    fn sequence_isolation_bias_masks_different_sequences() {
+        let mut cx = Graph::new();
+        let q_seq = cx.tensor(vec![2], DType::Int);
+        let k_seq = cx.tensor(vec![3], DType::Int);
+        let bias = sequence_isolation_bias(q_seq, k_seq);
+
+        // q_seq = [0, 1], k_seq = [0, 1, 0]
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (q_seq.id, vec![0i32, 1].into()),
+                (k_seq.id, vec![0i32, 1, 0].into()),
+            ],
+        );
+        let out = rt.get_f32(bias.id).expect("isolation bias");
+        // Shape [2, 3]: row q_seq, col k_seq.
+        // q=0: k=[0,1,0] -> [same, diff, same] -> [0, -inf, 0]
+        // q=1: k=[0,1,0] -> [diff, same, diff] -> [-inf, 0, -inf]
+        let expected = [
+            0.0,
+            f32::NEG_INFINITY,
+            0.0,
+            f32::NEG_INFINITY,
+            0.0,
+            f32::NEG_INFINITY,
+        ];
+        assert_eq!(out.len(), expected.len());
+        for (i, (&got, &exp)) in out.iter().zip(&expected).enumerate() {
+            assert_eq!(got, exp, "isolation_bias[{i}]: got {got}, expected {exp}");
+        }
+        assert!(out.iter().all(|v| !v.is_nan()), "bias must be NaN-free");
+    }
+
+    /// Verify `sliding_window_bias` masks both future positions and positions
+    /// before the window, producing exact `f32::NEG_INFINITY`.
+    #[test]
+    fn sliding_window_bias_masks_future_and_before_window() {
+        let mut cx = Graph::new();
+        let q_pos = cx.tensor(vec![4], DType::Int);
+        let k_pos = cx.tensor(vec![4], DType::Int);
+        let bias = sliding_window_bias(q_pos, k_pos, 2);
+
+        // q_pos = [0, 1, 2, 3], k_pos = [0, 1, 2, 3], window = 2
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (q_pos.id, vec![0i32, 1, 2, 3].into()),
+                (k_pos.id, vec![0i32, 1, 2, 3].into()),
+            ],
+        );
+        let out = rt.get_f32(bias.id).expect("sliding window bias");
+        assert_eq!(out.len(), 16);
+        // q=0, window=2: k=0 visible
+        // q=1, window=2: k=0,1 visible
+        // q=2, window=2: k=1,2 visible (k=0 before window)
+        // q=3, window=2: k=2,3 visible (k=0,1 before window)
+        let expected = [
+            0.0,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            0.0,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            0.0,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            0.0,
+        ];
+        for (i, (&got, &exp)) in out.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got, exp,
+                "sliding_window_bias[{i}]: got {got}, expected {exp}"
+            );
+        }
+        assert!(out.iter().all(|v| !v.is_nan()), "bias must be NaN-free");
+    }
+
+    /// Verify that a rolling cache at query position 1000 with window 4
+    /// and gathered key positions [997, 998, 999, 1000] produces all-zeros [0, 0, 0, 0].
+    /// Also verify that raw physical slot indices [0, 1, 2, 3] would be mistaken
+    /// as pre-window positions and erroneously masked out as -inf.
+    #[test]
+    fn rolling_cache_sliding_window_uses_logical_positions() {
+        let mut cx = Graph::new();
+        let q_pos = cx.tensor(vec![1], DType::Int);
+        let logical_k_pos = cx.tensor(vec![4], DType::Int);
+        let physical_slots = cx.tensor(vec![4], DType::Int);
+
+        let bias_logical = sliding_window_bias(q_pos, logical_k_pos, 4);
+        let bias_physical = sliding_window_bias(q_pos, physical_slots, 4);
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (q_pos.id, vec![1000i32].into()),
+                (logical_k_pos.id, vec![997i32, 998, 999, 1000].into()),
+                (physical_slots.id, vec![0i32, 1, 2, 3].into()),
+            ],
+        );
+
+        let logical_out = rt.get_f32(bias_logical.id).expect("logical bias");
+        assert_eq!(
+            logical_out,
+            &[0.0, 0.0, 0.0, 0.0],
+            "logical positions [997..=1000] within window 4 of query 1000 must all be unmasked"
+        );
+
+        let physical_out = rt.get_f32(bias_physical.id).expect("physical bias");
+        assert_eq!(
+            physical_out,
+            &[
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ],
+            "mistaking raw physical slots [0..3] for logical positions fully masks the window"
+        );
+    }
+
+    /// Verify that an entirely masked query row produces exact zero output
+    /// at the GQA output with no NaNs.
+    #[test]
+    fn grouped_query_attention_all_masked_row_produces_zero_output() {
+        const QUERY_HEADS: usize = 2;
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 2;
+        const CONTEXT: usize = 3;
+
+        let mut cx = Graph::new();
+        let query = cx.tensor(vec![1, QUERY_HEADS * HEAD_DIM], DType::F32);
+        let keys = cx.tensor(vec![CONTEXT, KV_HEADS * HEAD_DIM], DType::F32);
+        let values = cx.tensor(vec![CONTEXT, KV_HEADS * HEAD_DIM], DType::F32);
+        let bias = cx.tensor(vec![1, CONTEXT], DType::F32);
+        let output = grouped_query_attention(
+            query,
+            keys,
+            values,
+            bias,
+            AttentionGeometry::new(QUERY_HEADS, KV_HEADS, HEAD_DIM),
+        );
+
+        let query_vals = vec![1.0, 2.0, 3.0, 4.0];
+        let key_vals = vec![0.5, -0.5, 1.0, -1.0, 0.2, 0.8];
+        let val_vals = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        // All context positions masked out with -inf:
+        let bias_vals = vec![f32::NEG_INFINITY; CONTEXT];
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (query.id, query_vals.into()),
+                (keys.id, key_vals.into()),
+                (values.id, val_vals.into()),
+                (bias.id, bias_vals.into()),
+            ],
+        );
+
+        let out = rt.get_f32(output.id).expect("GQA output");
+        assert_eq!(out.len(), QUERY_HEADS * HEAD_DIM);
+        for (i, &v) in out.iter().enumerate() {
+            assert!(!v.is_nan(), "output[{i}] must not be NaN");
+            assert_eq!(v, 0.0, "output[{i}] for all-masked row must be exactly 0.0");
+        }
+    }
+
+    /// Verify that in a mixed batch containing both valid and fully masked rows,
+    /// the valid row computes standard softmax attention while the fully masked
+    /// row produces exact 0.0 output with no NaNs.
+    #[test]
+    fn grouped_query_attention_mixed_batch_preserves_active_and_zeroes_idle() {
+        const QUERY_HEADS: usize = 2;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 2;
+        const CONTEXT: usize = 2;
+
+        let mut cx = Graph::new();
+        // 2 queries in batch
+        let query = cx.tensor(vec![2, QUERY_HEADS * HEAD_DIM], DType::F32);
+        let keys = cx.tensor(vec![CONTEXT, KV_HEADS * HEAD_DIM], DType::F32);
+        let values = cx.tensor(vec![CONTEXT, KV_HEADS * HEAD_DIM], DType::F32);
+        let bias = cx.tensor(vec![2, CONTEXT], DType::F32);
+        let output = grouped_query_attention(
+            query,
+            keys,
+            values,
+            bias,
+            AttentionGeometry::new(QUERY_HEADS, KV_HEADS, HEAD_DIM),
+        );
+
+        let query_vals = vec![
+            // Query 0: active
+            0.5, -0.3, 0.8, 0.1, // Query 1: idle / padded
+            1.0, 2.0, 3.0, 4.0,
+        ];
+        let key_vals = vec![0.2, 0.4, -0.1, 0.3, 0.6, -0.5, 0.9, 0.2];
+        let value_vals = vec![1.0, -1.0, 0.5, 2.0, -0.5, 0.25, 1.5, -0.75];
+        let bias_vals = vec![
+            // Query 0 bias: unmasked
+            0.0,
+            0.0,
+            // Query 1 bias: all masked
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (query.id, query_vals.clone().into()),
+                (keys.id, key_vals.clone().into()),
+                (values.id, value_vals.clone().into()),
+                (bias.id, bias_vals.into()),
+            ],
+        );
+
+        let out = rt.get_f32(output.id).expect("mixed GQA output");
+        assert_eq!(out.len(), 2 * QUERY_HEADS * HEAD_DIM);
+
+        // Compute expected output for Query 0 manually using standard softmax:
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let mut expected_q0 = vec![0.0f32; QUERY_HEADS * HEAD_DIM];
+        for h in 0..QUERY_HEADS {
+            let q_h = &query_vals[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+            let mut scores = [0.0f32; CONTEXT];
+            for c in 0..CONTEXT {
+                let k_c = &key_vals[c * KV_HEADS * HEAD_DIM + h * HEAD_DIM..][..HEAD_DIM];
+                scores[c] = q_h.iter().zip(k_c).map(|(a, b)| a * b).sum::<f32>() * scale;
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps = scores.map(|s| (s - max).exp());
+            let sum: f32 = exps.iter().sum();
+            for (c, exp) in exps.iter().enumerate() {
+                let v_c = &value_vals[c * KV_HEADS * HEAD_DIM + h * HEAD_DIM..][..HEAD_DIM];
+                for d in 0..HEAD_DIM {
+                    expected_q0[h * HEAD_DIM + d] += exp / sum * v_c[d];
+                }
+            }
+        }
+
+        // Query 0 must match expected standard softmax attention:
+        let q0_out = &out[..QUERY_HEADS * HEAD_DIM];
+        for (i, (&got, &exp)) in q0_out.iter().zip(&expected_q0).enumerate() {
+            assert!(
+                (got - exp).abs() <= 1e-4 * exp.abs().max(1.0),
+                "q0 element {i}: got {got}, expected {exp}"
+            );
+        }
+
+        // Query 1 (all-masked) must be exactly 0.0 with no NaNs:
+        let q1_out = &out[QUERY_HEADS * HEAD_DIM..];
+        for (i, &v) in q1_out.iter().enumerate() {
+            assert!(!v.is_nan(), "q1 element {i} must not be NaN");
+            assert_eq!(v, 0.0, "q1 element {i} must be exactly 0.0");
+        }
     }
 }
 
@@ -1199,5 +1633,26 @@ mod score_bias_tests {
                 "element {index}: ours {a} vs expected {b}"
             );
         }
+    }
+
+    /// Demonstrate that the old arithmetic mask pattern `bool.cast(F32) * -inf`
+    /// produces NaN at unmasked positions — the bug this change fixes.
+    #[test]
+    fn arithmetic_mask_with_neginf_produces_nan() {
+        let mut cx = Graph::new();
+        let mask = cx.tensor(vec![4], DType::F32);
+        // Simulating the old pattern: mask is {0.0, 1.0}, multiplied by -inf.
+        let result = mask * f32::NEG_INFINITY;
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[(mask.id, vec![0.0f32, 1.0, 0.0, 1.0].into())],
+        );
+        let out = rt.get_f32(result.id).expect("arithmetic mask result");
+        // 0.0 * -inf = NaN (IEEE 754), 1.0 * -inf = -inf
+        assert!(out[0].is_nan(), "0 * -inf should be NaN, got {}", out[0]);
+        assert_eq!(out[1], f32::NEG_INFINITY);
+        assert!(out[2].is_nan(), "0 * -inf should be NaN, got {}", out[2]);
+        assert_eq!(out[3], f32::NEG_INFINITY);
     }
 }
