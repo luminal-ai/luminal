@@ -334,7 +334,8 @@ mod host_graphs {
             let a = ctx.dims[&'a'.into()];
             anyhow::ensure!(a != 6, "injected preparation failure");
             PREPARED[a].fetch_add(1, Ordering::SeqCst);
-            let ptx = cudarc::nvrtc::compile_ptx(
+            let ptx = luminal_cuda_lite::device::compile_for_device(
+                ctx.stream.context(),
                 r#"extern "C" __global__ void add(const float* a,const float* b,float* out,unsigned long long n){unsigned long long i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]+b[i];}"#,
             )?;
             let module = ctx.stream.context().load_module(ptx)?;

@@ -11,7 +11,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use cudarc::{
     driver::{CudaContext, CudaStream, result, sys as cu},
-    nvrtc::{CompileOptions, compile_ptx_with_opts},
+    nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts, result as nvrtc, sys as nvrtc_sys},
 };
 use luminal::{
     bufferize::{BufferId, BufferNode, SlotDescriptor},
@@ -21,7 +21,7 @@ use luminal::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    ffi::CString,
+    ffi::{CStr, CString},
     rc::Rc,
     sync::Arc,
 };
@@ -108,6 +108,85 @@ fn nvrtc_compile_options() -> CompileOptions {
             ..Default::default()
         })
         .clone()
+}
+
+/// The device's `sm_XY` number when the loaded NVRTC can emit SASS for it.
+fn nvrtc_device_sm(ctx: &CudaContext) -> Option<i32> {
+    let (major, minor) = ctx.compute_capability().ok()?;
+    let sm = major * 10 + minor;
+    let supported = unsafe {
+        let mut n = 0;
+        nvrtc_sys::nvrtcGetNumSupportedArchs(&mut n).result().ok()?;
+        let mut archs = vec![0; usize::try_from(n).ok()?];
+        nvrtc_sys::nvrtcGetSupportedArchs(archs.as_mut_ptr())
+            .result()
+            .ok()?;
+        archs
+    };
+    supported.contains(&sm).then_some(sm)
+}
+
+/// Compile one generated kernel to an image for `cuModuleLoadData`.
+///
+/// With `sm`, the image is a cubin for exactly that architecture. A cubin
+/// needs no driver JIT, so CUDA minor-version compatibility applies and an
+/// NVRTC newer than the driver still works. PTX from such an NVRTC does not:
+/// the driver rejects it with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`, for
+/// example NVRTC 13.4 under a driver that supports CUDA 13.3.
+///
+/// Without `sm` (this NVRTC predates the device), emit PTX for NVRTC's
+/// default virtual architecture and let the driver JIT it forward.
+fn compile_kernel(source: &str, sm: Option<i32>) -> std::result::Result<Vec<u8>, String> {
+    let Some(sm) = sm else {
+        let ptx =
+            compile_ptx_with_opts(source, nvrtc_compile_options()).map_err(|e| format!("{e:?}"))?;
+        return CString::new(ptx.to_src())
+            .map(CString::into_bytes_with_nul)
+            .map_err(|e| e.to_string());
+    };
+    let src = CString::new(source).map_err(|e| e.to_string())?;
+    let prog = nvrtc::create_program(&src, None).map_err(|e| format!("{e:?}"))?;
+    let mut options: Vec<String> = nvrtc_compile_options()
+        .include_paths
+        .iter()
+        .map(|path| format!("--include-path={path}"))
+        .collect();
+    options.push(format!("--gpu-architecture=sm_{sm}"));
+    let image = unsafe {
+        match nvrtc::compile_program(prog, &options) {
+            Err(e) => {
+                let log = nvrtc::get_program_log(prog)
+                    .map(|log| CStr::from_ptr(log.as_ptr()).to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Err(format!("{e:?} {options:?}\n{log}"))
+            }
+            Ok(()) => {
+                let mut size = 0;
+                nvrtc_sys::nvrtcGetCUBINSize(prog, &mut size)
+                    .result()
+                    .and_then(|()| {
+                        let mut cubin = vec![0u8; size];
+                        nvrtc_sys::nvrtcGetCUBIN(prog, cubin.as_mut_ptr().cast())
+                            .result()
+                            .map(|()| cubin)
+                    })
+                    .map_err(|e| format!("{e:?}"))
+            }
+        }
+    };
+    unsafe {
+        let _ = nvrtc::destroy_program(prog);
+    }
+    image
+}
+
+/// Compile a CUDA C++ source for `ctx`'s device the same way the runtime
+/// compiles its own kernels, for host ops and other code that loads its own
+/// module: a cubin for the device when this NVRTC targets it, otherwise PTX.
+pub fn compile_for_device(ctx: &CudaContext, source: &str) -> Result<Ptx> {
+    compile_kernel(source, nvrtc_device_sm(ctx))
+        .map(Ptx::from_binary)
+        .map_err(|e| anyhow!("NVRTC: {e}"))
 }
 
 /// Cumulative counters for inspecting replay, dynamic updates, and arena reuse.
@@ -951,6 +1030,7 @@ impl CompiledPlan {
         cache: &mut HashMap<String, Module>,
         stats: &mut GraphStats,
     ) -> Result<Self> {
+        let sm = nvrtc_device_sm(ctx);
         let schema: Vec<_> = bounds.keys().copied().collect();
         ensure!(
             storage.staging_bytes <= staging.bytes().len(),
@@ -1054,12 +1134,8 @@ impl CompiledPlan {
                                 let func = if let Some(module) = cache.get(&source) {
                                     module.func
                                 } else {
-                                    let ptx =
-                                        compile_ptx_with_opts(&source, nvrtc_compile_options())
-                                            .map_err(|e| {
-                                                anyhow!("NVRTC {label}: {e:?}\n{source}")
-                                            })?;
-                                    let image = CString::new(ptx.to_src())?;
+                                    let image = compile_kernel(&source, sm)
+                                        .map_err(|e| anyhow!("NVRTC {label}: {e}\n{source}"))?;
                                     let raw = unsafe {
                                         result::module::load_data(image.as_ptr().cast())
                                     }?;
@@ -1553,5 +1629,31 @@ impl CompiledPlan {
         }
         stats.launches += 1;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When NVRTC targets the device, kernels are SASS for that device, so
+    /// the driver never has to JIT PTX from a possibly newer toolchain.
+    #[test]
+    fn kernels_compile_to_a_cubin_for_the_device() {
+        let ctx = CudaContext::new(0).expect("CUDA device 0");
+        let Some(sm) = nvrtc_device_sm(&ctx) else {
+            eprintln!("this NVRTC does not target device 0; PTX fallback in use");
+            return;
+        };
+        let image = compile_kernel(
+            r#"extern "C" __global__ void k(float* x) { x[threadIdx.x] += 1.0f; }"#,
+            Some(sm),
+        )
+        .expect("compile");
+        assert_eq!(&image[..4], b"\x7fELF", "expected a cubin for sm_{sm}");
+        let module = ctx
+            .load_module(Ptx::from_binary(image))
+            .expect("load cubin");
+        module.load_function("k").expect("entry point");
     }
 }
