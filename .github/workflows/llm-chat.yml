@@ -37,5 +37,5 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo clippy -p llm_chat_metal --all-targets -- -D warnings
-      - run: cargo test -p llm_chat_metal
+      - run: cargo test --no-fail-fast -p llm_chat_metal
       - run: cargo test -p luminal_metal --test dynamic_execution

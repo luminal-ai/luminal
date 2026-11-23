@@ -19,7 +19,7 @@ jobs:
         steps:
             - uses: actions/checkout@v6
             - name: Run Metal crate tests
-              run: rustup update; cargo test --release -p luminal_metal --verbose -- --test-threads=1
+              run: rustup update; cargo test --release --no-fail-fast -p luminal_metal --verbose -- --test-threads=1
 
     llama_1b_metal_example:
         name: Llama 1B Metal Example
