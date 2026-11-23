@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpMatrixMultiplyGeneric (LayoutTensor LayoutTensor Layout) LayoutTensorOp)
