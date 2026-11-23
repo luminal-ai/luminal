@@ -41,8 +41,9 @@ fn pack_codes(target: PlanDtype, codes: &[u64]) -> Result<Vec<u8>, DriverError> 
     }
     .codegen(&ctx)
     .expect("generate packing kernel");
-    let ptx = cudarc::nvrtc::compile_ptx(&source[0].source).expect("compile packing kernel");
     let context = CudaContext::new(0).expect("CUDA device 0");
+    let ptx = luminal_cuda_lite::device::compile_for_device(&context, &source[0].source)
+        .expect("compile packing kernel");
     let stream = context.default_stream();
     let module = context.load_module(ptx).expect("load packing kernel");
     let function = module.load_function("k").expect("packing entry point");

@@ -71,6 +71,11 @@ impl KernelOp for Tf32RoundTripDps {
         let helper = r#"
 __device__ __forceinline__ float luminal_round_tf32(float value) {
 #if __CUDA_ARCH__ >= 800
+    // cvt.rna.tf32.f32 drops the low 13 mantissa bits of a NaN too, so a NaN
+    // whose payload sits only in those bits (0xff800001) comes back as -inf.
+    if (isnan(value)) {
+        return __uint_as_float((__float_as_uint(value) & 0x80000000u) | 0x7fc00000u);
+    }
     unsigned int bits;
     asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(bits) : "f"(value));
     return __uint_as_float(bits);
