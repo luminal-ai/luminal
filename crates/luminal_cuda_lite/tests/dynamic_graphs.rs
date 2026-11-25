@@ -115,6 +115,45 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
     );
 }
 
+/// A symbolic innermost extent folds each output across a full warp, and
+/// the launch geometry follows the live number of outputs.
+#[test]
+fn dynamic_innermost_reduction_follows_live_geometry() {
+    let mut g = Graph::new();
+    let x = g.tensor(vec!['a', 'b'], DType::F32);
+    let out = x.sum(vec![1]);
+    let mut rt = CudaRuntime::load(&g).unwrap();
+    rt.search(
+        &luminal::shape::SymbolBounds::from_ranges([
+            ('a'.into(), (1, 300)),
+            ('b'.into(), (1, 100)),
+        ])
+        .unwrap(),
+        &[('a'.into(), 9), ('b'.into(), 33)].into_iter().collect(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
+    for (rows, extent) in [(9, 33), (300, 100), (1, 1), (37, 5), (9, 33)] {
+        // Multiples of 1/8 whose partial sums are exact in f32.
+        let data: Vec<f32> = (0..rows * extent)
+            .map(|i| ((i * 37 % 101) as f32 - 50.) / 8.)
+            .collect();
+        let expected: Vec<f32> = data.chunks(extent).map(|row| row.iter().sum()).collect();
+        rt.set_dim('a', rows);
+        rt.set_dim('b', extent);
+        rt.upload(&mut arena_rt, x.id, data).unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        assert_eq!(
+            rt.read_f32(&arena_rt, out.id).unwrap(),
+            expected,
+            "{rows}x{extent}"
+        );
+    }
+}
+
 #[test]
 fn cublas_geometry_changes_rerecord_the_child_every_execution() {
     let mut g = Graph::new();
