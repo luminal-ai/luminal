@@ -11,7 +11,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, reduce, wrapping_fold};
+use crate::kernels::{CodegenCtx, FoldOrder, KernelOp, KernelSource, reduce, wrapping_fold};
 use anyhow::{Context, Result};
 
 /// `WrappingReduceSumGeneric(input) -> out` — pure dataflow form.
@@ -99,7 +99,14 @@ impl LayoutIrOp for WrappingReduceSumDps {}
 impl KernelOp for WrappingReduceSumDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
         let axis = usize::try_from(self.axis).context("negative reduce axis")?;
-        reduce(ctx, axis, "0", &wrapping_fold(ctx.operand_dtypes[0], "+")?)
+        // Wrapping integer addition is associative, so any order agrees.
+        reduce(
+            ctx,
+            axis,
+            "0",
+            &wrapping_fold(ctx.operand_dtypes[0], "+")?,
+            FoldOrder::Any,
+        )
     }
 }
 

@@ -781,13 +781,20 @@ pub(crate) fn elementwise(
     Ok(vec![KernelSource::plain(source, n)])
 }
 
-/// Generate a reduction with one thread per output element, looping over
-/// the reduced axis. Axis 0 is the last input dimension.
+/// Generate a reduction over one axis. Axis 0 is the last input dimension.
+///
+/// Each output is folded either by one thread looping over the reduced axis,
+/// or, when the reduced axis is the innermost one, by a group of lanes in one
+/// warp (see [`reduce_lanes`]). Each lane folds every `lanes`-th element and
+/// the lanes then combine their partial values with warp shuffles. Both forms
+/// apply the same `fold` and differ only in association order. Lanes are
+/// used only when `order` is [`FoldOrder::Any`].
 pub(crate) fn reduce(
     ctx: &CodegenCtx,
     axis_from_end: usize,
     init: &str,
     fold: &str,
+    order: FoldOrder,
 ) -> Result<Vec<KernelSource>> {
     let in_dims = &ctx.operand_dims[0];
     let ta = cuda_type(ctx.operand_dtypes[0])?;
@@ -822,6 +829,53 @@ pub(crate) fn reduce(
         ));
     }
     let (chain, idx) = layout_read_index("a", layout, in_dims, Coords::Bound { prefix: "c" })?;
+    let lanes = match order {
+        FoldOrder::Any => reduce_lanes(&inner, &extent),
+        FoldOrder::Sequential => None,
+    };
+    if let Some(lanes) = lanes {
+        // Indent the coordinates and index code inside `if (i < n)` and the loop.
+        let coords = coords.replace("    ", "        ");
+        let chain = chain.replace("    ", "            ");
+        let source = format!(
+            r#"template <typename T>
+__device__ __forceinline__ T lane_xor(T value, int mask) {{
+    unsigned long long bits = 0;
+    memcpy(&bits, &value, sizeof(T));
+    bits = __shfl_xor_sync(0xffffffffu, bits, mask);
+    memcpy(&value, &bits, sizeof(T));
+    return value;
+}}
+
+extern "C" __global__ void k(const {ta}* a, {to}* out, const long long* params) {{
+    const unsigned long long n = {n};
+    const unsigned long long t = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long i = t / {lanes};
+    const unsigned int lane = (unsigned int)(t % {lanes});
+    {ta} acc = {init};
+    if (i < n) {{
+        unsigned long long outer = i / {inner};
+        unsigned long long inner = i % {inner};
+{coords}        for (unsigned long long r = lane; r < {extent}; r += {lanes}) {{
+            long long c{axis} = (long long)r;
+{chain}            {ta} v = a[{idx}];
+            acc = {fold};
+        }}
+    }}
+    // Every lane of the warp joins each exchange, including lanes whose
+    // output is out of range, so the full-warp mask is always valid.
+    // Masks below `{lanes}` stay inside one output's lanes.
+    for (int mask = {lanes} / 2; mask > 0; mask >>= 1) {{
+        {ta} v = lane_xor(acc, mask);
+        acc = {fold};
+    }}
+    if (i < n && lane == 0) out[i] = acc;
+}}"#
+        );
+        let mut kernel = KernelSource::plain(source, n.clone());
+        kernel.launch = Some(KernelLaunch::linear(n * Expr::from(lanes), REDUCE_BLOCK));
+        return Ok(vec![kernel]);
+    }
     // Indent the generated index code inside the loop.
     let chain = chain.replace("    ", "        ");
     let source = format!(
@@ -841,6 +895,41 @@ pub(crate) fn reduce(
 }}"#
     );
     Ok(vec![KernelSource::plain(source, n)])
+}
+
+/// The order in which [`reduce`] may apply its fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldOrder {
+    /// Any association: lanes may fold partial values and then combine them.
+    Any,
+    /// In index order along the reduced axis, one thread per output.
+    Sequential,
+}
+
+/// Threads per block for cooperative reductions.
+const REDUCE_BLOCK: usize = 256;
+
+/// The number of lanes that cooperate on one output of [`reduce`], or `None`
+/// for one thread per output.
+///
+/// Lanes help only when the reduced axis is the innermost one (`inner == 1`).
+/// Then neighbouring lanes read neighbouring elements of one output's
+/// reduction, while one thread per output would make neighbouring threads
+/// read `extent` elements apart. When `inner > 1`, one thread per output
+/// already reads neighbouring elements across threads, so it is kept.
+///
+/// A known extent uses the next power of two up to a warp, so short
+/// reductions do not leave most lanes idle. A symbolic extent uses a full
+/// warp.
+fn reduce_lanes(inner: &Expr, extent: &Expr) -> Option<usize> {
+    if inner.literal() != Some(1) {
+        return None;
+    }
+    match extent.literal() {
+        Some(extent) if extent <= 1 => None,
+        Some(extent) => Some(extent.next_power_of_two().min(32)),
+        None => Some(32),
+    }
 }
 
 /// Inclusive scan along one axis: one thread per (outer, inner) pair folds

@@ -313,6 +313,65 @@ fn max_propagates_nan() {
     assert_exact_both_with_nan(&want, &got, &[f32::NAN, 3.0], "max over rows with a NaN");
 }
 
+/// Reductions over the innermost axis fold each output across a group of
+/// warp lanes. The shapes cover a single element, groups with idle lanes
+/// (extents 3 and 33), a full warp, a long tail (extent 1000), and a last
+/// block whose outputs are partly out of range (300 rows). Every value is a
+/// multiple of 1/8 and every partial sum fits in the f32 significand, so the
+/// sum is exact in any association order and is compared exactly.
+#[test]
+fn innermost_reductions_across_lane_groups() {
+    for (rows, extent) in [
+        (5usize, 1usize),
+        (5, 3),
+        (7, 32),
+        (9, 33),
+        (300, 7),
+        (2, 1000),
+    ] {
+        let values: Vec<f32> = (0..rows * extent)
+            .map(|i| ((i * 37 % 101) as f32 - 50.) / 8.)
+            .collect();
+        let expected_sum: Vec<f32> = values.chunks(extent).map(|row| row.iter().sum()).collect();
+        let mut cx = Graph::new();
+        let a = cx.tensor(vec![rows, extent], DType::F32);
+        let out = a.sum(vec![1]);
+        let (want, got) = run_both(&cx, &[(a.id, values.clone())], out.id);
+        assert_exact_both(
+            &want,
+            &got,
+            &expected_sum,
+            &format!("sum of {rows}x{extent}"),
+        );
+
+        // Put a NaN in every third row, at a lane other than lane 0.
+        let mut with_nan = values;
+        for row in (0..rows).step_by(3) {
+            with_nan[row * extent + (row * 7 + 1) % extent] = f32::NAN;
+        }
+        let expected_max: Vec<f32> = with_nan
+            .chunks(extent)
+            .map(|row| {
+                if row.iter().any(|v| v.is_nan()) {
+                    f32::NAN
+                } else {
+                    row.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                }
+            })
+            .collect();
+        let mut cx = Graph::new();
+        let a = cx.tensor(vec![rows, extent], DType::F32);
+        let out = a.max(vec![1]);
+        let (want, got) = run_both(&cx, &[(a.id, with_nan)], out.id);
+        assert_exact_both_with_nan(
+            &want,
+            &got,
+            &expected_max,
+            &format!("max of {rows}x{extent}"),
+        );
+    }
+}
+
 /// Once the running maximum meets a NaN it stays NaN.
 #[test]
 fn cummax_propagates_nan() {

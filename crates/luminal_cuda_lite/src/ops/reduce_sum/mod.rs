@@ -11,8 +11,9 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, reduce};
+use crate::kernels::{CodegenCtx, FoldOrder, KernelOp, KernelSource, reduce};
 use anyhow::{Context, Result};
+use luminal::dtype::PlanDtype;
 
 /// `ReduceSumGeneric(input) -> out` — pure dataflow form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +100,15 @@ impl LayoutIrOp for ReduceSumDps {}
 impl KernelOp for ReduceSumDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
         let axis = usize::try_from(self.axis).context("negative reduce axis")?;
-        reduce(ctx, axis, "0", "acc + v")
+        // A 16-bit float sum accumulates in its storage type, so the order
+        // of additions shows in the result: 512 BF16 ones sum to 256 in
+        // index order and to 512 pairwise. `tests/precision_contract.rs`
+        // pins the index-order result, so these sums stay sequential.
+        let order = match ctx.operand_dtypes[0] {
+            PlanDtype::F16 | PlanDtype::Bf16 => FoldOrder::Sequential,
+            _ => FoldOrder::Any,
+        };
+        reduce(ctx, axis, "0", "acc + v", order)
     }
 }
 

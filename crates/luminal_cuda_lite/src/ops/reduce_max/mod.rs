@@ -11,7 +11,9 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, max_fold, max_identity, reduce};
+use crate::kernels::{
+    CodegenCtx, FoldOrder, KernelOp, KernelSource, max_fold, max_identity, reduce,
+};
 use anyhow::{Context, Result};
 
 /// `ReduceMaxGeneric(input) -> out` — pure dataflow form.
@@ -100,7 +102,16 @@ impl KernelOp for ReduceMaxDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
         let axis = usize::try_from(self.axis).context("negative reduce axis")?;
         let dtype = ctx.operand_dtypes[0];
-        reduce(ctx, axis, &max_identity(dtype), &max_fold(dtype)?)
+        // The maximum, NaN propagation included, is the same in any order.
+        // Only the sign of a zero maximum can change, and the sequential
+        // fold already leaves that to the input order.
+        reduce(
+            ctx,
+            axis,
+            &max_identity(dtype),
+            &max_fold(dtype)?,
+            FoldOrder::Any,
+        )
     }
 }
 

@@ -549,6 +549,107 @@ mod strided {
         assert!(!source.contains("a_h0_0"), "no hop variables:\n{source}");
     }
 
+    /// Generate the single kernel for `op`, keeping its launch geometry.
+    fn generate_kernel(
+        op: &dyn BufferTensorIrOp,
+        operand_info: &[SlotDescriptor<DecodedLayout>],
+        result_info: &[SlotDescriptor<DecodedLayout>],
+    ) -> kernels::KernelSource {
+        let ctx = kernels::CodegenCtx::from_descriptors(op.label(), operand_info, result_info)
+            .expect("descriptor ctx builds");
+        let row = luminal_cuda_lite::as_kernel_op(op).expect("kernel interface");
+        let mut launches = row.codegen(&ctx).expect("codegen succeeds");
+        assert_eq!(launches.len(), 1, "single-launch op");
+        launches.remove(0)
+    }
+
+    /// A reduction over the innermost axis folds each output across a
+    /// group of lanes: the next power of two above the extent, at most a
+    /// warp. The launch covers `outputs * lanes` threads.
+    #[test]
+    fn innermost_reduce_folds_across_a_lane_group() {
+        for (extent, lanes) in [(3i64, 4usize), (32, 32), (1000, 32)] {
+            let op = ops::reduce_sum::ReduceSumDps { axis: 0 };
+            let kernel = generate_kernel(
+                &op,
+                &[slot(vec![5, extent]), slot(vec![5])],
+                &[slot(vec![5])],
+            );
+            let source = &kernel.source;
+            assert_contains(
+                source,
+                &[
+                    &format!("const unsigned long long i = t / {lanes};"),
+                    &format!("r < {extent}LL; r += {lanes})"),
+                    &format!("for (int mask = {lanes} / 2; mask > 0; mask >>= 1)"),
+                    "float v = lane_xor(acc, mask);",
+                    "if (i < n && lane == 0) out[i] = acc;",
+                ],
+            );
+            let launch = kernel
+                .launch
+                .as_ref()
+                .expect("a lane group declares its launch");
+            assert_eq!(
+                launch.grid[0].to_string(),
+                format!("luminal_ceil_div({}LL, 256LL)", 5 * lanes)
+            );
+            assert_eq!(launch.block[0].to_string(), "256LL");
+            assert_no_traps(source);
+        }
+    }
+
+    /// One thread per output stays when the reduced axis is not innermost
+    /// (neighbouring threads already read neighbouring elements) or when
+    /// there is only one element to fold.
+    #[test]
+    fn other_reduces_keep_one_thread_per_output() {
+        let outer = ops::reduce_sum::ReduceSumDps { axis: 1 };
+        let single = ops::reduce_max::ReduceMaxDps { axis: 0 };
+        for (op, input, output) in [
+            (&outer as &dyn BufferTensorIrOp, vec![6, 4], vec![4]),
+            (&single, vec![6, 1], vec![6]),
+        ] {
+            let kernel = generate_kernel(op, &[slot(input), slot(output.clone())], &[slot(output)]);
+            let source = kernel.source;
+            assert!(kernel.launch.is_none(), "default launch:\n{source}");
+            assert!(!source.contains("lane_xor"), "no lane exchange:\n{source}");
+            assert_contains(
+                &source,
+                &["for (unsigned long long r = 0;", "out[i] = acc;"],
+            );
+        }
+    }
+
+    /// A 16-bit float sum accumulates in its storage type, so it keeps the
+    /// index order that `precision_contract.rs` pins. A 16-bit maximum is
+    /// the same in any order and still folds across lanes.
+    #[test]
+    fn half_sums_stay_sequential_and_half_maxima_use_lanes() {
+        for dtype in [PlanDtype::F16, PlanDtype::Bf16] {
+            let operands = [slot_dt(vec![5, 64], dtype), slot_dt(vec![5], dtype)];
+            let results = [slot_dt(vec![5], dtype)];
+            let sum = generate_kernel(
+                &ops::reduce_sum::ReduceSumDps { axis: 0 },
+                &operands,
+                &results,
+            );
+            assert!(sum.launch.is_none(), "{dtype:?} sum:\n{}", sum.source);
+            assert!(
+                !sum.source.contains("lane_xor"),
+                "{dtype:?} sum:\n{}",
+                sum.source
+            );
+            let max = generate_kernel(
+                &ops::reduce_max::ReduceMaxDps { axis: 0 },
+                &operands,
+                &results,
+            );
+            assert!(max.launch.is_some(), "{dtype:?} max:\n{}", max.source);
+            assert_contains(&max.source, &["lane_xor(acc, mask)", "r += 32)"]);
+        }
+    }
+
     /// Cast keeps its conversion around the layout-expression read.
     #[test]
     fn cast_wraps_the_strided_read() {
