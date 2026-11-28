@@ -6,7 +6,7 @@ license = "MIT"
 description = "Shared compact compiler snapshots for Luminal backends"
 
 [dependencies]
-egglog = { git = "https://github.com/luminal-ai/egglog", rev = "3787810fa259efc45237eecd98d7914a6b02256c", default-features = false }
+egglog = { git = "https://github.com/luminal-ai/egglog", rev = "87d4097d713b13c12a8eda6b09b0cab931471682", default-features = false }
 egraph-serialize = { version = "0.3.0", default-features = false, features = ["serde"] }
 indexmap = { version = "2.2", features = ["serde"] }
 once_cell = "1.21"

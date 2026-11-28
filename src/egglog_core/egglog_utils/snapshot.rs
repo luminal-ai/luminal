@@ -153,7 +153,20 @@ impl Snapshot {
 
     fn read(egraph: &EGraph) -> Result<(Schema, Built)> {
         let schema = Schema::collect(egraph);
-        let built = egraph.read(|state| Builder::run(&state, &schema))?;
+        // The let tables' globals in declaration order, with their tables.
+        let lets: Vec<(String, usize, Value)> = egraph
+            .let_table_rows()
+            .into_iter()
+            .map(|(name, function, value)| {
+                let table = schema
+                    .tables
+                    .iter()
+                    .position(|t| t.name == function.name())
+                    .expect("let table in the schema");
+                (name.to_owned(), table, value)
+            })
+            .collect();
+        let built = egraph.read(|state| Builder::run(&state, &schema, &lets))?;
         #[cfg(debug_assertions)]
         built.tripwire.check(egraph, &schema, &built.snapshot)?;
         Ok((schema, built))
@@ -258,6 +271,8 @@ struct TableSchema {
     input_sorts: Vec<String>,
     output_sort: String,
     let_binding: bool,
+    /// Each row binds one eq-sort global (egglog's let tables).
+    let_table: bool,
 }
 
 struct Schema {
@@ -317,6 +332,7 @@ impl Schema {
                     .collect(),
                 output_sort: func_type.output.name().to_string(),
                 let_binding: function.is_let_binding(),
+                let_table: function.is_let_table(),
             });
         }
         schema
@@ -360,7 +376,11 @@ struct Builder<'s> {
 const SAMPLE_ROWS: usize = 64;
 
 impl<'s> Builder<'s> {
-    fn run(state: &ReadState<'_, '_>, schema: &'s Schema) -> Result<Built> {
+    fn run(
+        state: &ReadState<'_, '_>,
+        schema: &'s Schema,
+        lets: &[(String, usize, Value)],
+    ) -> Result<Built> {
         let mut builder = Builder {
             schema,
             snapshot: Snapshot {
@@ -374,11 +394,24 @@ impl<'s> Builder<'s> {
             class_values: Vec::new(),
             sampled: 0,
         };
+        let mut let_tables_listed = false;
         for (index, table) in schema.tables.iter().enumerate() {
             let id = TableId::from_len(index);
             builder.sampled = 0;
             let start = u32::try_from(builder.snapshot.nodes.len()).expect("rows fit in u32");
-            if table.let_binding {
+            if table.let_table {
+                // Every let table's globals at the first one's place, in
+                // declaration order, as the per-global tables listed them.
+                if !let_tables_listed {
+                    let_tables_listed = true;
+                    for (name, table, value) in lets {
+                        let class = builder.intern(state, schema.tables[*table].output, *value);
+                        builder.snapshot.classes[class.index()]
+                            .let_names
+                            .push(name.clone());
+                    }
+                }
+            } else if table.let_binding {
                 builder.scan(state, table, |b, _, output, _| {
                     b.bind_let(state, table, output)
                 })?;

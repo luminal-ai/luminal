@@ -404,7 +404,7 @@ impl Snapshot<'_> {
             identity: self.snapshot_reader().identity(),
             tables: self
                 .functions_iter()
-                .filter(|(name, f)| f.is_let_binding() || include(name))
+                .filter(|(name, f)| f.is_let_binding() || f.is_let_table() || include(name))
                 .map(|(name, f)| (name.clone(), self.snapshot_reader().table_version(f)))
                 .collect(),
             node_revision: snapshot.nodes.revision(),
@@ -442,7 +442,8 @@ impl Snapshot<'_> {
         }
         let mut updates = Vec::new();
         for (name, function) in self.functions_iter() {
-            if !function.is_let_binding() && !include(name) {
+            let global = function.is_let_binding() || function.is_let_table();
+            if !global && !include(name) {
                 continue;
             }
             let current = next.tables[name];
@@ -450,7 +451,7 @@ impl Snapshot<'_> {
             if previous == Some(current) {
                 continue;
             }
-            if function.is_let_binding() {
+            if global {
                 return Some(false);
             }
             if previous.map_or(0, |v| v.3) == 0 && current.3 == 0 {
@@ -561,6 +562,22 @@ impl Snapshot<'_> {
         }
         let mut updates = Vec::new();
         for (name, function) in self.functions_iter() {
+            if function.is_let_table() {
+                let sort = &function.func_type().output;
+                let mut matches = true;
+                self.snapshot_reader().for_each_while(function, |row| {
+                    let previous = self.let_name(row.vals[0]).and_then(|name| globals.remove(name));
+                    let value =
+                        value_bits(self.snapshot_reader().canonical_value(row.vals[1], sort));
+                    let current = classes.get(&(sort.name(), value)).copied();
+                    matches = previous.is_some() && previous == current;
+                    matches
+                });
+                if !matches {
+                    return false;
+                }
+                continue;
+            }
             if !function.is_let_binding() && !include(name) {
                 continue;
             }
@@ -681,7 +698,7 @@ impl Snapshot<'_> {
         let mut total_args = 0;
         let mut per_sort = HashMap::default();
         for (name, function) in self.functions_iter() {
-            if !function.is_let_binding() && !include(name) {
+            if !function.is_let_binding() && !include(name) || function.is_let_table() {
                 continue;
             }
             let count = self.snapshot_reader().table_size(function);
@@ -714,7 +731,24 @@ impl Snapshot<'_> {
         for (id, count) in per_sort {
             b.sorts[id].values.reserve(count);
         }
+        let mut let_tables_listed = false;
         for (name, function) in self.functions_iter() {
+            if function.is_let_table() {
+                // Every let table's globals at the first one's place, in
+                // declaration order, as the per-global tables listed them.
+                if !let_tables_listed {
+                    let_tables_listed = true;
+                    for (global, table, value) in self.let_table_rows() {
+                        let output = b.sort(&table.func_type().output);
+                        let class = b.intern(output, value);
+                        b.classes[class]
+                            .lets
+                            .get_or_insert_with(Default::default)
+                            .push(global.to_owned());
+                    }
+                }
+                continue;
+            }
             if !function.is_let_binding() && !include(name) {
                 continue;
             }
