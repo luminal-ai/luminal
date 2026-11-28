@@ -566,7 +566,9 @@ impl Snapshot<'_> {
                 let sort = &function.func_type().output;
                 let mut matches = true;
                 self.snapshot_reader().for_each_while(function, |row| {
-                    let previous = self.let_name(row.vals[0]).and_then(|name| globals.remove(name));
+                    let previous = self
+                        .let_name(row.vals[0])
+                        .and_then(|name| globals.remove(name));
                     let value =
                         value_bits(self.snapshot_reader().canonical_value(row.vals[1], sort));
                     let current = classes.get(&(sort.name(), value)).copied();
